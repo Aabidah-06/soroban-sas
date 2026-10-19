@@ -770,7 +770,7 @@ impl SAS {
     }
 
     /// The single encoding of the SAS -> Indexer write:
-    /// `Indexer::index_attestation(uid, recipient, schema_uid, attester)`.
+    /// `Indexer::index_attestation(uid, recipient, schema_uid, attester, expiration_time)`.
     /// Returns whether the indexer accepted it. Issuance, `reindex_attestation`,
     /// and `bulk_reindex` all go through here so the call shape cannot drift
     /// between them (#309).
@@ -784,6 +784,7 @@ impl SAS {
                 attestation.recipient.clone().into_val(env),
                 attestation.schema_uid.clone().into_val(env),
                 attestation.attester.clone().into_val(env),
+                attestation.expiration_time.into_val(env),
             ],
         );
         matches!(outcome, Ok(Ok(())))
