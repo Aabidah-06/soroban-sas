@@ -1,7 +1,7 @@
 #![allow(unexpected_cfgs)]
 #![no_std]
 use soroban_sas_common::{
-    events::{CONTRACT_UPGRADED, INDEXING_PROGRESS},
+    events::{CHUNK_ALLOCATED, CHUNK_FILLED, CONTRACT_UPGRADED, INDEXING_PROGRESS},
     ContractUpgradedEvent, IndexingProgressEvent, SASError, LEDGERS_IN_ONE_YEAR, UID,
 };
 use soroban_sdk::{
@@ -15,6 +15,7 @@ use soroban_sdk::{
 // - Instance storage: Admin, SAS contract, version, WASM hash, query counter state
 // - Persistent storage: Index chunks, status records, attestation metadata
 // All entries use TTL management with LEDGERS_IN_ONE_YEAR renewal period for durability.
+
 
 #[contract]
 pub struct Indexer;
@@ -88,6 +89,27 @@ const RECIPIENT_ATTESTATION_COUNT: Symbol = symbol_short!("RATTC");
 /// bound is imposed on `UID` in downstream test builds.
 type IndexRecord = (Address, UID, Address);
 
+/// Dimension of an index chunk, used as the topic discriminator for
+/// `ChunkAllocated` / `ChunkFilled` events so off-chain consumers can
+/// reconstruct the chunk graph per lookup key.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkDimension {
+    Recipient,
+    Schema,
+    Attester,
+}
+
+/// Payload for `ChunkAllocated`: identifies the key, chunk index, and the
+/// starting UID stored at position 0 of the newly initialized chunk.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkAllocatedEvent {
+    pub key: Val,
+    pub chunk_index: u32,
+    pub start_uid: UID,
+}
+
 /// Lifecycle state the indexer tracks per attestation UID so filtered
 /// queries can hide revoked / replaced entries without deleting history.
 #[contracttype]
@@ -139,6 +161,26 @@ fn check_query_limit(env: &Env) -> Result<(), SASError> {
     Ok(())
 }
 
+/// Emits `ChunkAllocated` for a freshly created chunk. Called only when the
+/// chunk vector was empty before the current push, so exactly one event is
+/// emitted per chunk index per key.
+fn emit_chunk_allocated(
+    env: &Env,
+    dimension: ChunkDimension,
+    key: Val,
+    chunk_index: u32,
+    start_uid: &UID,
+) {
+    env.events().publish(
+        (CHUNK_ALLOCATED, dimension),
+        ChunkAllocatedEvent {
+            key,
+            chunk_index,
+            start_uid: start_uid.clone(),
+        },
+    );
+}
+
 fn required_upgrade_address(env: &Env, key: &Symbol) -> Result<Address, SASError> {
     let Some(raw): Option<Val> = env.storage().instance().get(key) else {
         return Err(SASError::IncompatibleDependency);
@@ -171,6 +213,17 @@ fn validate_upgrade(
         return Err(SASError::InvalidValue);
     }
     Ok(admin)
+}
+
+/// Emits `ChunkFilled` when a chunk reaches `MAX_CHUNK_SIZE`. The event
+/// carries the same key/chunk_index pair as the corresponding
+/// `ChunkAllocated`, letting scrapers close the chunk and expect the next
+/// allocation at `chunk_index + 1`.
+fn emit_chunk_filled(env: &Env, dimension: ChunkDimension, key: Val, chunk_index: u32) {
+    env.events().publish(
+        (CHUNK_FILLED, dimension),
+        (key, chunk_index),
+    );
 }
 
 fn require_indexer_admin(env: &Env) -> Address {
@@ -257,6 +310,7 @@ where
 fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
+    let dimension = chunk_dimension_for_total(total_key);
     let mut chunk_index = total / MAX_CHUNK_SIZE;
     let mut chunk: soroban_sdk::Vec<UID> = env
         .storage()
@@ -271,6 +325,9 @@ fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
             .get(&(key.clone(), chunk_index))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
     }
+    if chunk.is_empty() {
+        emit_chunk_allocated(env, dimension, key.clone().into_val(env), chunk_index, uid);
+    }
     chunk.push_back(uid.clone());
     let storage_key = (key.clone(), chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
@@ -278,6 +335,9 @@ fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
         .persistent()
         .extend_ttl(&storage_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 
+    if chunk.len() == MAX_CHUNK_SIZE {
+        emit_chunk_filled(env, dimension, key.clone().into_val(env), chunk_index);
+    }
     total += 1;
     env.storage().persistent().set(&count_key, &total);
     env.storage()
@@ -320,6 +380,7 @@ fn index_recipient_attestation(env: &Env, recipient: &Address, uid: &UID) {
 fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
+    let dimension = chunk_dimension_for_total(total_key);
     let mut chunk_index = total / MAX_CHUNK_SIZE;
     let mut chunk: soroban_sdk::Vec<UID> = env
         .storage()
@@ -334,6 +395,9 @@ fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
             .get(&(key.clone(), chunk_index))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
     }
+    if chunk.is_empty() {
+        emit_chunk_allocated(env, dimension, key.clone().into_val(env), chunk_index, uid);
+    }
     chunk.push_back(uid.clone());
     let storage_key = (key.clone(), chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
@@ -341,12 +405,28 @@ fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
         .persistent()
         .extend_ttl(&storage_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 
+    if chunk.len() == MAX_CHUNK_SIZE {
+        emit_chunk_filled(env, dimension, key.clone().into_val(env), chunk_index);
+    }
     total += 1;
     env.storage().persistent().set(&count_key, &total);
     env.storage()
         .persistent()
         .extend_ttl(&count_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
     extend_instance_ttl(env);
+}
+
+/// Maps a per-dimension total counter symbol to its chunk dimension, so the
+/// shared `index_address_uid` / `index_uid_uid` writers can tag events with
+/// the correct topic without duplicating the write path per dimension.
+fn chunk_dimension_for_total(total_key: Symbol) -> ChunkDimension {
+    if total_key == SCHEMA_TOTAL {
+        ChunkDimension::Schema
+    } else if total_key == ATTESTER_TOTAL {
+        ChunkDimension::Attester
+    } else {
+        ChunkDimension::Recipient
+    }
 }
 
 /// Records a non-default lifecycle state for `uid`. Only `Revoked` /
