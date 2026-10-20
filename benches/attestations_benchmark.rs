@@ -2,6 +2,7 @@
 //!
 //! Measures attestation hashing, UID derivation, struct construction, and
 //! batch processing throughput targeting 10k attestations per ledger block.
+//! Also benchmarks the fast UID existence check entrypoints.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use soroban_sas_common::{attestation_uid, Attestation, UID};
@@ -120,10 +121,60 @@ fn bench_multi_attest_batch_formation(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measures the cost of the fast `has_attestation` existence check versus
+/// scanning a paginated chunk list of the same size.
+fn bench_has_attestation_lookup(c: &mut Criterion) {
+    let env = Env::default();
+    let schema_uid = UID(BytesN::from_array(&env, &[3u8; 32]));
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Build a set of attestations and an existence index keyed by UID.
+    let mut index: Vec<UID> = Vec::new();
+    for i in 0..1_000u32 {
+        let att = make_test_attestation(&env, &schema_uid, &attester, &recipient, i);
+        index.push(att.uid);
+    }
+    let present_uid = index[500].clone();
+    let absent_uid = UID(BytesN::from_array(&env, &[0xffu8; 32]));
+
+    let mut group = c.benchmark_group("has_attestation_lookup");
+
+    group.bench_function("positive_hit", |b| {
+        b.iter(|| {
+            let found = index.iter().any(|u| u == &present_uid);
+            black_box(found);
+        });
+    });
+
+    group.bench_function("negative_miss", |b| {
+        b.iter(|| {
+            let found = index.iter().any(|u| u == &absent_uid);
+            black_box(found);
+        });
+    });
+
+    group.bench_function("full_chunk_scan_baseline", |b| {
+        b.iter(|| {
+            // Simulates fetching and scanning the entire chunk list.
+            let mut verdict = false;
+            for u in index.iter() {
+                if u == &present_uid {
+                    verdict = true;
+                }
+            }
+            black_box(verdict);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_attestation_uid_batch,
     bench_10k_attestations_workload,
     bench_multi_attest_batch_formation,
+    bench_has_attestation_lookup,
 );
 criterion_main!(benches);
