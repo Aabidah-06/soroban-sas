@@ -2423,7 +2423,7 @@ impl IndexerClient {
     pub fn get_count_by_expiration(
         &self,
         rpc: &RpcClient,
-        expiration_status: soroban_sas_common::ExpirationStatus,
+        expiration_status: ExpirationStatus,
     ) -> Result<u32, SdkError> {
         let env = &Env::default();
         let arg = simulate::encode_arg(env, &expiration_status)?;

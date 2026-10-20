@@ -612,7 +612,12 @@ impl Indexer {
         sas.require_auth();
         extend_instance_ttl(&env);
 
-        let record: IndexRecord = (recipient.clone(), schema_uid.clone(), attester.clone(), expiration_time);
+        let record: IndexRecord = (
+            recipient.clone(),
+            schema_uid.clone(),
+            attester.clone(),
+            expiration_time,
+        );
         let record_key = (INDEXED_KEY, uid.clone());
         if let Some(existing) = env
             .storage()

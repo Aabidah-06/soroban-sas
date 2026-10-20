@@ -6,10 +6,6 @@ use soroban_sdk::{Env, String as SorobanString};
 const MAX_LEN: usize = 1024;
 const MAX_FIELDS: usize = 64; // = MAX_SCHEMA_FIELDS
 
-fn is_ws(c: char) -> bool {
-    matches!(c, ' ' | '\n' | '\r' | '\t' | '\x0b' | '\x0c')
-}
-
 fuzz_target!(|data: &[u8]| {
     let env = Env::default();
     let schema = SorobanString::from_bytes(&env, data);
