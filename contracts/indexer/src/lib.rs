@@ -81,12 +81,12 @@ const RECIPIENT_ATTESTATION: Symbol = symbol_short!("RATT");
 /// directly mapped to `recipient`.
 const RECIPIENT_ATTESTATION_COUNT: Symbol = symbol_short!("RATTC");
 
-/// The `(recipient, schema_uid, attester)` triple a UID was first indexed
+/// The `(recipient, schema_uid, attester, expiration_time)` quadruple a UID was first indexed
 /// with. A later `index_attestation` for the same UID must supply an
-/// identical triple (idempotent retry) or it is rejected. Stored as a plain
+/// identical quadruple (idempotent retry) or it is rejected. Stored as a plain
 /// tuple rather than a `#[contracttype]` struct so no `arbitrary`/testutils
 /// bound is imposed on `UID` in downstream test builds.
-type IndexRecord = (Address, UID, Address);
+type IndexRecord = (Address, UID, Address, u64);
 
 /// Lifecycle state the indexer tracks per attestation UID so filtered
 /// queries can hide revoked / replaced entries without deleting history.
@@ -555,17 +555,20 @@ impl Indexer {
     /// address to authorize against.
     ///
     /// Idempotent: a repeated call with the **same**
-    /// `(recipient, schema_uid, attester)` triple is a no-op (it only
+    /// `(recipient, schema_uid, attester, expiration_time)` quadruple is a no-op (it only
     /// renews TTLs), so a retried cross-contract call or a migration replay
-    /// can't duplicate query results or inflate storage. A repeated call
-    /// for the same `uid` with a **different** triple is rejected with
-    /// `SASError::DuplicateAttestation`.
+    /// can't duplicate query results or inflate storage. This ensures that
+    /// `bulk_reindex` replays after partial failures are safe: if some UIDs
+    /// were successfully indexed before a failure, replaying the entire batch
+    /// won't create duplicates. A repeated call for the same `uid` with a
+    /// **different** quadruple is rejected with `SASError::DuplicateAttestation`.
     pub fn index_attestation(
         env: Env,
         uid: UID,
         recipient: Address,
         schema_uid: UID,
         attester: Address,
+        expiration_time: u64,
     ) {
         let Some(sas): Option<Address> = env.storage().instance().get(&SAS_CONTRACT) else {
             panic_with_error!(&env, SASError::Unauthorized);
@@ -573,7 +576,7 @@ impl Indexer {
         sas.require_auth();
         extend_instance_ttl(&env);
 
-        let record: IndexRecord = (recipient.clone(), schema_uid.clone(), attester.clone());
+        let record: IndexRecord = (recipient.clone(), schema_uid.clone(), attester.clone(), expiration_time);
         let record_key = (INDEXED_KEY, uid.clone());
         if let Some(existing) = env
             .storage()
@@ -605,6 +608,13 @@ impl Indexer {
         index_recipient_attestation(&env, &recipient, &uid);
         index_uid_uid(&env, &schema_uid, &uid, SCHEMA_TOTAL);
         index_address_uid(&env, &attester, &uid, ATTESTER_TOTAL);
+
+        let expiration_status = if expiration_time == 0 {
+            ExpirationStatus::Perpetual
+        } else {
+            ExpirationStatus::Expiring
+        };
+        index_expiration_status(&env, expiration_status, &uid);
 
         // Progress for off-chain consumers (issue #315). Emitted only on the
         // first successful index of this UID, after the counters have moved.
