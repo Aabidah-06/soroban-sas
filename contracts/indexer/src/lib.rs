@@ -55,7 +55,26 @@ pub const CURRENT_WASM_HASH: Symbol = symbol_short!("WASMHASH");
 /// Highest version whose upgrade path this build knows and has been audited
 /// to activate. Increase only as part of a reviewed release.
 pub const MAX_KNOWN_VERSION: u32 = 2;
-const MAX_CHUNK_SIZE: u32 = 100;
+/// Default chunk capacity (UIDs per chunk) used when no adaptive tier has
+/// been recorded in instance storage. Kept at the historical value so
+/// existing deployments read their chunks with the same layout they were
+/// written with.
+const DEFAULT_CHUNK_SIZE: u32 = 100;
+/// Smallest chunk capacity the adaptive tiering will ever select. Bounds
+/// the number of storage writes per chunk so a single `set` stays well
+/// under the Soroban ledger entry size cap.
+const MIN_CHUNK_SIZE: u32 = 25;
+/// Largest chunk capacity the adaptive tiering will ever select. Bounds
+/// the serialized size of one chunk vector so it cannot exceed the
+/// Soroban ledger entry read/write byte boundary.
+const MAX_CHUNK_SIZE: u32 = 200;
+/// Approximate serialized size of one `UID` (32-byte hash) plus its XDR
+/// length prefix, used to derive the byte-bounded chunk capacity.
+const UID_BYTES: u32 = 36;
+/// Conservative per-entry byte budget for a single chunk write. Soroban
+/// caps a ledger entry at 64 KiB; leaving headroom for the vector header
+/// and key keeps writes strictly under the cap.
+const MAX_CHUNK_BYTES: u32 = 32_768;
 const MAX_QUERIES_PER_BLOCK: u32 = 1000;
 const RECIPIENT_TOTAL: Symbol = symbol_short!("RCOUNT");
 const SCHEMA_TOTAL: Symbol = symbol_short!("SCOUNT");
@@ -80,6 +99,12 @@ const RECIPIENT_ATTESTATION: Symbol = symbol_short!("RATT");
 /// `(RECIPIENT_ATTESTATION_COUNT, recipient)` stores the number of UIDs
 /// directly mapped to `recipient`.
 const RECIPIENT_ATTESTATION_COUNT: Symbol = symbol_short!("RATTC");
+/// Instance key recording the active adaptive chunk capacity (in UIDs).
+/// Absent on legacy deployments, which fall back to `DEFAULT_CHUNK_SIZE`.
+const CHUNK_CAPACITY: Symbol = symbol_short!("CHUNKCAP");
+/// Instance key recording the storage tier the chunk capacity was derived
+/// from, so operators can audit why a given capacity was chosen.
+const CHUNK_TIER: Symbol = symbol_short!("CHUNKTIER");
 
 /// The `(recipient, schema_uid, attester)` triple a UID was first indexed
 /// with. A later `index_attestation` for the same UID must supply an
@@ -137,6 +162,45 @@ fn check_query_limit(env: &Env) -> Result<(), SASError> {
         .set(&QUERY_COUNTER_COUNT, &new_count);
 
     Ok(())
+}
+
+/// Returns the active chunk capacity (UIDs per chunk) for this indexer.
+///
+/// Reads the adaptive capacity recorded in instance storage, clamped to
+/// `[MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]`. Legacy deployments without the key
+/// fall back to `DEFAULT_CHUNK_SIZE`, preserving their existing chunk
+/// layout. The result is additionally bounded by the byte budget so a
+/// single chunk write can never exceed the Soroban ledger entry size cap.
+fn chunk_capacity(env: &Env) -> u32 {
+    let stored: u32 = env
+        .storage()
+        .instance()
+        .get(&CHUNK_CAPACITY)
+        .unwrap_or(DEFAULT_CHUNK_SIZE);
+    let byte_bound = MAX_CHUNK_BYTES / UID_BYTES;
+    let upper = core::cmp::min(MAX_CHUNK_SIZE, byte_bound);
+    let lower = core::cmp::min(MIN_CHUNK_SIZE, upper);
+    stored.clamp(lower, upper)
+}
+
+/// Derives an adaptive chunk capacity from a storage tier benchmark.
+///
+/// `tier` is a coarse volume signal (expected UIDs per lookup key): low
+/// volume keys get small chunks to avoid over-allocating storage entries,
+/// high volume keys get larger chunks to reduce per-entry overhead while
+/// staying under the byte cap. The result is clamped by `chunk_capacity`'s
+/// bounds so it is always safe to write.
+fn adaptive_capacity_for_tier(tier: u32) -> u32 {
+    let byte_bound = MAX_CHUNK_BYTES / UID_BYTES;
+    let upper = core::cmp::min(MAX_CHUNK_SIZE, byte_bound);
+    let lower = core::cmp::min(MIN_CHUNK_SIZE, upper);
+    let candidate = match tier {
+        0 => MIN_CHUNK_SIZE,
+        1 => 50,
+        2 => 100,
+        _ => MAX_CHUNK_SIZE,
+    };
+    candidate.clamp(lower, upper)
 }
 
 fn required_upgrade_address(env: &Env, key: &Symbol) -> Result<Address, SASError> {
@@ -257,13 +321,14 @@ where
 fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
-    let mut chunk_index = total / MAX_CHUNK_SIZE;
+    let capacity = chunk_capacity(env);
+    let mut chunk_index = total / capacity;
     let mut chunk: soroban_sdk::Vec<UID> = env
         .storage()
         .persistent()
         .get(&(key.clone(), chunk_index))
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
-    if chunk.len() >= MAX_CHUNK_SIZE {
+    if chunk.len() >= capacity {
         chunk_index += 1;
         chunk = env
             .storage()
@@ -320,13 +385,14 @@ fn index_recipient_attestation(env: &Env, recipient: &Address, uid: &UID) {
 fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
-    let mut chunk_index = total / MAX_CHUNK_SIZE;
+    let capacity = chunk_capacity(env);
+    let mut chunk_index = total / capacity;
     let mut chunk: soroban_sdk::Vec<UID> = env
         .storage()
         .persistent()
         .get(&(key.clone(), chunk_index))
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
-    if chunk.len() >= MAX_CHUNK_SIZE {
+    if chunk.len() >= capacity {
         chunk_index += 1;
         chunk = env
             .storage()
@@ -381,14 +447,15 @@ fn collect_filtered(
 ) -> soroban_sdk::Vec<UID> {
     let mut out = soroban_sdk::Vec::new(env);
     let mut index = 0u32;
+    let capacity = chunk_capacity(env);
     while index < total {
-        let chunk_index = index / MAX_CHUNK_SIZE;
-        let chunk_offset = index % MAX_CHUNK_SIZE;
+        let chunk_index = index / capacity;
+        let chunk_offset = index % capacity;
         let Some(chunk) = get_chunk(chunk_index) else {
             break;
         };
         if chunk_offset >= chunk.len() {
-            index = (chunk_index + 1) * MAX_CHUNK_SIZE;
+            index = (chunk_index + 1) * capacity;
             continue;
         }
         let available = chunk.len() - chunk_offset;
@@ -426,15 +493,16 @@ fn collect_page(
 
     let end = core::cmp::min(total, cursor.saturating_add(limit));
     let mut index = cursor;
+    let capacity = chunk_capacity(env);
     while index < end {
-        let chunk_index = index / MAX_CHUNK_SIZE;
-        let chunk_offset = index % MAX_CHUNK_SIZE;
+        let chunk_index = index / capacity;
+        let chunk_offset = index % capacity;
         let Some(chunk) = get_chunk(chunk_index) else {
             break;
         };
 
         if chunk_offset >= chunk.len() {
-            index = (chunk_index + 1) * MAX_CHUNK_SIZE;
+            index = (chunk_index + 1) * capacity;
             continue;
         }
 
@@ -540,6 +608,37 @@ impl Indexer {
     pub fn get_sas(env: Env) -> Option<Address> {
         extend_instance_ttl(&env);
         env.storage().instance().get(&SAS_CONTRACT)
+    }
+
+    /// Returns the active adaptive chunk capacity (UIDs per chunk) used by
+    /// the write path. Legacy deployments without a recorded capacity
+    /// report `DEFAULT_CHUNK_SIZE`.
+    pub fn get_chunk_capacity(env: Env) -> u32 {
+        extend_instance_ttl(&env);
+        chunk_capacity(&env)
+    }
+
+    /// Returns the storage tier the active chunk capacity was derived from,
+    /// or `None` when the capacity has never been tuned.
+    pub fn get_chunk_tier(env: Env) -> Option<u32> {
+        extend_instance_ttl(&env);
+        env.storage().instance().get(&CHUNK_TIER)
+    }
+
+    /// Admin-only: records an adaptive chunk capacity derived from a
+    /// storage tier benchmark. `tier` is a coarse volume signal (0 = low
+    /// volume, 3 = high volume). The stored capacity is clamped to the
+    /// byte-bounded safe range so subsequent chunk writes stay strictly
+    /// under the Soroban ledger entry size cap. Existing chunks are left
+    /// untouched; only future writes use the new capacity.
+    pub fn set_chunk_tier(env: Env, tier: u32) {
+        extend_instance_ttl(&env);
+        let admin = require_indexer_admin(&env);
+        admin.require_auth();
+        let capacity = adaptive_capacity_for_tier(tier);
+        env.storage().instance().set(&CHUNK_CAPACITY, &capacity);
+        env.storage().instance().set(&CHUNK_TIER, &tier);
+        extend_instance_ttl(&env);
     }
 
     /// Records `uid` in the recipient, schema, and attester indexes.
@@ -964,9 +1063,10 @@ impl Indexer {
         let mut index = cursor;
         let mut loaded: Option<u32> = None;
         let mut chunk = soroban_sdk::Vec::new(&env);
+        let capacity = chunk_capacity(&env);
         while index < total && out.len() < limit {
-            let chunk_index = index / MAX_CHUNK_SIZE;
-            let chunk_offset = index % MAX_CHUNK_SIZE;
+            let chunk_index = index / capacity;
+            let chunk_offset = index % capacity;
             if loaded != Some(chunk_index) {
                 let Some(next) = read_chunk(&env, &(issuer.clone(), chunk_index)) else {
                     break;
@@ -975,7 +1075,7 @@ impl Indexer {
                 loaded = Some(chunk_index);
             }
             if chunk_offset >= chunk.len() {
-                index = (chunk_index + 1) * MAX_CHUNK_SIZE;
+                index = (chunk_index + 1) * capacity;
                 continue;
             }
             if let Some(uid) = chunk.get(chunk_offset) {
@@ -1022,9 +1122,10 @@ impl Indexer {
         // instead of per chunk.
         let mut loaded: Option<u32> = None;
         let mut chunk = soroban_sdk::Vec::new(&env);
+        let capacity = chunk_capacity(&env);
         while index < total && out.len() < limit {
-            let chunk_index = index / MAX_CHUNK_SIZE;
-            let chunk_offset = index % MAX_CHUNK_SIZE;
+            let chunk_index = index / capacity;
+            let chunk_offset = index % capacity;
             if loaded != Some(chunk_index) {
                 let Some(next) = read_chunk(&env, &(recipient.clone(), chunk_index)) else {
                     break;
@@ -1033,7 +1134,7 @@ impl Indexer {
                 loaded = Some(chunk_index);
             }
             if chunk_offset >= chunk.len() {
-                index = (chunk_index + 1) * MAX_CHUNK_SIZE;
+                index = (chunk_index + 1) * capacity;
                 continue;
             }
             if let Some(uid) = chunk.get(chunk_offset) {

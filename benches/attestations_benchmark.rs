@@ -2,6 +2,9 @@
 //!
 //! Measures attestation hashing, UID derivation, struct construction, and
 //! batch processing throughput targeting 10k attestations per ledger block.
+//!
+//! Also benchmarks dynamic chunk resizing based on ledger storage tier
+//! thresholds, ensuring chunk writes stay under Soroban entry size caps.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use soroban_sas_common::{attestation_uid, Attestation, UID};
@@ -88,6 +91,123 @@ fn bench_10k_attestations_workload(c: &mut Criterion) {
     group.finish();
 }
 
+/// Soroban ledger entry size cap (bytes) used to bound chunk writes.
+const SOROBAN_LEDGER_ENTRY_SIZE_CAP: usize = 65_536;
+
+/// Storage tier thresholds (bytes) driving adaptive chunk capacity selection.
+const STORAGE_TIER_THRESHOLDS: [usize; 4] = [4_096, 16_384, 32_768, 65_536];
+
+/// Approximate serialized size of a single attestation entry in bytes.
+const ATTESTATION_ENTRY_SIZE: usize = 256;
+
+/// Selects an adaptive chunk capacity for the given storage tier.
+///
+/// The capacity is derived from the tier threshold divided by the per-entry
+/// size, then clamped so the resulting chunk write never exceeds the Soroban
+/// ledger entry size cap.
+fn adaptive_chunk_capacity(tier_threshold: usize) -> usize {
+    let raw = tier_threshold / ATTESTATION_ENTRY_SIZE;
+    let max_entries = SOROBAN_LEDGER_ENTRY_SIZE_CAP / ATTESTATION_ENTRY_SIZE;
+    raw.clamp(1, max_entries)
+}
+
+/// Measures adaptive chunk capacity selection across storage tier thresholds.
+fn bench_adaptive_chunk_capacity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("adaptive_chunk_capacity");
+    for threshold in STORAGE_TIER_THRESHOLDS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threshold),
+            &threshold,
+            |b, &t| {
+                b.iter(|| black_box(adaptive_chunk_capacity(black_box(t))));
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Measures chunk write sizing to verify writes remain under the Soroban cap.
+fn bench_chunk_write_size_bounds(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chunk_write_size_bounds");
+    for threshold in STORAGE_TIER_THRESHOLDS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threshold),
+            &threshold,
+            |b, &t| {
+                b.iter(|| {
+                    let capacity = adaptive_chunk_capacity(t);
+                    let write_bytes = capacity * ATTESTATION_ENTRY_SIZE;
+                    assert!(write_bytes <= SOROBAN_LEDGER_ENTRY_SIZE_CAP);
+                    black_box(write_bytes);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Stress test: processes a large attestation sequence chunked adaptively.
+fn bench_large_attestation_sequence_chunked(c: &mut Criterion) {
+    let env = Env::default();
+    let schema_uid = UID(BytesN::from_array(&env, &[3u8; 32]));
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let mut group = c.benchmark_group("large_attestation_sequence_chunked");
+    group.sample_size(10);
+
+    for threshold in STORAGE_TIER_THRESHOLDS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threshold),
+            &threshold,
+            |b, &t| {
+                let capacity = adaptive_chunk_capacity(t);
+                b.iter(|| {
+                    let mut processed = 0usize;
+                    for chunk_start in (0..10_000).step_by(capacity) {
+                        let chunk_end = (chunk_start + capacity).min(10_000);
+                        for i in chunk_start..chunk_end {
+                            let att = make_test_attestation(
+                                &env,
+                                &schema_uid,
+                                &attester,
+                                &recipient,
+                                i as u32,
+                            );
+                            black_box(att.uid);
+                        }
+                        processed += chunk_end - chunk_start;
+                    }
+                    black_box(processed);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Compares read throughput across small and large chunk sizes.
+fn bench_chunk_read_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chunk_read_throughput");
+    for chunk_size in [10usize, 100, 1000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(chunk_size),
+            &chunk_size,
+            |b, &n| {
+                let entries: Vec<usize> = (0..n).collect();
+                b.iter(|| {
+                    let mut sum = 0usize;
+                    for entry in &entries {
+                        sum = sum.wrapping_add(*entry);
+                    }
+                    black_box(sum);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 /// Measures throughput for multi-attest batch sizes representing transaction units.
 fn bench_multi_attest_batch_formation(c: &mut Criterion) {
     let env = Env::default();
@@ -124,6 +244,10 @@ criterion_group!(
     benches,
     bench_attestation_uid_batch,
     bench_10k_attestations_workload,
+    bench_adaptive_chunk_capacity,
+    bench_chunk_write_size_bounds,
+    bench_large_attestation_sequence_chunked,
+    bench_chunk_read_throughput,
     bench_multi_attest_batch_formation,
 );
 criterion_main!(benches);
