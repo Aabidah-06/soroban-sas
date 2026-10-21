@@ -134,6 +134,29 @@ pub struct AttesterKeyRecord {
     pub revoked: bool,
 }
 
+/// On-chain schema revocation policy enforcement (#448).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RevocationPolicy {
+    /// Schema creator mandates that all attestations issued under this schema must be revocable.
+    RevocableOnly = 1,
+    /// Schema creator mandates that all attestations issued under this schema must be irrevocable.
+    IrrevocableOnly = 2,
+    /// Attester may choose whether each attestation is revocable or irrevocable.
+    Permissive = 3,
+}
+
+impl From<bool> for RevocationPolicy {
+    fn from(revocable: bool) -> Self {
+        if revocable {
+            RevocationPolicy::Permissive
+        } else {
+            RevocationPolicy::IrrevocableOnly
+        }
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)] // Optimize storage serialization (#284)
@@ -159,6 +182,7 @@ pub struct Attestation {
     pub attester: Address,
     pub revocable: bool,
     pub data: Bytes,
+    pub valid_from: u64,
 }
 
 /// Compact internal storage representation for Attestation records (#438).
@@ -274,6 +298,7 @@ impl CompactAttestation {
             attester: self.attester.clone(),
             revocable,
             data: self.data.clone(),
+            valid_from: 0,
         }
     }
 
