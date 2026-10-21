@@ -1,1 +1,87 @@
-W3dvcmtzcGFjZV0KbWVtYmVycyA9IFsKICAgICJwYWNrYWdlcy9zb3JvYmFuLXNhcy1jb21tb24iLAogICAgImNvbnRyYWN0cy9zY2hlbWEtcmVnaXN0cnkiLAogICAgImNvbnRyYWN0cy9zYXMiLAogICAgImNvbnRyYWN0cy9pbmRleGVyIiwKICAgICJwYWNrYWdlcy9zb3JvYmFuLXNhcy1zZGsiLAogICAgInBhY2thZ2VzL3Nvcm9iYW4tc2FzLWNsaSIsCiAgICAiY29udHJhY3RzL3Blcm1pc3NpdmUtcmVzb2x2ZXIiLAogICAgImNvbnRyYWN0cy90b2tlbi1nYXRlZC1yZXNvbHZlciIsCiAgICAidG9vbHMvcHJvbWV0aGV1cy1leHBvcnRlciIsCiAgICAiY29udHJhY3RzL2Nyb3NzLWNoYWluLXZlcmlmaWVyIiwKXQpleGNsdWRlID0gWyJmdXp6IiwgInRvb2xzL2dhcy1wcm9maWxlciJdCnJlc29sdmVyID0gIjIiCgpbcGFja2FnZV0KbmFtZSA9ICJzb3JvYmFuLXNhcy13b3Jrc3BhY2UiCnZlcnNpb24gPSAiMC4wLjAiCmVkaXRpb24gPSAiMjAyMSIKcHVibGlzaCA9IGZhbHNlCgpbZGVwZW5kZW5jaWVzXQpjcml0ZXJpb24gPSB7IHdvcmtzcGFjZSA9IHRydWUgfQpzb3JvYmFuLXNhcy1jb21tb24gPSB7IHdvcmtzcGFjZSA9IHRydWUgfQpzb3JvYmFuLXNhcy1zZGsgPSB7IHBhdGggPSAicGFja2FnZXMvc29yb2Jhbi1zYXMtc2RrIiB9CnNvcm9iYW4tc2RrID0geyB3b3Jrc3BhY2UgPSB0cnVlLCBmZWF0dXJlcyA9IFsidGVzdHV0aWxzIl0gfQpoZXggPSAiMC40IgpzdGVsbGFyLXN0cmtrZXkgPSAiMC4wLjgiCmVkMjU1MTktZGFsZWsgPSAiMi4wLjAiCgpbZGV2LWRlcGVuZGVuY2llc10KdG9raW8gPSB7IHZlcnNpb24gPSAiMSIsIGZlYXR1cmVzID0gWyJydC1tdWx0aS10aHJlYWQiLCAibWFjcm9zIiwgInRpbWUiXSB9CnVyZXEgPSAiMiIKCltbYmVuY2hdXQKbmFtZSA9ICJoYXNoaW5nX2JlbmNobWFyayIKaGFybmVzcyA9IGZhbHNlCgpbW2JlbmNoXV0KbmFtZSA9ICJhdHRlc3RhdGlvbnNfYmVuY2htYXJrIgpoYXJuZXNzID0gZmFsc2UKCltbdGVzdF1dCm5hbWUgPSAiaW50ZWdyYXRpb24iCnBhdGggPSAidGVzdHMvaW50ZWdyYXRpb24vZTJlX25vZGVfdGVzdC5ycyIKClt3b3Jrc3BhY2UubGludHMucnVzdF0KdW5leHBlY3RlZF9jZmdzID0gImFsbG93IgoKW3Byb2ZpbGUuZGV2XQpvcHQtbGV2ZWwgPSAwCmRlYnVnID0gdHJ1ZQpvdmVyZmxvdy1jaGVja3MgPSB0cnVlCgpbcHJvZmlsZS5yZWxlYXNlXQpvcHQtbGV2ZWwgPSAieiIKb3ZlcmZsb3ctY2hlY2tzID0gdHJ1ZQpkZWJ1ZyA9IDAKc3RyaXAgPSAic3ltYm9scyIKZGVidWctYXNzZXJ0aW9ucyA9IGZhbHNlCnBhbmljID0gImFib3J0Igpjb2RlZ2VuLXVuaXRzID0gMQpsdG8gPSB0cnVlCgoKW3Byb2ZpbGUucmVsZWFzZS13aXRoLWxvZ3NdCmluaGVyaXRzID0gInJlbGVhc2UiCmRlYnVnLWFzc2VydGlvbnMgPSB0cnVlCgpbcHJvZmlsZS50ZXN0XQpwYW5pYyA9ICJ1bndpbmQiCgpbd29ya3NwYWNlLmRlcGVuZGVuY2llc10Kc29yb2Jhbi1zZHkgPSAiMjEuNy43Igpjcml0ZXJpb24gPSB7IHZlcnNpb24gPSAiMC41IiwgZmVhdHVyZXMgPSBbImh0bWxfcmVwb3J0cyJdIH0Kc29yb2Jhbi1zYXMtY29tbW9uID0geyBwYXRoID0gInBhY2thZ2VzL3Nvcm9iYW4tc2FzLWNvbW1vbiIgfQoKW3dvcmtzcGFjZS5saW50cy5jbGlwcHldCm5ld193aXRob3V0X2RlZmF1bHQgPSAiYWxsb3ciCgpbcG9ydGFibGVdCg==[package.metadata.docs]
+[workspace]
+members = [
+    "packages/soroban-sas-common",
+    "contracts/schema-registry",
+    "contracts/sas",
+    "contracts/indexer",
+    "packages/soroban-sas-sdk",
+    "packages/soroban-sas-cli",
+    "contracts/permissive-resolver",
+    "contracts/token-gated-resolver",
+    "tools/prometheus-exporter",
+    "contracts/cross-chain-verifier",
+    "contracts/zk-verifier",
+]
+exclude = ["fuzz", "tools/gas-profiler"]
+resolver = "2"
+
+[package]
+name = "soroban-sas-workspace"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+criterion = { workspace = true }
+soroban-sas-common = { workspace = true }
+soroban-sas-sdk = { path = "packages/soroban-sas-sdk" }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+hex = "0.4"
+stellar-strkey = "0.0.8"
+ed25519-dalek = "2.0.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+ureq = "2"
+
+[[bench]]
+name = "hashing_benchmark"
+harness = false
+
+[[bench]]
+name = "attestations_benchmark"
+harness = false
+
+[[test]]
+name = "integration"
+path = "tests/integration/e2e_node_test.rs"
+
+[workspace.lints.rust]
+unexpected_cfgs = "allow"
+
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
+
+[profile.test]
+panic = "unwind"
+
+[workspace.dependencies]
+soroban-sdk = "21.7.7"
+criterion = { version = "0.5", features = ["html_reports"] }
+soroban-sas-common = { path = "packages/soroban-sas-common" }
+
+[workspace.lints.clippy]
+new_without_default = "allow"
+
+[portable]
+
+[package.metadata.docs]
+all-features = true
+documentation = "https://soroban-sas.github.io/soroban-sas-sdk/"
