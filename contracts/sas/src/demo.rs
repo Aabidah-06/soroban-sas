@@ -1,19 +1,19 @@
 //! A narrated, end-to-end walkthrough of the attestation service, run
-//! entirely in-process (no network, no funded accounts) against the *real*
-//! `schema-registry` and `sas` contracts — not mocks. Run it with:
-//!
-//!   cargo test -p sas --lib demo:: -- --nocapture
-//!
-//! and record the terminal output: it prints each step of the protocol as
-//! it happens, so the output itself tells the story of what the service
-//! does — register a schema, issue an attestation against it, verify it,
-//! then revoke it and verify again.
+/// entirely in-process (no network, no funded accounts) against the *real*
+/// `schema-registry` and `sas` contracts — not mocks. Run it with:
+///
+///   cargo test -p sas --lib demo:: -- --nocapture
+///
+/// and record the terminal output: it prints each step of the protocol as
+/// it happens, so the output itself tells the story of what the service
+/// does — register a schema, issue an attestation against it, verify it,
+/// then revoke it and verify again.
 
 use crate::{SASClient, SAS};
 use schema_registry::{SchemaRegistry, SchemaRegistryClient};
 use soroban_sas_common::{Attestation, UID};
 use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String as SorobanString};
+use soroban_sdk:{contract, contractimpl, Address, Bytes, BytesN, Env, String as SorobanString};
 
 /// A resolver that accepts every attestation unconditionally. Schemas name a
 /// resolver contract that gets the final say on each attestation issued
@@ -32,12 +32,24 @@ mod noop_resolver {
     }
 }
 
-#[test]
+/// The canonical schema string the demo registers. Exposed so the explorer tooling
+/// (schema builder UI + code snippets) can reuse the exact same string and thus
+/// derive the identical `schema_uid`.
+const DEMO_SCHEMA: &str = "bool is_verified_human";
+
+/// Returns the canonical schema string used by the demo. This is the single
+/// source of truth for the demo schema and is used by the explorer's visual
+/// builder to produce a string matching protocol rules.
+pub fn demo_schema_string() -> &'static str {
+    DEMO_SCHEMA
+}
+
+# [test]
 fn demo_register_schema_then_attest_verify_and_revoke() {
     let env = Env::default();
     env.mock_all_auths();
 
-    println!("\n=== soroban-sas: schema -> attestation -> verification demo ===\n");
+    println("\n=== soroban-sas: schema -> attestation -> verification demo ===\n");
 
     // --- Deploy the three parties: a schema registry, the core SAS
     // contract, and a resolver the demo schema will delegate to. ---
@@ -52,17 +64,17 @@ fn demo_register_schema_then_attest_verify_and_revoke() {
 
     let resolver_id = env.register_contract(None, noop_resolver::NoopResolver);
 
-    println!(
+    println(
         "1. Deployed schema-registry ({registry_id:?}) and sas ({sas_id:?}), bound together.\n"
     );
 
     // --- Step 1: register a schema. This is the "shape of the claim" every
     // attestation issued under it will follow. ---
     let issuer = Address::generate(&env);
-    let schema_str = SorobanString::from_str(&env, "bool is_verified_human");
+    let schema_str = SorobanString::from_str(&env, demo_schema_string());
     let schema_uid = registry.register(&issuer, &schema_str, &resolver_id, &true);
 
-    println!("2. Registered schema \"bool is_verified_human\"");
+    println!("2. Registered schema \"{DEMO_SCHEMA}\"");
     println!("   schema_uid: {}\n", hex::encode(schema_uid.0.to_array()));
 
     // --- Step 2: schema owner authorizes a delegate. ---
