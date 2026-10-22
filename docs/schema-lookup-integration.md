@@ -42,6 +42,10 @@ Invalidation also prevents any older in-flight background refresh from
 repopulating that UID. `SchemaCache::stats` exposes hit, miss, expiration,
 eviction, and refresh counters.
 
+Run `cargo bench --bench schema_cache_benchmark` to compare cached hits with
+uncached lookups against a loopback RPC stub at 1, 4, and 16 concurrent
+workers. The benchmark does not contact a live network.
+
 ## Schema Registry Contract
 
 The Schema Registry stores schema definitions and maintains their metadata. Each schema has:
