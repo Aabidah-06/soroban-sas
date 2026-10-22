@@ -171,7 +171,7 @@ pub(crate) fn validate_simulated_transaction(
     if invoke_args.function_name.0.to_string() != function_name {
         return Err(SdkError::ValidationError(format!(
             "function name mismatch: expected {function_name}, got {}",
-            invoke_args.function_name.0.to_string()
+            invoke_args.function_name.0
         )));
     }
 

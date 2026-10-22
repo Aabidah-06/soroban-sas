@@ -14,6 +14,11 @@ pub enum SASError {
     InvalidSchema = 101,
     SchemaAlreadyExists = 102,
     SchemaNotFound = 103,
+    /// A schema definition string violated strict lexical rules: it contained
+    /// control characters, invalid/invisible unicode whitespace, or malformed
+    /// separators (trailing/leading delimiters, non-canonical spacing). See
+    /// `validate_schema_lexical`.
+    InvalidSchemaDefinition = 104,
 
     /// Attestation lifecycle errors
     AttestationNotFound = 201,
@@ -21,6 +26,11 @@ pub enum SASError {
     NotRevocable = 203,
     AlreadyExpired = 204,
     DuplicateAttestation = 205,
+    /// An attestation's revocability flag violated the schema's revocation
+    /// policy: an irrevocable attestation was issued under a `RevocableOnly`
+    /// schema. (The inverse violation — a revocable attestation under an
+    /// `IrrevocableOnly` schema — reuses `NotRevocable`.)
+    InvalidRevocability = 206,
 
     /// Authorization errors
     Unauthorized = 301,

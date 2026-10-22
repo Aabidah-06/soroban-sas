@@ -13,6 +13,14 @@ pub const ATTESTED: Symbol = symbol_short!("ATTESTED");
 pub const REVOKED: Symbol = symbol_short!("REVOKED");
 /// First topic of every `SchemaRegistered` event.
 pub const REGISTERED: Symbol = symbol_short!("REGISTER");
+/// First topic of every `SchemaOwnershipProposed` event (#446).
+pub const SCHEMA_OWNERSHIP_PROPOSED: Symbol = symbol_short!("SCHPROP");
+/// First topic of every `SchemaOwnershipTransferred` event (#446).
+pub const SCHEMA_OWNERSHIP_TRANSFERRED: Symbol = symbol_short!("SCHOWN");
+/// First topic of every `SchemaOwnershipTransferCancelled` event (#446).
+pub const SCHEMA_OWNERSHIP_CANCELLED: Symbol = symbol_short!("SCHCANC");
+/// First topic of every `NoncesInvalidated` event (#437).
+pub const NONCES_INVALIDATED: Symbol = symbol_short!("NONCEINV");
 
 /// Payload of the `SchemaRegistered` event.
 ///
@@ -35,6 +43,43 @@ pub struct AttestationIssuedEvent {
     pub schema_uid: UID,
     pub attester: Address,
     pub recipient: Address,
+}
+
+/// Payload of the `SchemaOwnershipProposed` event (#446).
+///
+/// Published with topics `(SCHEMA_OWNERSHIP_PROPOSED, schema_uid)` when the
+/// current owner proposes a new owner in the two-step transfer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaOwnershipProposedEvent {
+    pub schema_uid: UID,
+    pub current_owner: Address,
+    pub proposed_owner: Address,
+}
+
+/// Payload of the `SchemaOwnershipTransferred` event (#446).
+///
+/// Published with topics `(SCHEMA_OWNERSHIP_TRANSFERRED, schema_uid)` when the
+/// proposed owner claims ownership.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaOwnershipTransferredEvent {
+    pub schema_uid: UID,
+    pub old_owner: Address,
+    pub new_owner: Address,
+}
+
+/// Payload of the `NoncesInvalidated` event (#437).
+///
+/// Published with topics `(NONCES_INVALIDATED, attester)`. `min_nonce` and
+/// `max_nonce` describe the inclusive range of delegation nonces cancelled by
+/// advancing the attester's high-water mark.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoncesInvalidatedEvent {
+    pub attester: Address,
+    pub min_nonce: u64,
+    pub max_nonce: u64,
 }
 
 /// Payload of the `AttestationRevoked` event.

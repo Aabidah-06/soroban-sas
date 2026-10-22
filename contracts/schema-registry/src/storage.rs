@@ -16,3 +16,13 @@ pub const REGISTRY_VERSION: Symbol = symbol_short!("VERSION");
 /// must be non-zero and not the current WASM's hash; unknown future
 /// versions are rejected.
 pub const UPGRADE_EVENT: Symbol = symbol_short!("UPGRADE");
+/// Maps a schema UID to its tri-state `RevocationPolicy` (#448). Stored only
+/// when a policy is set explicitly via `register_with_policy`; absent entries
+/// fall back to `RevocationPolicy::from(record.revocable)` so legacy boolean
+/// schemas keep their behaviour.
+/// Keyed as `(SCHEMA_POLICY, uid) -> RevocationPolicy`.
+pub const SCHEMA_POLICY: Symbol = symbol_short!("POLICY");
+/// Maps a schema UID to the address proposed as its next owner during a
+/// two-step ownership transfer (#446). Keyed as `(PENDING_OWNER, uid) ->
+/// Address`; removed once the transfer is claimed or cancelled.
+pub const PENDING_OWNER: Symbol = symbol_short!("PENDOWN");

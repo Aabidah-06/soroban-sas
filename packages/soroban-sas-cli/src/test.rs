@@ -2,7 +2,10 @@
 mod tests {
     use clap::Parser;
 
-    use crate::{decode_hex_or_base64, parse_uid, validate_schema_syntax, AttestCommands, Cli, Commands, OutputFormat};
+    use crate::{
+        decode_hex_or_base64, parse_uid, validate_schema_syntax, AttestCommands, Cli, Commands,
+        OutputFormat,
+    };
 
     #[test]
     fn test_cli_snapshot_formatting() {

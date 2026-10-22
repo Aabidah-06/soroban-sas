@@ -2,7 +2,9 @@
 #![no_std]
 #![allow(unused_variables)]
 
-use soroban_sas_common::{validate_schema_syntax, SASError, SchemaRecord, LEDGERS_IN_ONE_YEAR, UID};
+use soroban_sas_common::{
+    validate_schema_syntax, SASError, SchemaRecord, LEDGERS_IN_ONE_YEAR, UID,
+};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, xdr::ToXdr, Address, Bytes, Env, String,
 };
@@ -14,7 +16,9 @@ mod storage;
 use storage::*;
 
 fn extend_instance_ttl(env: &Env) {
-    env.storage().instance().extend_ttl(LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 }
 
 fn require_registry_admin(env: &Env) -> Address {
@@ -73,11 +77,7 @@ impl SchemaRegistry {
         let admin = require_registry_admin(&env);
         admin.require_auth();
 
-        let old_version: u32 = env
-            .storage()
-            .instance()
-            .get(&REGISTRY_VERSION)
-            .unwrap_or(1);
+        let old_version: u32 = env.storage().instance().get(&REGISTRY_VERSION).unwrap_or(1);
 
         // Reject unknown future versions before writing any state.
         // Genesis 1 -> only 2 is known; expand this allow-list as new
@@ -179,7 +179,41 @@ impl SchemaRegistry {
         resolver: Address,
         revocable: bool,
     ) -> UID {
+        Self::register_internal(env, owner, schema, resolver, revocable, None)
+    }
+
+    /// Registers a schema with an explicit tri-state [`RevocationPolicy`] (#448).
+    ///
+    /// The stored `SchemaRecord.revocable` boolean is derived from the policy
+    /// (`policy != IrrevocableOnly`) so the legacy boolean view stays
+    /// consistent with the richer policy. SAS core reads the policy back via
+    /// [`get_schema_policy`] when validating each attestation's revocability.
+    pub fn register_with_policy(
+        env: Env,
+        owner: Address,
+        schema: String,
+        resolver: Address,
+        policy: soroban_sas_common::RevocationPolicy,
+    ) -> UID {
+        let revocable = policy != soroban_sas_common::RevocationPolicy::IrrevocableOnly;
+        Self::register_internal(env, owner, schema, resolver, revocable, Some(policy))
+    }
+
+    fn register_internal(
+        env: Env,
+        owner: Address,
+        schema: String,
+        resolver: Address,
+        revocable: bool,
+        policy: Option<soroban_sas_common::RevocationPolicy>,
+    ) -> UID {
         extend_instance_ttl(&env);
+        // Strict lexical validation first (#447): control characters, invalid
+        // unicode whitespace, and malformed separators are rejected with the
+        // typed `InvalidSchemaDefinition` before the structural syntax check.
+        if let Err(err) = soroban_sas_common::validate_schema_lexical(&env, &schema) {
+            panic_with_error!(&env, err);
+        }
         if let Err(err) = validate_schema_syntax(&env, &schema) {
             panic_with_error!(&env, err);
         }
@@ -236,6 +270,16 @@ impl SchemaRegistry {
             LEDGERS_IN_ONE_YEAR,
         );
 
+        if let Some(policy) = policy {
+            let policy_key = (SCHEMA_POLICY, uid.clone());
+            env.storage().persistent().set(&policy_key, &policy);
+            env.storage().persistent().extend_ttl(
+                &policy_key,
+                LEDGERS_IN_ONE_YEAR,
+                LEDGERS_IN_ONE_YEAR,
+            );
+        }
+
         env.events().publish(
             (soroban_sas_common::events::REGISTERED, uid.clone()),
             soroban_sas_common::SchemaRegisteredEvent {
@@ -245,6 +289,156 @@ impl SchemaRegistry {
         );
 
         uid
+    }
+
+    /// Returns the tri-state [`RevocationPolicy`] governing `uid` (#448).
+    ///
+    /// An explicit policy stored via [`register_with_policy`] takes precedence;
+    /// otherwise the policy is derived from the record's legacy `revocable`
+    /// boolean. Unknown or deprecated schemas default to `Permissive`.
+    pub fn get_schema_policy(env: Env, uid: UID) -> soroban_sas_common::RevocationPolicy {
+        extend_instance_ttl(&env);
+        let policy_key = (SCHEMA_POLICY, uid.clone());
+        if let Some(policy) = env
+            .storage()
+            .persistent()
+            .get::<_, soroban_sas_common::RevocationPolicy>(&policy_key)
+        {
+            return policy;
+        }
+        match env.storage().persistent().get::<_, SchemaRecord>(&uid) {
+            Some(record) => soroban_sas_common::RevocationPolicy::from(record.revocable),
+            None => soroban_sas_common::RevocationPolicy::Permissive,
+        }
+    }
+
+    /// Proposes transferring ownership of `schema_uid` to `new_owner` using the
+    /// two-step acceptance pattern (#446). Callable only by the current owner
+    /// (the schema creator). The transfer is not finalized until the proposed
+    /// owner claims it via [`claim_schema_ownership`]. Emits
+    /// `SchemaOwnershipProposed`.
+    pub fn propose_schema_owner(env: Env, schema_uid: UID, new_owner: Address) {
+        extend_instance_ttl(&env);
+        if !env.storage().persistent().has(&schema_uid) {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+        let Some(current_owner) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&(SCHEMA_CREATOR, schema_uid.clone()))
+        else {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        };
+        current_owner.require_auth();
+        if current_owner == new_owner {
+            panic_with_error!(&env, SASError::InvalidValue);
+        }
+
+        let pending_key = (PENDING_OWNER, schema_uid.clone());
+        env.storage().persistent().set(&pending_key, &new_owner);
+        env.storage().persistent().extend_ttl(
+            &pending_key,
+            LEDGERS_IN_ONE_YEAR,
+            LEDGERS_IN_ONE_YEAR,
+        );
+
+        env.events().publish(
+            (
+                soroban_sas_common::events::SCHEMA_OWNERSHIP_PROPOSED,
+                schema_uid.clone(),
+            ),
+            soroban_sas_common::SchemaOwnershipProposedEvent {
+                schema_uid,
+                current_owner,
+                proposed_owner: new_owner,
+            },
+        );
+    }
+
+    /// Claims ownership of `schema_uid`, finalizing a two-step transfer (#446).
+    /// Callable only by the address previously proposed via
+    /// [`propose_schema_owner`]; any other caller (or a claim with no pending
+    /// proposal) reverts with `Unauthorized`. Emits
+    /// `SchemaOwnershipTransferred`.
+    pub fn claim_schema_ownership(env: Env, schema_uid: UID) {
+        extend_instance_ttl(&env);
+        let pending_key = (PENDING_OWNER, schema_uid.clone());
+        let Some(proposed_owner) = env.storage().persistent().get::<_, Address>(&pending_key)
+        else {
+            panic_with_error!(&env, SASError::Unauthorized);
+        };
+        proposed_owner.require_auth();
+
+        let creator_key = (SCHEMA_CREATOR, schema_uid.clone());
+        let Some(old_owner) = env.storage().persistent().get::<_, Address>(&creator_key) else {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        };
+
+        env.storage()
+            .persistent()
+            .set(&creator_key, &proposed_owner);
+        env.storage().persistent().extend_ttl(
+            &creator_key,
+            LEDGERS_IN_ONE_YEAR,
+            LEDGERS_IN_ONE_YEAR,
+        );
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (
+                soroban_sas_common::events::SCHEMA_OWNERSHIP_TRANSFERRED,
+                schema_uid.clone(),
+            ),
+            soroban_sas_common::SchemaOwnershipTransferredEvent {
+                schema_uid,
+                old_owner,
+                new_owner: proposed_owner,
+            },
+        );
+    }
+
+    /// Cancels an in-flight two-step ownership transfer for `schema_uid` (#446).
+    /// Callable only by the current owner. Reverts with `SchemaNotFound` when
+    /// no transfer is pending. Emits `SchemaOwnershipTransferCancelled`.
+    pub fn cancel_schema_ownership_transfer(env: Env, schema_uid: UID) {
+        extend_instance_ttl(&env);
+        let Some(current_owner) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&(SCHEMA_CREATOR, schema_uid.clone()))
+        else {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        };
+        current_owner.require_auth();
+
+        let pending_key = (PENDING_OWNER, schema_uid.clone());
+        if !env.storage().persistent().has(&pending_key) {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (
+                soroban_sas_common::events::SCHEMA_OWNERSHIP_CANCELLED,
+                schema_uid,
+            ),
+            current_owner,
+        );
+    }
+
+    /// Returns the address proposed as the next owner of `schema_uid`, if a
+    /// two-step transfer is pending (#446).
+    pub fn get_pending_schema_owner(env: Env, schema_uid: UID) -> Option<Address> {
+        extend_instance_ttl(&env);
+        env.storage().persistent().get(&(PENDING_OWNER, schema_uid))
+    }
+
+    /// Returns the current owner (creator) of `schema_uid`, if registered (#446).
+    pub fn get_schema_owner(env: Env, schema_uid: UID) -> Option<Address> {
+        extend_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get(&(SCHEMA_CREATOR, schema_uid))
     }
 
     pub fn get_schema(env: Env, uid: UID) -> Option<SchemaRecord> {

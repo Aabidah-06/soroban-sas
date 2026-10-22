@@ -36,7 +36,10 @@ fn test_register_rejects_malformed_schema_strings() {
     for schema in ["!!!", " ", "12345"] {
         let schema = String::from_str(&env, schema);
         let res = client.try_register(&owner, &schema, &resolver, &true);
-        assert_eq!(res, Err(Ok(soroban_sas_common::SASError::InvalidSchema.into())));
+        assert_eq!(
+            res,
+            Err(Ok(soroban_sas_common::SASError::InvalidSchema.into()))
+        );
     }
 }
 
@@ -378,7 +381,10 @@ fn test_uid_derivation_is_deterministic_and_includes_policy() {
     payload.append(&schema.clone().to_xdr(&env));
     payload.append(&resolver.clone().to_xdr(&env));
     payload.append(&Bytes::from_slice(&env, &[1u8]));
-    let expected = soroban_sas_common::UID(BytesN::from_array(&env, &env.crypto().sha256(&payload).to_array()));
+    let expected = soroban_sas_common::UID(BytesN::from_array(
+        &env,
+        &env.crypto().sha256(&payload).to_array(),
+    ));
     assert_eq!(uid, expected);
 
     // False case: revocable false yields different hash
@@ -386,7 +392,10 @@ fn test_uid_derivation_is_deterministic_and_includes_policy() {
     payload2.append(&schema.clone().to_xdr(&env));
     payload2.append(&resolver.clone().to_xdr(&env));
     payload2.append(&Bytes::from_slice(&env, &[0u8]));
-    let expected_false = soroban_sas_common::UID(BytesN::from_array(&env, &env.crypto().sha256(&payload2).to_array()));
+    let expected_false = soroban_sas_common::UID(BytesN::from_array(
+        &env,
+        &env.crypto().sha256(&payload2).to_array(),
+    ));
     assert_ne!(uid, expected_false);
 }
 
@@ -407,7 +416,10 @@ fn test_uid_golden_vectors() {
     payload_true.append(&schema.clone().to_xdr(&env));
     payload_true.append(&resolver.clone().to_xdr(&env));
     payload_true.append(&Bytes::from_slice(&env, &[1u8]));
-    let expected_true = soroban_sas_common::UID(BytesN::from_array(&env, &env.crypto().sha256(&payload_true).to_array()));
+    let expected_true = soroban_sas_common::UID(BytesN::from_array(
+        &env,
+        &env.crypto().sha256(&payload_true).to_array(),
+    ));
     assert_eq!(uid_true, expected_true);
 
     // Golden vector: same schema/resolver with revocable=false must be distinct
@@ -416,7 +428,10 @@ fn test_uid_golden_vectors() {
     payload_false.append(&schema.clone().to_xdr(&env));
     payload_false.append(&resolver.clone().to_xdr(&env));
     payload_false.append(&Bytes::from_slice(&env, &[0u8]));
-    let expected_false = soroban_sas_common::UID(BytesN::from_array(&env, &env.crypto().sha256(&payload_false).to_array()));
+    let expected_false = soroban_sas_common::UID(BytesN::from_array(
+        &env,
+        &env.crypto().sha256(&payload_false).to_array(),
+    ));
     assert_eq!(uid_false, expected_false);
     assert_ne!(uid_true, uid_false);
 

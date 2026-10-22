@@ -62,6 +62,17 @@ mod tests {
         ScAddress, ScVal, SequenceNumber, String32, Thresholds, Uint256,
     };
 
+    fn assert_account_key_bytes(key_b64: &str, expected: [u8; 32]) {
+        let key = LedgerKey::from_xdr_base64(key_b64, Limits::none()).unwrap();
+        let LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes))),
+        }) = key
+        else {
+            panic!("expected a LedgerKey::Account, got {key:?}");
+        };
+        assert_eq!(bytes, expected);
+    }
+
     #[test]
     fn account_ledger_key_round_trips_multiple_ed25519_keys() {
         for public_key in [
@@ -141,7 +152,7 @@ mod tests {
             .to_xdr_base64(Limits::none())
             .unwrap();
 
-        let data = LedgerEntryData::from_xdr_base64(&entry_xdr, Limits::none()).unwrap();
+        let data = LedgerEntryData::from_xdr_base64(entry_xdr, Limits::none()).unwrap();
         let result = match data {
             LedgerEntryData::Account(_) => Ok(()),
             _ => Err(SdkError::ValidationError(
@@ -161,12 +172,12 @@ mod tests {
             latest_ledger: 100,
         };
 
-        // When entries is empty, should return ValidationError
-        if entries_response.entries.is_empty() {
-            assert!(true); // Correctly identifies unfunded account case
-        } else {
-            panic!("should recognize empty entries");
-        }
+        // An unfunded account yields an empty entries response, which the
+        // caller must recognize as such.
+        assert!(
+            entries_response.entries.is_empty(),
+            "unfunded account should produce empty entries"
+        );
     }
 
     #[test]

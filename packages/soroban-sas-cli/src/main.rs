@@ -171,7 +171,9 @@ fn validate_schema_syntax(schema: &str) -> Result<(), String> {
             start += 1;
         }
         if start >= end {
-            return Err("schema must use comma-separated `name Type` field definitions".to_string());
+            return Err(
+                "schema must use comma-separated `name Type` field definitions".to_string(),
+            );
         }
     }
 
@@ -321,7 +323,6 @@ enum SchemaCommands {
         json: bool,
     },
 }
-
 
 #[derive(Subcommand)]
 enum AttestCommands {
@@ -794,8 +795,8 @@ fn print_transaction_result(
         "envelopeXdr": result.envelope_xdr,
         "resultXdr": result.result_xdr,
     });
-    let human_text = serde_json::to_string_pretty(&data)
-        .map_err(|e| format!("serialization failed: {e}"))?;
+    let human_text =
+        serde_json::to_string_pretty(&data).map_err(|e| format!("serialization failed: {e}"))?;
     emit_ok(output, || println!("{human_text}"), data.clone())
 }
 

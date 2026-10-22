@@ -33,7 +33,9 @@ pub const MAX_MULTI_REVOKE: u32 = 100;
 const REGISTRY_INTERFACE_VERSION: Symbol = symbol_short!("SASREG");
 
 fn extend_instance_ttl(env: &Env) {
-    env.storage().instance().extend_ttl(LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 }
 
 #[contractimpl]
@@ -142,6 +144,24 @@ impl SAS {
         let Some(schema) = schema_opt else {
             panic_with_error!(&env, SASError::InvalidSchema);
         };
+
+        // Enforce the schema's tri-state revocation policy (#448). Query the
+        // registry's `get_schema_policy` if it implements it; registries that
+        // predate the policy model map cleanly from the legacy `revocable`
+        // boolean via `RevocationPolicy::from`.
+        let policy: soroban_sas_common::RevocationPolicy =
+            match env
+                .try_invoke_contract::<soroban_sas_common::RevocationPolicy, soroban_sdk::Error>(
+                    &registry,
+                    &Symbol::new(&env, "get_schema_policy"),
+                    soroban_sdk::vec![&env, attestation.schema_uid.clone().into_val(&env)],
+                ) {
+                Ok(Ok(p)) => p,
+                _ => soroban_sas_common::RevocationPolicy::from(schema.revocable),
+            };
+        if let Err(err) = soroban_sas_common::check_policy(policy, attestation.revocable) {
+            panic_with_error!(&env, err);
+        }
 
         // Optional resolver callback support
         let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
@@ -289,11 +309,7 @@ impl SAS {
             let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
                 &indexer,
                 &Symbol::new(&env, "handle_replace"),
-                soroban_sdk::vec![
-                    &env,
-                    old_uid_clone.into_val(&env),
-                    new_uid.into_val(&env)
-                ],
+                soroban_sdk::vec![&env, old_uid_clone.into_val(&env), new_uid.into_val(&env)],
             );
         }
         issued_uid
@@ -363,7 +379,17 @@ impl SAS {
     /// through `revoke_internal` so storage-read/auth work is not repeated.
     pub fn multi_revoke(env: Env, uids: soroban_sdk::Vec<UID>) {
         extend_instance_ttl(&env);
+        if uids.len() > MAX_MULTI_REVOKE {
+            panic_with_error!(&env, SASError::BatchTooLarge);
+        }
+        let mut distinct = soroban_sdk::Map::new(&env);
+        let mut seen_uids = soroban_sdk::Map::new(&env);
+        let mut to_revoke = soroban_sdk::Vec::new(&env);
         for uid in uids.iter() {
+            if seen_uids.contains_key(uid.clone()) {
+                panic_with_error!(&env, SASError::DuplicateAttestation);
+            }
+            seen_uids.set(uid.clone(), true);
             let Some(attestation) = env.storage().persistent().get::<_, Attestation>(&uid) else {
                 panic_with_error!(&env, SASError::AttestationNotFound);
             };
@@ -443,6 +469,67 @@ impl SAS {
         }
         env.storage().instance().set(&key, &nonce);
         extend_instance_ttl(env);
+    }
+
+    /// Invalidates the inclusive range of delegation nonces
+    /// `[min_nonce, max_nonce]` for `attester` by advancing their high-water
+    /// mark to `max_nonce` (#437).
+    ///
+    /// Any later delegated call (`attest_by_delegation` / `revoke_by_delegation`)
+    /// whose nonce is `<= max_nonce` then reverts with
+    /// [`SASError::DelegationReplay`], immediately cancelling pending off-chain
+    /// signatures if a key or payload is suspected compromised.
+    ///
+    /// Requires `attester.require_auth()`. The watermark can only advance:
+    /// `max_nonce` must be strictly greater than the current watermark, and
+    /// `min_nonce <= max_nonce`, otherwise the call reverts with
+    /// [`SASError::InvalidValue`]. Emits `NoncesInvalidated`.
+    pub fn invalidate_nonces(env: Env, attester: Address, min_nonce: u64, max_nonce: u64) {
+        extend_instance_ttl(&env);
+        if min_nonce > max_nonce {
+            panic_with_error!(&env, SASError::InvalidValue);
+        }
+        attester.require_auth();
+        Self::invalidate_nonces_internal(&env, &attester, min_nonce, max_nonce);
+    }
+
+    /// Advances `attester`'s delegation nonce high-water mark to `new_nonce`
+    /// (#437), cancelling every nonce `<= new_nonce` in one call. Convenience
+    /// wrapper over [`invalidate_nonces`] covering the open range from the
+    /// current watermark. Requires `attester.require_auth()` and that
+    /// `new_nonce` strictly advances the watermark.
+    pub fn set_nonce_highwater_mark(env: Env, attester: Address, new_nonce: u64) {
+        extend_instance_ttl(&env);
+        attester.require_auth();
+        let key = (DELEGATION_NONCE, attester.clone());
+        let current: u64 = env.storage().instance().get(&key).unwrap_or(0);
+        let min_nonce = current.saturating_add(1);
+        Self::invalidate_nonces_internal(&env, &attester, min_nonce, new_nonce);
+    }
+
+    /// Returns `attester`'s current delegation nonce high-water mark (#437).
+    /// A delegated call is accepted only if its nonce is strictly greater than
+    /// this value. Zero means no nonce has been consumed or invalidated yet.
+    pub fn get_nonce_highwater_mark(env: Env, attester: Address) -> u64 {
+        extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&(DELEGATION_NONCE, attester))
+            .unwrap_or(0)
+    }
+
+    fn invalidate_nonces_internal(env: &Env, attester: &Address, min_nonce: u64, max_nonce: u64) {
+        let key = (DELEGATION_NONCE, attester.clone());
+        let current: u64 = env.storage().instance().get(&key).unwrap_or(0);
+        // The watermark is monotonic: it can only advance. `max_nonce` must
+        // exceed the current mark, so an attester cannot decrease it or replay
+        // an old range.
+        if max_nonce <= current {
+            panic_with_error!(env, SASError::InvalidValue);
+        }
+        env.storage().instance().set(&key, &max_nonce);
+        extend_instance_ttl(env);
+        events::publish_nonces_invalidated(env, attester, min_nonce, max_nonce);
     }
 
     /// Verifies off-chain attestation signed by attester's ed25519 key.

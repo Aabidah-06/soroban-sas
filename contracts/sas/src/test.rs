@@ -45,7 +45,7 @@ pub mod mock1 {
             true
         }
 
-        pub fn SASREG(_env: Env) -> bool {
+        pub fn sasreg(_env: Env) -> bool {
             true
         }
 
@@ -73,7 +73,7 @@ pub mod mock2 {
         pub fn validate_schema(_env: Env, _uid: UID) -> bool {
             false
         }
-        pub fn SASREG(_env: Env) -> bool {
+        pub fn sasreg(_env: Env) -> bool {
             true
         }
         pub fn get_schema(_env: Env, _uid: UID) -> Option<soroban_sas_common::SchemaRecord> {
@@ -94,41 +94,6 @@ pub mod mock3 {
         }
         pub fn on_revoke(_env: Env, _attestation: Attestation) {
             // Mock execution
-        }
-    }
-}
-
-pub mod mock4 {
-    use super::*;
-    #[contract]
-    pub struct MockIndexer;
-
-    #[contractimpl]
-    impl MockIndexer {
-        pub fn index_attestation(
-            env: Env,
-            uid: UID,
-            recipient: Address,
-            _schema_uid: UID,
-            _attester: Address,
-        ) {
-            let mut uids: soroban_sdk::Vec<UID> = env
-                .storage()
-                .persistent()
-                .get(&recipient)
-                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-            uids.push_back(uid);
-            env.storage().persistent().set(&recipient, &uids);
-        }
-
-        pub fn get_attestations_by_recipient(
-            env: Env,
-            recipient: Address,
-        ) -> soroban_sdk::Vec<UID> {
-            env.storage()
-                .persistent()
-                .get(&recipient)
-                .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
         }
     }
 }
@@ -1473,9 +1438,9 @@ fn test_delegation_nonce_survives_one_year_ttl_and_rejects_replay() {
     assert!(s.sas_client.verify_attestation(&s.attestation.uid));
 
     // Replay before TTL must fail
-    let replay_before = s
-        .sas_client
-        .try_attest_by_delegation(&s.attestation, &nonce, &signature, &public_key);
+    let replay_before =
+        s.sas_client
+            .try_attest_by_delegation(&s.attestation, &nonce, &signature, &public_key);
     assert!(replay_before.is_err());
 
     // Advance ledger in two stages with intermediate renewal to keep instance
@@ -1494,9 +1459,9 @@ fn test_delegation_nonce_survives_one_year_ttl_and_rejects_replay() {
     });
 
     // Replay after the previous one-year TTL must still fail (durable protection)
-    let replay_after = s
-        .sas_client
-        .try_attest_by_delegation(&s.attestation, &nonce, &signature, &public_key);
+    let replay_after =
+        s.sas_client
+            .try_attest_by_delegation(&s.attestation, &nonce, &signature, &public_key);
     assert!(replay_after.is_err());
 }
 
@@ -1592,9 +1557,9 @@ fn test_delegation_nonce_storage_bounded_and_describes_concurrent_behavior() {
         contract: s.sas_id.clone(),
         nonce: 20,
     };
-    let payload_hash =
-        soroban_sas_common::hash_offchain_attestation(&s.env, &other_att, &domain);
-    let other_sig = BytesN::from_array(&s.env, &other_key.sign(&payload_hash.to_array()).to_bytes());
+    let payload_hash = soroban_sas_common::hash_offchain_attestation(&s.env, &other_att, &domain);
+    let other_sig =
+        BytesN::from_array(&s.env, &other_key.sign(&payload_hash.to_array()).to_bytes());
     let other_pk = BytesN::from_array(&s.env, &other_key.verifying_key().to_bytes());
     // This should succeed because nonce 20 for other attester is first for that attester
     // (requires register fallback if structural check fails - use generated address that matches key structurally)

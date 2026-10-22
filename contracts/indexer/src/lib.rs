@@ -18,10 +18,25 @@ const MAX_CHUNK_SIZE: u32 = 100;
 const RECIPIENT_TOTAL: Symbol = symbol_short!("RCOUNT");
 const SCHEMA_TOTAL: Symbol = symbol_short!("SCOUNT");
 const ATTESTER_TOTAL: Symbol = symbol_short!("ACOUNT");
-const SAS_INTERFACE_VERSION: Symbol = symbol_short!("SASV1");
+const SAS_INTERFACE_VERSION: Symbol = symbol_short!("sasv1");
+/// Persistent key prefix for a UID's [`IndexStatus`]: `(STATUS_KEY, uid)`.
+const STATUS_KEY: Symbol = symbol_short!("IDXSTAT");
+
+/// Lifecycle state the indexer tracks per attestation UID so filtered queries
+/// can hide revoked / replaced entries without deleting history. A UID with no
+/// stored status is treated as `Active` (issued before status tracking).
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexStatus {
+    Active,
+    Revoked,
+    Replaced,
+}
 
 fn extend_instance_ttl(env: &Env) {
-    env.storage().instance().extend_ttl(LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 }
 
 fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
@@ -44,11 +59,9 @@ fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
     chunk.push_back(uid.clone());
     let storage_key = (key.clone(), chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
-    env.storage().persistent().extend_ttl(
-        &storage_key,
-        LEDGERS_IN_ONE_YEAR,
-        LEDGERS_IN_ONE_YEAR,
-    );
+    env.storage()
+        .persistent()
+        .extend_ttl(&storage_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 
     total += 1;
     env.storage().instance().set(&count_key, &total);
@@ -75,11 +88,9 @@ fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
     chunk.push_back(uid.clone());
     let storage_key = (key.clone(), chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
-    env.storage().persistent().extend_ttl(
-        &storage_key,
-        LEDGERS_IN_ONE_YEAR,
-        LEDGERS_IN_ONE_YEAR,
-    );
+    env.storage()
+        .persistent()
+        .extend_ttl(&storage_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 
     total += 1;
     env.storage().instance().set(&count_key, &total);
@@ -96,14 +107,12 @@ fn set_index_status(env: &Env, uid: &UID, status: IndexStatus) {
 
 fn is_active(env: &Env, uid: &UID) -> bool {
     // No status entry means legacy `Active` (issued before status tracking).
-    match env
-        .storage()
-        .persistent()
-        .get::<_, IndexStatus>(&(STATUS_KEY, uid.clone()))
-    {
-        Some(IndexStatus::Active) | None => true,
-        _ => false,
-    }
+    matches!(
+        env.storage()
+            .persistent()
+            .get::<_, IndexStatus>(&(STATUS_KEY, uid.clone())),
+        Some(IndexStatus::Active) | None
+    )
 }
 
 fn collect_filtered(
@@ -156,8 +165,13 @@ impl Indexer {
             panic_with_error!(&env, SASError::AlreadyInitialized);
         }
         let compatible: bool = env
-            .try_invoke_contract::<bool, soroban_sdk::Error>(&sas, &SAS_INTERFACE_VERSION, soroban_sdk::vec![&env])
-            .unwrap_or(Ok(false)).unwrap_or(false);
+            .try_invoke_contract::<bool, soroban_sdk::Error>(
+                &sas,
+                &SAS_INTERFACE_VERSION,
+                soroban_sdk::vec![&env],
+            )
+            .unwrap_or(Ok(false))
+            .unwrap_or(false);
         if !compatible {
             panic_with_error!(&env, SASError::IncompatibleDependency);
         }
@@ -192,6 +206,32 @@ impl Indexer {
         index_uid_uid(&env, &schema_uid, &uid, SCHEMA_TOTAL);
         index_address_uid(&env, &attester, &uid, ATTESTER_TOTAL);
         extend_instance_ttl(&env);
+    }
+
+    /// Marks `uid` as revoked so that filtered queries (with
+    /// `include_revoked = false`) hide it, without deleting its history.
+    /// Called best-effort by the SAS contract when an attestation is revoked.
+    pub fn handle_revoke(env: Env, uid: UID) {
+        extend_instance_ttl(&env);
+        set_index_status(&env, &uid, IndexStatus::Revoked);
+    }
+
+    /// Marks `old_uid` as replaced when an attestation is superseded via
+    /// `SAS::replace_attestation`, preserving history while hiding the old
+    /// entry from active filtered queries. `new_uid` remains `Active`.
+    pub fn handle_replace(env: Env, old_uid: UID, new_uid: UID) {
+        extend_instance_ttl(&env);
+        set_index_status(&env, &old_uid, IndexStatus::Replaced);
+        let _ = new_uid;
+    }
+
+    /// Returns the recorded [`IndexStatus`] for `uid`, or `None` when no status
+    /// has been recorded (legacy entries are implicitly `Active`).
+    pub fn get_attestation_status(env: Env, uid: UID) -> Option<IndexStatus> {
+        extend_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get::<_, IndexStatus>(&(STATUS_KEY, uid))
     }
 
     pub fn get_attestations_by_recipient(env: Env, recipient: Address) -> soroban_sdk::Vec<UID> {
@@ -294,11 +334,16 @@ impl Indexer {
             .instance()
             .get(&(RECIPIENT_TOTAL, recipient.clone()))
             .unwrap_or(0);
-        collect_filtered(&env, total, |chunk_index| {
-            env.storage()
-                .persistent()
-                .get(&(recipient.clone(), chunk_index))
-        }, include_revoked)
+        collect_filtered(
+            &env,
+            total,
+            |chunk_index| {
+                env.storage()
+                    .persistent()
+                    .get(&(recipient.clone(), chunk_index))
+            },
+            include_revoked,
+        )
     }
 
     pub fn get_schema_filtered(
@@ -311,11 +356,16 @@ impl Indexer {
             .instance()
             .get(&(SCHEMA_TOTAL, schema_uid.clone()))
             .unwrap_or(0);
-        collect_filtered(&env, total, |chunk_index| {
-            env.storage()
-                .persistent()
-                .get(&(schema_uid.clone(), chunk_index))
-        }, include_revoked)
+        collect_filtered(
+            &env,
+            total,
+            |chunk_index| {
+                env.storage()
+                    .persistent()
+                    .get(&(schema_uid.clone(), chunk_index))
+            },
+            include_revoked,
+        )
     }
 
     pub fn get_attester_filtered(
@@ -328,11 +378,16 @@ impl Indexer {
             .instance()
             .get(&(ATTESTER_TOTAL, attester.clone()))
             .unwrap_or(0);
-        collect_filtered(&env, total, |chunk_index| {
-            env.storage()
-                .persistent()
-                .get(&(attester.clone(), chunk_index))
-        }, include_revoked)
+        collect_filtered(
+            &env,
+            total,
+            |chunk_index| {
+                env.storage()
+                    .persistent()
+                    .get(&(attester.clone(), chunk_index))
+            },
+            include_revoked,
+        )
     }
 
     /// Paginated active-only view: walks the underlying chunks and
