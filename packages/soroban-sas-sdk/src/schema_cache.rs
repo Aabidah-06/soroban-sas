@@ -6,7 +6,7 @@ use crate::simulate;
 use soroban_sas_common::SchemaRecord;
 use soroban_sdk::xdr::{Limits, WriteXdr};
 use soroban_sdk::Env;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,8 @@ pub struct SchemaCacheStats {
 struct CacheState {
     entries: HashMap<SchemaUid, CacheEntry>,
     lru: VecDeque<SchemaUid>,
-    refreshing: HashSet<SchemaUid>,
+    refreshing: HashMap<SchemaUid, u64>,
+    next_refresh_token: u64,
     stats: SchemaCacheStats,
 }
 
@@ -79,23 +80,8 @@ impl SchemaCache {
         let value = value.map(Self::encode).transpose()?;
 
         let mut state = self.state.lock().expect("schema cache lock poisoned");
-        Self::remove_entry(&mut state, &uid);
-        while state.entries.len() >= self.capacity {
-            if let Some(evicted) = state.lru.pop_front() {
-                state.entries.remove(&evicted);
-                state.stats.evictions += 1;
-            } else {
-                break;
-            }
-        }
-        state.entries.insert(
-            uid,
-            CacheEntry {
-                value,
-                expires_at: Instant::now() + self.ttl,
-            },
-        );
-        state.lru.push_back(uid);
+        state.refreshing.remove(&uid);
+        Self::insert_encoded(&mut state, uid, value, self.capacity, self.ttl);
         Ok(())
     }
 
@@ -155,21 +141,51 @@ impl SchemaCache {
         Ok((Some(value), expired))
     }
 
-    pub(crate) fn start_refresh(&self, uid: SchemaUid) -> bool {
-        self.state
-            .lock()
-            .expect("schema cache lock poisoned")
-            .refreshing
-            .insert(uid)
+    pub(crate) fn start_refresh(&self, uid: SchemaUid) -> Option<u64> {
+        let mut state = self.state.lock().expect("schema cache lock poisoned");
+        if state.refreshing.contains_key(&uid) {
+            return None;
+        }
+        let token = state.next_refresh_token;
+        state.next_refresh_token = state.next_refresh_token.wrapping_add(1);
+        state.refreshing.insert(uid, token);
+        Some(token)
     }
 
-    pub(crate) fn finish_refresh(&self, uid: SchemaUid, success: bool) {
+    pub(crate) fn finish_refresh(
+        &self,
+        uid: SchemaUid,
+        token: u64,
+        result: Result<Option<SchemaRecord>, SdkError>,
+    ) {
+        let result = match result {
+            Ok(Some(record)) if record.deprecated => Ok(None),
+            Ok(value) => value.map(Self::encode).transpose().map(Some),
+            Err(error) => Err(error),
+        };
         let mut state = self.state.lock().expect("schema cache lock poisoned");
+        if state.refreshing.get(&uid) != Some(&token) {
+            return;
+        }
         state.refreshing.remove(&uid);
-        if success {
-            state.stats.refreshes += 1;
-        } else {
-            state.stats.refresh_errors += 1;
+
+        match result {
+            Ok(Some(value)) => {
+                Self::insert_encoded(&mut state, uid, value, self.capacity, self.ttl);
+                state.stats.refreshes += 1;
+            }
+            Ok(None) => {
+                Self::remove_entry(&mut state, &uid);
+                state.stats.refreshes += 1;
+            }
+            Err(_) => state.stats.refresh_errors += 1,
+        }
+    }
+
+    pub(crate) fn cancel_refresh(&self, uid: &SchemaUid, token: u64) {
+        let mut state = self.state.lock().expect("schema cache lock poisoned");
+        if state.refreshing.get(uid) == Some(&token) {
+            state.refreshing.remove(uid);
         }
     }
 
@@ -183,9 +199,35 @@ impl SchemaCache {
         state.entries.remove(uid).is_some()
     }
 
+    fn insert_encoded(
+        state: &mut CacheState,
+        uid: SchemaUid,
+        value: Option<String>,
+        capacity: usize,
+        ttl: Duration,
+    ) {
+        Self::remove_entry(state, &uid);
+        while state.entries.len() >= capacity {
+            if let Some(evicted) = state.lru.pop_front() {
+                state.entries.remove(&evicted);
+                state.stats.evictions += 1;
+            } else {
+                break;
+            }
+        }
+        state.entries.insert(
+            uid,
+            CacheEntry {
+                value,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+        state.lru.push_back(uid);
+    }
+
     fn encode(record: SchemaRecord) -> Result<String, SdkError> {
-        let env = Env::default();
-        simulate::encode_arg(&env, &record)?
+        let env = record.resolver.env();
+        simulate::encode_arg(env, &record)?
             .to_xdr_base64(Limits::none())
             .map_err(|error| {
                 SdkError::DecodingError(format!("failed to encode cached schema: {error:?}"))

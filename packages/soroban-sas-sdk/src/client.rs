@@ -501,7 +501,7 @@ impl SASClient {
                 return Ok(value);
             }
         } else if let Some(value) = cached {
-            if cache.start_refresh(*schema_uid) {
+            if let Some(refresh_token) = cache.start_refresh(*schema_uid) {
                 let cache = cache.clone();
                 let refresh_rpc = rpc.clone();
                 let registry_id = registry_id.to_owned();
@@ -510,24 +510,15 @@ impl SASClient {
                 let refresh = thread::Builder::new()
                     .name("schema-cache-refresh".to_string())
                     .spawn(move || {
-                        match SASClient::get_schema_from_registry(
+                        let result = SASClient::get_schema_from_registry(
                             &refresh_rpc,
                             &registry_id,
                             &uid,
-                        ) {
-                            Ok(Some(record)) if record.deprecated => {
-                                refresh_cache.invalidate(&uid);
-                                refresh_cache.finish_refresh(uid, true);
-                            }
-                            Ok(record) => {
-                                let refreshed = refresh_cache.insert(uid, record).is_ok();
-                                refresh_cache.finish_refresh(uid, refreshed);
-                            }
-                            Err(_) => refresh_cache.finish_refresh(uid, false),
-                        }
+                        );
+                        refresh_cache.finish_refresh(uid, refresh_token, result);
                     });
                 if refresh.is_err() {
-                    cache.finish_refresh(*schema_uid, false);
+                    cache.cancel_refresh(schema_uid, refresh_token);
                     return self.refresh_schema(rpc, &registry_id, schema_uid, &cache);
                 }
             }
