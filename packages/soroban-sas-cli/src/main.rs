@@ -5,6 +5,7 @@ mod cache;
 mod hardware;
 mod identity;
 mod io_safety;
+mod json_schema;
 mod manpage;
 mod network;
 mod offchain;
@@ -264,6 +265,7 @@ fn validate_schema_syntax(schema: &str) -> Result<(), String> {
     };
 
     let mut field_count = 0u32;
+    let mut seen_names: Vec<String> = Vec::new();
     while start < end {
         let mut field_end = start;
         while field_end < end && schema[field_end] != b',' {
@@ -319,6 +321,13 @@ fn validate_schema_syntax(schema: &str) -> Result<(), String> {
                 "schema must use comma-separated `name Type` field definitions".to_string(),
             );
         }
+        let name_norm = std::str::from_utf8(name).unwrap_or("").to_ascii_lowercase();
+        if seen_names.iter().any(|existing| existing == &name_norm) {
+            return Err(format!(
+                "schema field `{name_norm}` collides with an earlier field and would break serialization"
+            ));
+        }
+        seen_names.push(name_norm);
         field_count += 1;
 
         if field_end >= end {
@@ -686,6 +695,14 @@ enum OffchainCommands {
 
 #[derive(Subcommand)]
 enum SchemaCommands {
+    /// Export a SAS schema as JSON Schema Draft-7 and print compatibility warnings (#537).
+    Lint {
+        #[arg(
+            long,
+            help = "Schema definition string, e.g. `name string, active bool`"
+        )]
+        schema: String,
+    },
     /// Register a new schema. The registration is signed and submitted by
     /// --secret-key's account, which becomes the schema's owner.
     Register {
@@ -2642,6 +2659,27 @@ fn run_schema(
 ) -> Result<(), String> {
     let env = soroban_sdk::Env::default();
     match action {
+        SchemaCommands::Lint { schema } => {
+            let linted = json_schema::lint_schema(&schema)?;
+            let round_tripped = json_schema::round_trip_schema(&schema)?;
+            let pretty = serde_json::to_string_pretty(&linted.document)
+                .map_err(|e| format!("serialization failed: {e}"))?;
+            let warnings = linted.warnings.clone();
+            emit_ok(
+                output,
+                || {
+                    for warning in &warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                    println!("{pretty}");
+                },
+                serde_json::json!({
+                    "json_schema": linted.document,
+                    "warnings": linted.warnings,
+                    "sas_schema": round_tripped,
+                }),
+            )
+        }
         SchemaCommands::Register {
             schema,
             resolver,
