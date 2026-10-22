@@ -72,9 +72,14 @@ fn byte(data: &Bytes, at: &mut u32) -> u8 {
     result
 }
 fn chunk(env: &Env, data: &Bytes, at: &mut u32, n: u32) -> Bytes {
-    assert!(*at <= data.len() && n <= data.len() - *at, "truncated VC envelope");
+    assert!(
+        *at <= data.len() && n <= data.len() - *at,
+        "truncated VC envelope"
+    );
     let mut out = Bytes::new(env);
-    for _ in 0..n { out.push_back(byte(data, at)); }
+    for _ in 0..n {
+        out.push_back(byte(data, at));
+    }
     out
 }
 fn signature(env: &Env, data: &Bytes, at: &mut u32) -> BytesN<64> {
@@ -101,23 +106,43 @@ impl DidVcResolver {
     /// Called by SAS when registering a credential against this schema.
     /// Refuse unknown controllers, non-matching DID subjects or bad signatures.
     pub fn on_attest(env: Env, att: Attestation) {
-        let issuer_key: BytesN<32> = env.storage().persistent()
-            .get(&att.attester).expect("issuer DID controller not registered");
-        let subject_key: BytesN<32> = env.storage().persistent()
-            .get(&att.recipient).expect("subject DID controller not registered");
+        let issuer_key: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&att.attester)
+            .expect("issuer DID controller not registered");
+        let subject_key: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&att.recipient)
+            .expect("subject DID controller not registered");
 
         let data = &att.data;
-        assert!(data.len() >= MAGIC.len() as u32 + 2 + 2 + 64 + 64, "short VC proof");
+        assert!(
+            data.len() >= MAGIC.len() as u32 + 2 + 2 + 64 + 64,
+            "short VC proof"
+        );
         let mut cursor = 0;
-        assert_eq!(chunk(&env, data, &mut cursor, MAGIC.len() as u32),
-                   Bytes::from_slice(&env, MAGIC), "wrong VC proof version");
+        assert_eq!(
+            chunk(&env, data, &mut cursor, MAGIC.len() as u32),
+            Bytes::from_slice(&env, MAGIC),
+            "wrong VC proof version"
+        );
 
         let issuer_len = u32::from(byte(data, &mut cursor));
         let issuer_did = chunk(&env, data, &mut cursor, issuer_len);
         let subject_len = u32::from(byte(data, &mut cursor));
         let subject_did = chunk(&env, data, &mut cursor, subject_len);
-        assert_eq!(issuer_did, did_for_key(&env, &issuer_key), "issuer DID/key mismatch");
-        assert_eq!(subject_did, did_for_key(&env, &subject_key), "subject DID/key mismatch");
+        assert_eq!(
+            issuer_did,
+            did_for_key(&env, &issuer_key),
+            "issuer DID/key mismatch"
+        );
+        assert_eq!(
+            subject_did,
+            did_for_key(&env, &subject_key),
+            "subject DID/key mismatch"
+        );
 
         let len_hi = u32::from(byte(data, &mut cursor));
         let len_lo = u32::from(byte(data, &mut cursor));
@@ -129,11 +154,16 @@ impl DidVcResolver {
         assert_eq!(cursor, data.len(), "trailing proof data");
 
         // JWT EdDSA signs the exact ASCII "base64url(header).base64url(payload)".
-        env.crypto().ed25519_verify(&issuer_key, &signing_input, &jwt_signature);
+        env.crypto()
+            .ed25519_verify(&issuer_key, &signing_input, &jwt_signature);
         // Separate domain-separated signature binds JWT and did:key subjects
         // to these exact SAS addresses and schema; it prevents substitution.
         let digest = binding_hash(&env, &att, &signing_input, &issuer_did, &subject_did);
-        env.crypto().ed25519_verify(&issuer_key, &Bytes::from_array(&env, &digest.to_array()), &binding_signature);
+        env.crypto().ed25519_verify(
+            &issuer_key,
+            &Bytes::from_array(&env, &digest.to_array()),
+            &binding_signature,
+        );
     }
 
     /// SAS performs revocation authorization and state tracking. No additional
