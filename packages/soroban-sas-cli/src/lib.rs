@@ -10,4 +10,5 @@
 //! (`main.rs`).
 #![allow(dead_code)]
 pub mod bulk;
+pub mod decoder;
 pub mod io_safety;
