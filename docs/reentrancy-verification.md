@@ -138,7 +138,7 @@ does for `multi_attest`.
 
 **Mutation check:** with `enter_reentrancy_guard` removed from
 `multi_attest_by_delegation`, the guard test fails (`Ok(())` instead of
-`Err(#502)`). The test pins the guard.
+`Err(Error(Contract, 502))`). The test pins the guard.
 
 ## Findings
 
