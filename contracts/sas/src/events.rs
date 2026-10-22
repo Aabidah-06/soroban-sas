@@ -2,12 +2,12 @@ use soroban_sas_common::{
     events::{
         ADMIN_TRANSFER_COMPLETED, ADMIN_TRANSFER_PROPOSED, ATTESTATION_RENEWED, ATTESTED,
         BATCH_ATTESTED, BATCH_REVOKED, CONTRACT_PAUSED, CONTRACT_UNPAUSED, CONTRACT_UPGRADED,
-        INDEXER_STRICT_UPDATED, INDEXER_UPDATED, REVOKED,
+        INDEXER_STRICT_UPDATED, INDEXER_UPDATED, REVOKED, SCHEMA_REVOKED,
     },
     AdminTransferCompletedEvent, AdminTransferProposedEvent, Attestation, AttestationIssuedEvent,
     AttestationRenewedEvent, AttestationRevokedEvent, BatchAttestedEvent, BatchRevokedEvent,
     ContractPausedEvent, ContractUnpausedEvent, ContractUpgradedEvent, IndexerStrictUpdatedEvent,
-    IndexerUpdatedEvent, UID,
+    IndexerUpdatedEvent, SchemaRevokedEvent, UID,
 };
 use soroban_sdk::{symbol_short, Address, Env};
 
@@ -141,6 +141,28 @@ pub fn publish_batch_revoked(env: &Env, count: u32, attester_count: u32) {
         BatchRevokedEvent {
             count,
             attester_count,
+        },
+    );
+}
+
+/// Publishes the `SchemaRevoked` summary event marking the end of a
+/// successful `revoke_by_schema` call, after every per-item
+/// `AttestationRevoked` event for the batch. See `publish_batch_attested`
+/// for the shared ordering/failure-path guarantees.
+///
+/// Topics: `(SCHEMA_REVOKED, schema_uid, authorizer)`.
+pub fn publish_schema_revoked(
+    env: &Env,
+    schema_uid: &UID,
+    authorizer: &Address,
+    count: u32,
+) {
+    env.events().publish(
+        (SCHEMA_REVOKED, schema_uid.clone(), authorizer.clone()),
+        SchemaRevokedEvent {
+            schema_uid: schema_uid.clone(),
+            authorizer: authorizer.clone(),
+            count,
         },
     );
 }
