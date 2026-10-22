@@ -39,7 +39,9 @@ fn base64url(data: &[u8]) -> String {
 
 fn bytes_to_string(bytes: &Bytes) -> String {
     let mut out = Vec::new();
-    for i in 0..bytes.len() { out.push(bytes.get(i).unwrap()); }
+    for i in 0..bytes.len() {
+        out.push(bytes.get(i).unwrap());
+    }
     String::from_utf8(out).expect("DID should contain ASCII")
 }
 
@@ -47,7 +49,10 @@ fn bytes_to_string(bytes: &Bytes) -> String {
 /// assertionMethod explicitly references the issuer's Ed25519 verification key.
 /// The multicodec fingerprint is deterministic, not a hard-coded DID literal.
 fn did_document(did: &str) -> Value {
-    let key_id = format!("{did}#{fingerprint}", fingerprint = &did["did:key:".len()..]);
+    let key_id = format!(
+        "{did}#{fingerprint}",
+        fingerprint = &did["did:key:".len()..]
+    );
     json!({
         "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
         "id": did,
@@ -65,30 +70,38 @@ fn did_document(did: &str) -> Value {
 /// Validate the data-model boundary before offering an attestation to SAS.
 /// A Soroban contract cannot safely dereference remote JSON-LD contexts or
 /// parse arbitrary JSON, so the client owns JSON-LD/JWT semantic validation.
-fn validate_vc(doc: &Value, issuer_doc: &Value, subject_doc: &Value,
-               issuer_did: &str, subject_did: &str, schema_uid: &UID) -> Result<(), String> {
+fn validate_vc(
+    doc: &Value,
+    issuer_doc: &Value,
+    subject_doc: &Value,
+    issuer_did: &str,
+    subject_did: &str,
+    schema_uid: &UID,
+) -> Result<(), String> {
     fn valid_doc(doc: &Value, did: &str) -> bool {
         let fingerprint = did.strip_prefix("did:key:").unwrap_or("");
         let expected_key_id = format!("{did}#{fingerprint}");
-        doc.get("id").and_then(Value::as_str) == Some(did) &&
-        doc["verificationMethod"][0]["id"] == expected_key_id &&
-        doc["verificationMethod"][0]["controller"] == did &&
-        doc["verificationMethod"][0]["publicKeyMultibase"] == fingerprint &&
-        doc["assertionMethod"][0] == expected_key_id &&
-        doc["@context"][0] == "https://www.w3.org/ns/did/v1"
+        doc.get("id").and_then(Value::as_str) == Some(did)
+            && doc["verificationMethod"][0]["id"] == expected_key_id
+            && doc["verificationMethod"][0]["controller"] == did
+            && doc["verificationMethod"][0]["publicKeyMultibase"] == fingerprint
+            && doc["assertionMethod"][0] == expected_key_id
+            && doc["@context"][0] == "https://www.w3.org/ns/did/v1"
     }
     if !valid_doc(issuer_doc, issuer_did) || !valid_doc(subject_doc, subject_did) {
         return Err("DID document does not bind the declared subject and key".into());
     }
-    if doc["@context"][0] != "https://www.w3.org/2018/credentials/v1" ||
-        doc["type"][0] != "VerifiableCredential" ||
-        doc["issuer"] != issuer_did ||
-        doc["credentialSubject"]["id"] != subject_did ||
-        doc["credentialSubject"]["degree"] != "Computer Science" ||
-        doc["credentialSubject"]["graduated"] != true ||
-        doc["credentialSchema"]["id"] != format!("urn:sas:schema:{}", hex::encode(schema_uid.0.to_array())) ||
-        doc["credentialSchema"]["type"] != "SasSchema2026" ||
-        doc["issuanceDate"].as_str().is_none() {
+    if doc["@context"][0] != "https://www.w3.org/2018/credentials/v1"
+        || doc["type"][0] != "VerifiableCredential"
+        || doc["issuer"] != issuer_did
+        || doc["credentialSubject"]["id"] != subject_did
+        || doc["credentialSubject"]["degree"] != "Computer Science"
+        || doc["credentialSubject"]["graduated"] != true
+        || doc["credentialSchema"]["id"]
+            != format!("urn:sas:schema:{}", hex::encode(schema_uid.0.to_array()))
+        || doc["credentialSchema"]["type"] != "SasSchema2026"
+        || doc["issuanceDate"].as_str().is_none()
+    {
         return Err("VC data does not match issuer, subject or SAS schema".into());
     }
     Ok(())
@@ -96,8 +109,13 @@ fn validate_vc(doc: &Value, issuer_doc: &Value, subject_doc: &Value,
 
 /// Binary envelope consumed by on_attest. We keep JSON-LD in the JWT claim,
 /// and put just the signed compact JWT input/proofs/DID identities on-chain.
-fn encode_envelope(issuer_did: &str, subject_did: &str, signing_input: &str,
-                   jwt_sig: &[u8; 64], binding_sig: &[u8; 64]) -> Vec<u8> {
+fn encode_envelope(
+    issuer_did: &str,
+    subject_did: &str,
+    signing_input: &str,
+    jwt_sig: &[u8; 64],
+    binding_sig: &[u8; 64],
+) -> Vec<u8> {
     assert!(issuer_did.len() <= u8::MAX as usize && subject_did.len() <= u8::MAX as usize);
     assert!(signing_input.len() <= 4096);
     let mut bytes = b"SASVC1".to_vec();
@@ -168,17 +186,26 @@ fn simulate() -> (Value, Value, Value, String, bool) {
             "type": "SasSchema2026"
         }
     });
-    validate_vc(&vc, &issuer_doc, &subject_doc, &issuer_did, &subject_did, &schema_uid)
-        .expect("invalid DID or VC document");
+    validate_vc(
+        &vc,
+        &issuer_doc,
+        &subject_doc,
+        &issuer_did,
+        &subject_did,
+        &schema_uid,
+    )
+    .expect("invalid DID or VC document");
     let kid = format!("{}#{}", issuer_did, &issuer_did["did:key:".len()..]);
     let header = json!({"alg": "EdDSA", "typ": "JWT", "kid": kid});
     let claims = json!({
         "iss": issuer_did, "sub": subject_did,
         "nbf": 1792540800, "jti": vc["id"], "vc": vc,
     });
-    let signing_input = format!("{}.{}",
+    let signing_input = format!(
+        "{}.{}",
         base64url(header.to_string().as_bytes()),
-        base64url(claims.to_string().as_bytes()));
+        base64url(claims.to_string().as_bytes())
+    );
     let jwt_signature = issuer_key.sign(signing_input.as_bytes()).to_bytes();
 
     // On-chain checks bind the same signed JWT to the SAS schema and parties.
@@ -200,10 +227,21 @@ fn simulate() -> (Value, Value, Value, String, bool) {
     let signing_bytes = Bytes::from_slice(&env, signing_input.as_bytes());
     let issuer_did_bytes = Bytes::from_slice(&env, issuer_did.as_bytes());
     let subject_did_bytes = Bytes::from_slice(&env, subject_did.as_bytes());
-    let bound_hash = binding_hash(&env, &att, &signing_bytes, &issuer_did_bytes, &subject_did_bytes);
+    let bound_hash = binding_hash(
+        &env,
+        &att,
+        &signing_bytes,
+        &issuer_did_bytes,
+        &subject_did_bytes,
+    );
     let bound_signature = issuer_key.sign(&bound_hash.to_array()).to_bytes();
-    let envelope = encode_envelope(&issuer_did, &subject_did, &signing_input,
-        &jwt_signature, &bound_signature);
+    let envelope = encode_envelope(
+        &issuer_did,
+        &subject_did,
+        &signing_input,
+        &jwt_signature,
+        &bound_signature,
+    );
     att.data = Bytes::from_slice(&env, &envelope);
     att.uid = attestation_uid(&env, &schema_uid, &recipient, &issuer, &att.data);
 
@@ -213,8 +251,7 @@ fn simulate() -> (Value, Value, Value, String, bool) {
     let verified = sas.verify_attestation(&uid);
 
     // Proof is the JWS signature, not a made-up Data Integrity proof suite.
-    let jwt = format!("{}.{}",
-        signing_input, base64url(&jwt_signature));
+    let jwt = format!("{}.{}", signing_input, base64url(&jwt_signature));
     (issuer_doc, subject_doc, vc, jwt, verified)
 }
 
@@ -224,9 +261,18 @@ fn main() {
         return;
     }
     let (issuer_doc, subject_doc, vc, jwt, verified) = simulate();
-    println!("Issuer DID document:\n{}", serde_json::to_string_pretty(&issuer_doc).unwrap());
-    println!("Subject DID document:\n{}", serde_json::to_string_pretty(&subject_doc).unwrap());
-    println!("Verifiable Credential (JSON-LD):\n{}", serde_json::to_string_pretty(&vc).unwrap());
+    println!(
+        "Issuer DID document:\n{}",
+        serde_json::to_string_pretty(&issuer_doc).unwrap()
+    );
+    println!(
+        "Subject DID document:\n{}",
+        serde_json::to_string_pretty(&subject_doc).unwrap()
+    );
+    println!(
+        "Verifiable Credential (JSON-LD):\n{}",
+        serde_json::to_string_pretty(&vc).unwrap()
+    );
     println!("VC-JWT (EdDSA):\n{jwt}");
     println!("SAS on-chain resolver check + attestation verification: {verified}");
     assert!(verified, "attestation should be valid");
@@ -295,11 +341,18 @@ mod tests {
         let att = Attestation {
             uid: UID(BytesN::from_array(&env, &[0; 32])),
             schema_uid: UID(BytesN::from_array(&env, &[1; 32])),
-            time: 0, expiration_time: 0, revocation_time: 0, valid_from: 0,
+            time: 0,
+            expiration_time: 0,
+            revocation_time: 0,
+            valid_from: 0,
             ref_uid: UID(BytesN::from_array(&env, &[0; 32])),
-            attester: issuer, recipient, revocable: true,
-            data: Bytes::from_slice(&env, &encode_envelope(
-                &did, &did, input, &[0; 64], &[0; 64])),
+            attester: issuer,
+            recipient,
+            revocable: true,
+            data: Bytes::from_slice(
+                &env,
+                &encode_envelope(&did, &did, input, &[0; 64], &[0; 64]),
+            ),
         };
         assert!(client.try_on_attest(&att).is_err());
     }
@@ -320,11 +373,18 @@ mod tests {
         let att = Attestation {
             uid: UID(BytesN::from_array(&env, &[0; 32])),
             schema_uid: UID(BytesN::from_array(&env, &[1; 32])),
-            time: 0, expiration_time: 0, revocation_time: 0, valid_from: 0,
+            time: 0,
+            expiration_time: 0,
+            revocation_time: 0,
+            valid_from: 0,
             ref_uid: UID(BytesN::from_array(&env, &[0; 32])),
-            attester: issuer, recipient, revocable: true,
-            data: Bytes::from_slice(&env, &encode_envelope(
-                &did, "did:key:zFakeSubject", "a.b", &[0; 64], &[0; 64])),
+            attester: issuer,
+            recipient,
+            revocable: true,
+            data: Bytes::from_slice(
+                &env,
+                &encode_envelope(&did, "did:key:zFakeSubject", "a.b", &[0; 64], &[0; 64]),
+            ),
         };
         assert!(client.try_on_attest(&att).is_err());
     }
