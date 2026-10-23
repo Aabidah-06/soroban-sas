@@ -75,6 +75,11 @@ const UID_BYTES: u32 = 36;
 /// caps a ledger entry at 64 KiB; leaving headroom for the vector header
 /// and key keeps writes strictly under the cap.
 const MAX_CHUNK_BYTES: u32 = 32_768;
+const CHUNK_ALLOCATED: Symbol = symbol_short!("CHKALLOC");
+const CHUNK_FULL: Symbol = symbol_short!("CHKFULL");
+const DIM_RECIPIENT: Symbol = symbol_short!("recipient");
+const DIM_SCHEMA: Symbol = symbol_short!("schema");
+const DIM_ATTESTER: Symbol = symbol_short!("attester");
 const MAX_QUERIES_PER_BLOCK: u32 = 1000;
 const RECIPIENT_TOTAL: Symbol = symbol_short!("RCOUNT");
 const SCHEMA_TOTAL: Symbol = symbol_short!("SCOUNT");
@@ -82,6 +87,8 @@ const ATTESTER_TOTAL: Symbol = symbol_short!("ACOUNT");
 const SAS_INTERFACE_VERSION: Symbol = symbol_short!("SASV1");
 /// Persistent key prefix for a UID's [`IndexStatus`]: `(STATUS_KEY, uid)`.
 const STATUS_KEY: Symbol = symbol_short!("IDXSTAT");
+/// Persistent key prefix for an attestation's valid_from activation timestamp (#439).
+const VALID_FROM_KEY: Symbol = symbol_short!("VFROM");
 /// Persistent key prefix for a UID's idempotency record: `(INDEXED_KEY, uid)`
 /// stores the `(recipient, schema_uid, attester)` triple the UID was first
 /// indexed with. Its presence marks the UID as already indexed and pins the
@@ -318,7 +325,21 @@ where
     chunk
 }
 
-fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
+fn emit_chunk_allocated(env: &Env, dimension: Symbol, key: Val, chunk_index: u32) {
+    env.events().publish(
+        (CHUNK_ALLOCATED, dimension, chunk_index),
+        (key, env.ledger().sequence()),
+    );
+}
+
+fn emit_chunk_full(env: &Env, dimension: Symbol, key: Val, chunk_index: u32, total_items: u32) {
+    env.events().publish(
+        (CHUNK_FULL, dimension, chunk_index, total_items),
+        (key, total_items),
+    );
+}
+
+fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol, dimension: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
     let capacity = chunk_capacity(env);
@@ -328,15 +349,30 @@ fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
         .persistent()
         .get(&(key.clone(), chunk_index))
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    let mut allocated = chunk.is_empty();
     if chunk.len() >= capacity {
+        emit_chunk_full(
+            env,
+            dimension.clone(),
+            key.into_val(env),
+            chunk_index,
+            chunk.len(),
+        );
         chunk_index += 1;
         chunk = env
             .storage()
             .persistent()
             .get(&(key.clone(), chunk_index))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        allocated = true;
     }
     chunk.push_back(uid.clone());
+    if allocated {
+        emit_chunk_allocated(env, dimension.clone(), key.into_val(env), chunk_index);
+    }
+    if chunk.len() == capacity {
+        emit_chunk_full(env, dimension, key.into_val(env), chunk_index, chunk.len());
+    }
     let storage_key = (key.clone(), chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
     env.storage()
@@ -382,7 +418,7 @@ fn index_recipient_attestation(env: &Env, recipient: &Address, uid: &UID) {
     extend_instance_ttl(env);
 }
 
-fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
+fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol, dimension: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
     let capacity = chunk_capacity(env);
@@ -392,15 +428,30 @@ fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
         .persistent()
         .get(&(key.clone(), chunk_index))
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    let mut allocated = chunk.is_empty();
     if chunk.len() >= capacity {
+        emit_chunk_full(
+            env,
+            dimension.clone(),
+            key.into_val(env),
+            chunk_index,
+            chunk.len(),
+        );
         chunk_index += 1;
         chunk = env
             .storage()
             .persistent()
             .get(&(key.clone(), chunk_index))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        allocated = true;
     }
     chunk.push_back(uid.clone());
+    if allocated {
+        emit_chunk_allocated(env, dimension.clone(), key.into_val(env), chunk_index);
+    }
+    if chunk.len() == capacity {
+        emit_chunk_full(env, dimension, key.into_val(env), chunk_index, chunk.len());
+    }
     let storage_key = (key.clone(), chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
     env.storage()
@@ -517,6 +568,63 @@ fn collect_page(
         index += take;
     }
     uids
+}
+
+/// A reverse page and the inclusive position to pass to the next call.
+/// `None` as an input cursor starts at the current tail; `None` as an output
+/// cursor means the history has been exhausted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReversePage {
+    pub uids: soroban_sdk::Vec<UID>,
+    pub next_cursor: Option<u32>,
+}
+
+fn collect_reverse_page(
+    env: &Env,
+    total: u32,
+    cursor: Option<u32>,
+    limit: u32,
+    mut get_chunk: impl FnMut(u32) -> Option<soroban_sdk::Vec<UID>>,
+) -> ReversePage {
+    let mut page = ReversePage {
+        uids: soroban_sdk::Vec::new(env),
+        next_cursor: None,
+    };
+    if total == 0 || limit == 0 {
+        return page;
+    }
+    let Some(mut index) = cursor.or_else(|| total.checked_sub(1)) else {
+        return page;
+    };
+    if index >= total {
+        return page;
+    }
+    let mut loaded_index = None;
+    let mut loaded_chunk = soroban_sdk::Vec::new(env);
+    while page.uids.len() < limit {
+        let chunk_index = index / MAX_CHUNK_SIZE;
+        if loaded_index != Some(chunk_index) {
+            let Some(chunk) = get_chunk(chunk_index) else {
+                break;
+            };
+            loaded_chunk = chunk;
+            loaded_index = Some(chunk_index);
+        }
+        let offset = index % MAX_CHUNK_SIZE;
+        let Some(uid) = loaded_chunk.get(offset) else {
+            break;
+        };
+        page.uids.push_back(uid);
+        let Some(previous) = index.checked_sub(1) else {
+            return page;
+        };
+        index = previous;
+    }
+    if page.uids.len() == limit {
+        page.next_cursor = Some(index);
+    }
+    page
 }
 
 #[contractimpl]
@@ -700,10 +808,10 @@ impl Indexer {
             LEDGERS_IN_ONE_YEAR,
         );
 
-        index_address_uid(&env, &recipient, &uid, RECIPIENT_TOTAL);
+        index_address_uid(&env, &recipient, &uid, RECIPIENT_TOTAL, DIM_RECIPIENT);
         index_recipient_attestation(&env, &recipient, &uid);
-        index_uid_uid(&env, &schema_uid, &uid, SCHEMA_TOTAL);
-        index_address_uid(&env, &attester, &uid, ATTESTER_TOTAL);
+        index_uid_uid(&env, &schema_uid, &uid, SCHEMA_TOTAL, DIM_SCHEMA);
+        index_address_uid(&env, &attester, &uid, ATTESTER_TOTAL, DIM_ATTESTER);
 
         // Progress for off-chain consumers (issue #315). Emitted only on the
         // first successful index of this UID, after the counters have moved.
@@ -727,6 +835,30 @@ impl Indexer {
     pub fn get_attestation_status(env: Env, uid: UID) -> Option<IndexStatus> {
         extend_instance_ttl(&env);
         env.storage().persistent().get(&(STATUS_KEY, uid))
+    }
+
+    /// Records the activation timestamp `valid_from` for an indexed attestation (#439).
+    /// Can only be called by the bound SAS contract.
+    pub fn set_valid_from(env: Env, uid: UID, valid_from: u64) {
+        let Some(sas): Option<Address> = env.storage().instance().get(&SAS_CONTRACT) else {
+            panic_with_error!(&env, SASError::Unauthorized);
+        };
+        sas.require_auth();
+        extend_instance_ttl(&env);
+        let key = (VALID_FROM_KEY, uid);
+        env.storage().persistent().set(&key, &valid_from);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        extend_instance_ttl(&env);
+    }
+
+    /// Exposes the recorded `valid_from` activation timestamp for `uid` (#439).
+    /// Returns 0 if unset or unknown.
+    pub fn get_valid_from(env: Env, uid: UID) -> u64 {
+        extend_instance_ttl(&env);
+        let key = (VALID_FROM_KEY, uid);
+        env.storage().persistent().get(&key).unwrap_or(0)
     }
 
     /// Total number of UIDs indexed under `address` as a recipient, across
@@ -912,6 +1044,58 @@ impl Indexer {
         let total = index_total(&env, &(ATTESTER_TOTAL, attester.clone()));
         collect_page(&env, total, cursor, limit, |chunk_index| {
             read_chunk(&env, &(attester.clone(), chunk_index))
+        })
+    }
+
+    /// Newest-first recipient history. Pass `None` for the first cursor and
+    /// then the returned `next_cursor` until it is `None`.
+    pub fn get_atts_by_recipient_reverse(
+        env: Env,
+        recipient: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ReversePage {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(RECIPIENT_TOTAL, recipient.clone()));
+        collect_reverse_page(&env, total, cursor, limit, |i| {
+            read_chunk(&env, &(recipient.clone(), i))
+        })
+    }
+
+    /// Newest-first schema history; uses the same cursor contract.
+    pub fn get_atts_by_schema_reverse(
+        env: Env,
+        schema_uid: UID,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ReversePage {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(SCHEMA_TOTAL, schema_uid.clone()));
+        collect_reverse_page(&env, total, cursor, limit, |i| {
+            read_chunk(&env, &(schema_uid.clone(), i))
+        })
+    }
+
+    /// Newest-first attester history; uses the same cursor contract.
+    pub fn get_atts_by_attester_reverse(
+        env: Env,
+        attester: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ReversePage {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(ATTESTER_TOTAL, attester.clone()));
+        collect_reverse_page(&env, total, cursor, limit, |i| {
+            read_chunk(&env, &(attester.clone(), i))
         })
     }
 
