@@ -1,4 +1,5 @@
 //! In-memory mock SAS and Indexer client for unit testing downstream services without RPC.
+#![allow(clippy::arc_with_non_send_sync)]
 
 use crate::errors::SdkError;
 use sha2::{Digest, Sha256};
@@ -317,7 +318,7 @@ mod tests {
         schema_uid.0.copy_into_slice(&mut raw_schema_uid);
 
         let schema = mock.get_schema(&raw_schema_uid).unwrap().unwrap();
-        assert_eq!(schema.revocable, true);
+        assert!(schema.revocable);
 
         let recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4";
         let attestation_uid = mock
