@@ -152,6 +152,7 @@ pub mod mock4 {
             recipient: Address,
             _schema_uid: UID,
             _attester: Address,
+            _expiration_time: u64,
         ) {
             let mut uids: soroban_sdk::Vec<UID> = env
                 .storage()
@@ -2825,6 +2826,7 @@ pub mod mock_trap_indexer {
             _recipient: Address,
             _schema_uid: UID,
             _attester: Address,
+            _expiration_time: u64,
         ) {
             soroban_sdk::panic_with_error!(&env, SASError::NotInitialized);
         }

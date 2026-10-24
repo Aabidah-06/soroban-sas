@@ -157,6 +157,20 @@ impl From<bool> for RevocationPolicy {
     }
 }
 
+/// Lifecycle of a schema record (#539).
+///
+/// `Quarantined` pauses new attestations while leaving historical ones
+/// readable. Stored beside the record so existing `SchemaRecord` bytes stay
+/// compatible.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SchemaStatus {
+    Active = 0,
+    Deprecated = 1,
+    Quarantined = 2,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)] // Optimize storage serialization (#284)
@@ -368,6 +382,17 @@ impl CompactAttestation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactAttestationKey {
     pub uid: UID,
+}
+
+/// Expiration status bucket for indexing attestations by their expiration
+/// time. Perpetual attestations (expiration_time == 0) are indexed separately
+/// from time-bound attestations to enable efficient queries for time-sensitive
+/// use cases.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpirationStatus {
+    Perpetual,
+    Expiring,
 }
 
 /// Typed storage key for tracking per-attester delegation nonces (#237).
