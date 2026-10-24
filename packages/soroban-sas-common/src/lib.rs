@@ -384,6 +384,17 @@ pub struct CompactAttestationKey {
     pub uid: UID,
 }
 
+/// Expiration status bucket for indexing attestations by their expiration
+/// time. Perpetual attestations (expiration_time == 0) are indexed separately
+/// from time-bound attestations to enable efficient queries for time-sensitive
+/// use cases.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpirationStatus {
+    Perpetual,
+    Expiring,
+}
+
 /// Typed storage key for tracking per-attester delegation nonces (#237).
 ///
 /// Serializes as ScVec rather than ScMap (which a raw `(DELEGATION_NONCE, attester)`

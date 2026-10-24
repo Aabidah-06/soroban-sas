@@ -9,7 +9,7 @@ use crate::simulate;
 use crate::strkey::{parse_address, AddressKind};
 use crate::transaction::{SubmissionPolicy, TransactionSubmitter};
 use serde::{Deserialize, Serialize};
-use soroban_sas_common::{Attestation, SchemaRecord, UID};
+use soroban_sas_common::{Attestation, ExpirationStatus, SchemaRecord, UID};
 use soroban_sdk::xdr::{
     ContractDataDurability, ExtensionPoint, Hash, LedgerEntryData, LedgerKey,
     LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
@@ -2466,6 +2466,25 @@ impl IndexerClient {
             rpc,
             &self.contract_id,
             "get_count_by_attester",
+            vec![arg],
+        )
+    }
+
+    /// Calls `Indexer::get_count_by_expiration(expiration_status)` via
+    /// `simulateTransaction`. See [`IndexerClient::get_count_by_recipient`]
+    /// for semantics.
+    pub fn get_count_by_expiration(
+        &self,
+        rpc: &RpcClient,
+        expiration_status: ExpirationStatus,
+    ) -> Result<u32, SdkError> {
+        let env = &Env::default();
+        let arg = simulate::encode_arg(env, &expiration_status)?;
+        invoke_read_only(
+            env,
+            rpc,
+            &self.contract_id,
+            "get_count_by_expiration",
             vec![arg],
         )
     }
