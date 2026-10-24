@@ -14,6 +14,7 @@ pub mod batch;
 pub mod client;
 pub mod delegation;
 pub mod limits;
+pub mod retry;
 pub mod rpc;
 pub mod schema_builder;
 pub mod sequence;
@@ -23,6 +24,12 @@ pub mod stream;
 pub mod strkey;
 pub mod transaction;
 pub mod transaction_signer;
+pub mod transaction_submitter;
+pub use retry::{ExponentialBackoff, RetryPolicy, RpcErrorKind};
+pub use transaction_submitter::{
+    FeeBumpSigner, FeeBumpStrategy, FeeBumpTransactionEnvelope, PendingTransaction, SubmitError,
+    SubmitResponse, TransactionStatus, TransactionSubmitter,
+};
 
 pub mod chaos;
 pub mod errors;

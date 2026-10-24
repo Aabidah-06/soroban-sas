@@ -154,7 +154,7 @@ impl TimeWindowResolver {
     /// `recipient`, or `None` if the recipient has never been attested
     /// through this resolver (or its record has expired).
     ///
-    /// Together with [`Self::get_cooldown_period_seconds`], callers can
+    /// Together with `get_cooldown_period_seconds`, callers can
     /// compute when the next issuance becomes possible without attempting
     /// one.
     pub fn get_last_attested_time(env: Env, recipient: Address) -> Option<u64> {
