@@ -1636,6 +1636,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sas-docgen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "soroban-sas-common",
+ "soroban-sas-sdk",
+ "soroban-sdk",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "schema-registry"
 version = "0.1.0"
 dependencies = [
