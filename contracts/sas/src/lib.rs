@@ -1946,7 +1946,6 @@ impl SAS {
         if uids.len() > MAX_MULTI_REVOKE {
             panic_with_error!(&env, SASError::BatchTooLarge);
         }
-
         let mut seen: soroban_sdk::Map<UID, bool> = soroban_sdk::Map::new(&env);
         let mut distinct: soroban_sdk::Map<Address, bool> = soroban_sdk::Map::new(&env);
         let mut to_revoke: soroban_sdk::Vec<UID> = soroban_sdk::Vec::new(&env);
@@ -2418,7 +2417,6 @@ impl SAS {
             panic_with_error!(&env, SASError::InvalidValue);
         }
         attester.require_auth();
-
         Self::invalidate_nonces_internal(&env, &attester, min_nonce, max_nonce);
     }
 
@@ -2485,12 +2483,11 @@ impl SAS {
             attester: attester.clone(),
         };
         let current = env.storage().instance().get::<_, u64>(&key).unwrap_or(0);
-        if max_nonce < current {
+        if max_nonce <= current {
             panic_with_error!(env, SASError::InvalidValue);
         }
         env.storage().instance().set(&key, &max_nonce);
         extend_instance_ttl(env);
-
         events::publish_nonces_invalidated(env, attester, min_nonce, max_nonce);
     }
 

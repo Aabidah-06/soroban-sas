@@ -22,6 +22,26 @@ schema string above. The validator rejects whitespace-only values, entries
 without at least one `name Type` pair, and strings that do not resemble a
 field declaration.
 
+## Schema Definition Hygiene
+
+Schema definition strings are validated with strict lexical rules before the
+structural `name Type` parser runs. A registration is rejected with
+`SASError::InvalidSchemaDefinition` when the string contains:
+
+- ASCII control characters (`< 0x20`, including tabs, newlines, carriage
+  returns, and the null byte) or `DEL` (`0x7F`);
+- invalid UTF-8, or invisible / non-ASCII unicode whitespace such as a
+  non-breaking space (`U+00A0`), zero-width space (`U+200B`), byte-order mark
+  (`U+FEFF`), or ideographic space (`U+3000`);
+- malformed separators: a leading or trailing comma, two consecutive spaces,
+  a space immediately before a comma, or more than one space after a comma.
+
+These rules enforce a single canonical spelling for any given schema. Without
+them, two visually identical schema strings that differ only by an invisible
+code point or redundant whitespace would hash to different UIDs, producing
+phantom duplicate schemas and divergence between on-chain and off-chain
+parsers.
+
 Two ceilings bound the size of a schema string:
 - **Byte length**: at most 1024 bytes (`MAX_SCHEMA_LENGTH`).
 - **Field count**: at most 64 comma-separated fields (`MAX_SCHEMA_FIELDS`).

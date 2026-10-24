@@ -101,7 +101,6 @@ pub mod mock2 {
         pub fn validate_schema(_env: Env, _uid: UID) -> bool {
             false
         }
-
         pub fn is_authorized(_env: Env, _uid: UID, _attester: Address) -> bool {
             false
         }

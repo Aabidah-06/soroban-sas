@@ -9,7 +9,8 @@ use soroban_sas_common::{
         SCHEMA_FEE_UPDATED, SCHEMA_FROST_GROUP_UPDATED, SCHEMA_OWNERSHIP_PROPOSED,
         SCHEMA_OWNERSHIP_TRANSFERRED, SCHEMA_QUARANTINED, TREASURY_UPDATED,
     },
-    validate_frost_group, validate_schema_syntax, ContractUpgradedEvent, DelegatesStatus,
+    validate_frost_group, validate_schema_lexical, validate_schema_syntax, ContractUpgradedEvent,
+    DelegatesStatus,
     FrostGroup, PreviousAddress, RevocationPolicy, SASError, SchemaDelegateAddedEvent,
     SchemaDelegateRemovedEvent, SchemaDeprecatedEvent, SchemaFeeUpdatedEvent,
     SchemaFrostGroupUpdatedEvent, SchemaOwnershipProposedEvent, SchemaOwnershipTransferredEvent,
@@ -1553,7 +1554,7 @@ impl SchemaRegistry {
         if let Some(record) = env.storage().persistent().get::<_, SchemaRecord>(&uid) {
             RevocationPolicy::from(record.revocable)
         } else {
-            panic_with_error!(&env, SASError::SchemaNotFound);
+            RevocationPolicy::Permissive
         }
     }
 
@@ -1741,6 +1742,12 @@ impl SchemaRegistry {
         max_ttl: u64,
     ) -> UID {
         extend_instance_ttl(&env);
+        // Strict lexical validation first (#447): control characters, invalid
+        // unicode whitespace, and malformed separators are rejected with the
+        // typed `InvalidSchemaDefinition` before the structural syntax check.
+        if let Err(err) = validate_schema_lexical(&env, &schema) {
+            panic_with_error!(&env, err);
+        }
         if let Err(err) = validate_schema_syntax(&env, &schema) {
             panic_with_error!(&env, err);
         }
@@ -1835,9 +1842,11 @@ impl SchemaRegistry {
         uid
     }
 
-    /// Returns the active [`SchemaRecord`] for `uid`, renewing its TTL when it
-    /// exists. An unknown or deprecated UID returns `None` and creates no
-    /// storage.
+    /// Returns the current owner (creator) of `schema_uid`, if registered (#446).
+    pub fn get_schema_owner(env: Env, schema_uid: UID) -> Option<Address> {
+        extend_instance_ttl(&env);
+        schema_creator(&env, &schema_uid)
+    }
     pub fn get_schema(env: Env, uid: UID) -> Option<SchemaRecord> {
         extend_instance_ttl(&env);
         if env

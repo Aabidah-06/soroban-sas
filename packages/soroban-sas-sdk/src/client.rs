@@ -2712,6 +2712,23 @@ fn is_archived_error(msg: &str) -> bool {
 /// `secret_seed`. The contract requires `attester.require_auth()`, so a
 /// mismatch here can only ever fail on-chain — surfacing it locally saves a
 /// round trip and a wasted signature over a doomed transaction.
+#[allow(dead_code)]
+fn ensure_attester_matches_secret(
+    env: &Env,
+    secret_seed: &[u8; 32],
+    attestation: &Attestation,
+) -> Result<(), SdkError> {
+    let public_key = signature::derive_public_key(secret_seed);
+    let signer_strkey = stellar_strkey::ed25519::PublicKey(public_key).to_string();
+    let signer = Address::from_string(&SorobanString::from_str(env, &signer_strkey));
+    if signer != attestation.attester {
+        return Err(SdkError::ValidationError(
+            "attestation.attester does not match the account derived from secret_seed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Simulates a read-only call to `function_name` on `contract_id` and
 /// decodes its return value as `T`.
 fn invoke_read_only<T>(
@@ -3193,6 +3210,7 @@ mod tests {
     /// reset the connection, which `ureq` surfaces as a spurious transport
     /// error and made these tests flaky.
     fn spawn_mock_rpc_server(response_body: String) -> String {
+        use std::io::{BufRead, BufReader};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         std::thread::spawn(move || {
