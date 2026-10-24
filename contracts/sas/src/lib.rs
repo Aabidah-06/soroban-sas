@@ -6,7 +6,8 @@ extern crate alloc;
 
 use soroban_sas_common::{
     Attestation, CompactAttestation, CompactAttestationKey, ContractUpgradedEvent,
-    DelegationNonceKey, SASError, LEDGERS_IN_ONE_YEAR, MAX_ATTESTATION_DATA_BYTES, UID,
+    DelegationNonceKey, RecipientConsentNonceKey, SASError, LEDGERS_IN_ONE_YEAR,
+    MAX_ATTESTATION_DATA_BYTES, UID,
 };
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -40,6 +41,7 @@ pub const ATTESTER_KEY: Symbol = symbol_short!("ATTKEY");
 /// protection with one `instance` entry per attester (bounded growth) whose
 /// lifetime tracks contract liveness via `extend_instance_ttl`.
 pub const DELEGATION_NONCE: Symbol = symbol_short!("DELNONCE");
+pub const RECIPIENT_CONSENT_NONCE: Symbol = symbol_short!("RCONSENT");
 pub const VALID_FROM: Symbol = symbol_short!("V_FROM");
 /// Monotonic contract version. Missing on legacy initialized deployments,
 /// which are treated as genesis version 1.
@@ -1353,6 +1355,63 @@ impl SAS {
 
         old.attester.require_auth();
 
+        Self::replace_internal(env, old_uid, new_data, old)
+    }
+
+    /// Relayed replacement requiring independent off-chain approvals from
+    /// the old attester and recipient. Both sign the same domain-separated
+    /// digest of `old_uid`, the complete `new_data`, and both nonces. The
+    /// attester nonce shares the delegated issuance/revocation watermark;
+    /// recipient consent has its own per-recipient watermark. All writes,
+    /// callbacks and indexer updates commit or revert together.
+    pub fn replace_by_delegation_consent(
+        env: Env,
+        old_uid: UID,
+        new_data: Attestation,
+        attester_approval: soroban_sas_common::ReplacementApproval,
+        recipient_approval: soroban_sas_common::ReplacementApproval,
+    ) -> UID {
+        if is_paused_status(&env) {
+            panic_with_error!(&env, SASError::ContractPaused);
+        }
+        extend_instance_ttl(&env);
+        let Some(old) = read_attestation(&env, &old_uid) else {
+            panic_with_error!(&env, SASError::AttestationNotFound);
+        };
+        if new_data.attester != old.attester || new_data.recipient != old.recipient {
+            panic_with_error!(&env, SASError::Unauthorized);
+        }
+        Self::require_attester_key(&env, &old.attester, &attester_approval.public_key);
+        Self::require_attester_key(&env, &old.recipient, &recipient_approval.public_key);
+
+        let domain = soroban_sas_common::ReplacementConsentDomain {
+            network_id: env.ledger().network_id(),
+            contract: env.current_contract_address(),
+            attester_nonce: attester_approval.nonce,
+            recipient_nonce: recipient_approval.nonce,
+        };
+        let digest = soroban_sas_common::hash_delegated_replacement_consent(
+            &env, &old_uid, &new_data, &domain,
+        );
+        soroban_sas_common::verify_offchain_signature(
+            &env,
+            &digest,
+            &attester_approval.public_key,
+            &attester_approval.signature,
+        );
+        soroban_sas_common::verify_offchain_signature(
+            &env,
+            &digest,
+            &recipient_approval.public_key,
+            &recipient_approval.signature,
+        );
+        Self::consume_delegation_nonce(&env, &old.attester, attester_approval.nonce);
+        Self::consume_recipient_consent_nonce(&env, &old.recipient, recipient_approval.nonce);
+
+        Self::replace_internal(env, old_uid, new_data, old)
+    }
+
+    fn replace_internal(env: Env, old_uid: UID, new_data: Attestation, old: Attestation) -> UID {
         if !old.revocable {
             panic_with_error!(&env, SASError::NotRevocable);
         }
@@ -1855,6 +1914,21 @@ impl SAS {
         extend_instance_ttl(env);
     }
 
+    fn consume_recipient_consent_nonce(env: &Env, recipient: &Address, nonce: u64) {
+        extend_instance_ttl(env);
+        let key = RecipientConsentNonceKey {
+            scope: RECIPIENT_CONSENT_NONCE,
+            recipient: recipient.clone(),
+        };
+        if let Some(last) = env.storage().instance().get::<_, u64>(&key) {
+            if nonce <= last {
+                panic_with_error!(env, SASError::DelegationReplay);
+            }
+        }
+        env.storage().instance().set(&key, &nonce);
+        extend_instance_ttl(env);
+    }
+
     /// Invalidates a range of delegation nonces `[min_nonce, max_nonce]` for `attester` (#437).
     /// Requires direct caller authorization (`attester.require_auth()`).
     pub fn invalidate_nonces(env: Env, attester: Address, min_nonce: u64, max_nonce: u64) {
@@ -2223,6 +2297,19 @@ impl SAS {
     pub fn get_delegation_nonce(env: Env, attester: Address) -> Option<u64> {
         extend_instance_ttl(&env);
         let key = DelegationNonceKey { attester };
+        let nonce = env.storage().instance().get::<_, u64>(&key);
+        extend_instance_ttl(&env);
+        nonce
+    }
+
+    /// Highest consumed recipient consent nonce, or `None` before first use.
+    /// The next consent nonce must be strictly greater than this value.
+    pub fn get_recipient_consent_nonce(env: Env, recipient: Address) -> Option<u64> {
+        extend_instance_ttl(&env);
+        let key = RecipientConsentNonceKey {
+            scope: RECIPIENT_CONSENT_NONCE,
+            recipient,
+        };
         let nonce = env.storage().instance().get::<_, u64>(&key);
         extend_instance_ttl(&env);
         nonce
