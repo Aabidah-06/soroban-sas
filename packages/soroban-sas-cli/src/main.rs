@@ -5,9 +5,11 @@ mod cache;
 mod hardware;
 mod identity;
 mod io_safety;
+mod json_schema;
 mod manpage;
 mod network;
 mod offchain;
+mod wizard;
 
 /// Resolves a subcommand's own flag against the global `--network` shorthand
 /// (issue #174): an explicit flag (already merged with its environment
@@ -217,26 +219,62 @@ fn trim_bounds(bytes: &[u8], mut start: usize, mut end: usize) -> Option<(usize,
 }
 
 fn validate_schema_syntax(schema: &str) -> Result<(), String> {
-    let schema = schema.as_bytes();
-    if schema.is_empty() {
+    let schema_bytes = schema.as_bytes();
+    if schema_bytes.is_empty() {
         return Err("schema is empty: pass a non-empty --schema definition string".to_string());
     }
-    if schema.len() > MAX_SCHEMA_LENGTH {
+    if schema_bytes.len() > MAX_SCHEMA_LENGTH {
         return Err(format!(
             "schema is {} bytes, which exceeds the {MAX_SCHEMA_LENGTH}-byte limit",
-            schema.len()
+            schema_bytes.len()
         ));
     }
 
+    for &b in schema_bytes {
+        if b < 32 || b == 127 {
+            return Err(
+                "schema contains invalid control character or null byte (ASCII < 32)".to_string(),
+            );
+        }
+    }
+    for c in schema.chars() {
+        if c != ' ' && c.is_whitespace() {
+            return Err("schema contains invalid unicode whitespace".to_string());
+        }
+        if matches!(
+            c,
+            '\u{0085}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200B}'
+                    | '\u{200C}'
+                    | '\u{200D}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202F}'
+                    | '\u{205F}'
+                    | '\u{2060}'
+                    | '\u{3000}'
+                    | '\u{FEFF}'
+                    | '\u{00AD}'
+        ) {
+            return Err("schema contains reserved invisible or unicode whitespace".to_string());
+        }
+    }
+
+    let schema = schema_bytes;
     let Some((mut start, end)) = trim_bounds(schema, 0, schema.len()) else {
         return Err("schema is empty: pass a non-empty --schema definition string".to_string());
     };
 
     let mut field_count = 0u32;
+    let mut seen_names: Vec<String> = Vec::new();
     while start < end {
         let mut field_end = start;
         while field_end < end && schema[field_end] != b',' {
             field_end += 1;
+        }
+
+        if field_end > start && schema[field_end - 1] == b' ' {
+            return Err("malformed separator: space before comma not allowed".to_string());
         }
 
         let Some((field_start, field_end)) = trim_bounds(schema, start, field_end) else {
@@ -246,7 +284,7 @@ fn validate_schema_syntax(schema: &str) -> Result<(), String> {
         };
 
         let mut split_index = field_start;
-        while split_index < field_end && !is_ascii_whitespace(schema[split_index]) {
+        while split_index < field_end && schema[split_index] != b' ' {
             split_index += 1;
         }
         if split_index == field_start || split_index >= field_end {
@@ -255,13 +293,11 @@ fn validate_schema_syntax(schema: &str) -> Result<(), String> {
             );
         }
 
-        let mut ty_start = split_index;
-        while ty_start < field_end && is_ascii_whitespace(schema[ty_start]) {
-            ty_start += 1;
-        }
-        if ty_start >= field_end {
+        let ty_start = split_index + 1;
+        if ty_start >= field_end || schema[ty_start] == b' ' {
             return Err(
-                "schema must use comma-separated `name Type` field definitions".to_string(),
+                "non-canonical spacing: exactly one space allowed between identifier and type"
+                    .to_string(),
             );
         }
 
@@ -286,6 +322,13 @@ fn validate_schema_syntax(schema: &str) -> Result<(), String> {
                 "schema must use comma-separated `name Type` field definitions".to_string(),
             );
         }
+        let name_norm = std::str::from_utf8(name).unwrap_or("").to_ascii_lowercase();
+        if seen_names.iter().any(|existing| existing == &name_norm) {
+            return Err(format!(
+                "schema field `{name_norm}` collides with an earlier field and would break serialization"
+            ));
+        }
+        seen_names.push(name_norm);
         field_count += 1;
 
         if field_end >= end {
@@ -653,6 +696,14 @@ enum OffchainCommands {
 
 #[derive(Subcommand)]
 enum SchemaCommands {
+    /// Export a SAS schema as JSON Schema Draft-7 and print compatibility warnings (#537).
+    Lint {
+        #[arg(
+            long,
+            help = "Schema definition string, e.g. `name string, active bool`"
+        )]
+        schema: String,
+    },
     /// Register a new schema. The registration is signed and submitted by
     /// --secret-key's account, which becomes the schema's owner.
     Register {
@@ -699,6 +750,49 @@ enum SchemaCommands {
     /// answer; `--secret-key` / `--registry-contract-id` still come from
     /// flags or environment variables, matching `register` (#326).
     Interactive {
+        #[arg(
+            long,
+            help = "Owner's signing key: S... strkey seed or 32-byte hex seed",
+            env = "SAS_SECRET_KEY",
+            hide_env_values = true
+        )]
+        secret_key: Option<String>,
+        #[arg(
+            long,
+            help = "Network passphrase to sign against",
+            env = "SOROBAN_NETWORK_PASSPHRASE"
+        )]
+        network_passphrase: Option<String>,
+        #[arg(
+            long,
+            help = "Schema Registry contract address (C...)",
+            env = "SCHEMA_REGISTRY_CONTRACT_ID"
+        )]
+        registry_contract_id: String,
+        #[arg(long, help = "Soroban RPC endpoint URL", env = "SOROBAN_RPC_URL")]
+        rpc_url: Option<String>,
+    },
+    /// Interactive registration wizard (#469): prompts for a schema name,
+    /// field-by-field definitions, revocability, an optional resolver
+    /// address, and a metadata URI — validating each answer the moment it is
+    /// entered — then shows a summary with the estimated network fee and
+    /// submits the registration once confirmed. Needs a terminal for the
+    /// dialoguer prompts; when stdin is not a TTY it falls back to reading
+    /// one answer per line from stdin in the same order (name, fields
+    /// ending in a blank line, `y/n` revocable, resolver, metadata URI,
+    /// final `y/N` confirmation). `name` and the metadata URI are off-chain
+    /// labels echoed in the result: the registry identifies a schema by the
+    /// `(schema, resolver, revocable)` tuple alone. `--resolver` /
+    /// SAS_RESOLVER_CONTRACT_ID prefills the resolver so its prompt can be
+    /// skipped with a blank answer.
+    Wizard {
+        #[arg(
+            long,
+            help = "Default resolver contract address (C...), used when the wizard's resolver \
+                    prompt is left blank",
+            env = "SAS_RESOLVER_CONTRACT_ID"
+        )]
+        resolver: Option<String>,
         #[arg(
             long,
             help = "Owner's signing key: S... strkey seed or 32-byte hex seed",
@@ -1009,6 +1103,11 @@ enum AttestCommands {
             default_value_t = 300
         )]
         max_ledger_skew: u64,
+        #[arg(
+            long,
+            help = "Simulate transaction execution and print resource consumption without submitting"
+        )]
+        dry_run: bool,
     },
     /// Create and submit a new on-chain attestation
     Create {
@@ -1105,6 +1204,11 @@ enum AttestCommands {
         contract_id: String,
         #[arg(long, help = "Soroban RPC endpoint URL", env = "SOROBAN_RPC_URL")]
         rpc_url: Option<String>,
+        #[arg(
+            long,
+            help = "Simulate transaction execution and print resource consumption without submitting"
+        )]
+        dry_run: bool,
     },
     /// Verify an on-chain attestation's current validity
     Verify {
@@ -1503,25 +1607,101 @@ fn print_sas_fee_admin_result(
     emit_ok(output, || println!("{human}"), data)
 }
 
-/// Prints a [`soroban_sas_sdk::client::DryRunResult`] (issue #329's
-/// `--dry-run`): no transaction was signed or submitted, so there is no
-/// hash to report — only the simulated resource fee.
+/// Prints a [`soroban_sas_sdk::client::DryRunResult`] (issue #329, #473's
+/// `--dry-run`): no transaction was signed or submitted, displaying exact
+/// resource consumption (CPU instructions, RAM bytes, storage entries, fees).
 fn print_dry_run_result(
     result: soroban_sas_sdk::client::DryRunResult,
     output: OutputFormat,
 ) -> Result<(), String> {
-    let human = format!(
-        "Dry run: `{}` would succeed\nEstimated fee: {} stroops (simulated against ledger {})\nNo transaction was submitted.",
-        result.function_name, result.total_fee, result.latest_ledger
-    );
-    let data = serde_json::json!({
-        "dry_run": true,
-        "function": result.function_name,
-        "estimated_fee_stroops": result.total_fee,
-        "min_resource_fee_stroops": result.min_resource_fee,
-        "simulated_ledger": result.latest_ledger,
-    });
-    emit_ok(output, || println!("{human}"), data)
+    match output {
+        OutputFormat::Human => {
+            println!("Dry run: `{}` simulation succeeded", result.function_name);
+            println!("Simulated against ledger: {}", result.latest_ledger);
+            println!(
+                "Total estimated fee:      {} stroops (min resource fee: {} stroops)",
+                result.total_fee, result.min_resource_fee
+            );
+            if let Some(ref res) = result.resources {
+                println!();
+                println!("Resource Breakdown:");
+                println!("┌───────────────────────┬────────────────────────┬──────────────┐");
+                println!("│ Metric                │ Consumed               │ Limit Status │");
+                println!("├───────────────────────┼────────────────────────┼──────────────┤");
+                println!(
+                    "│ CPU Instructions      │ {:<22} │ {:<12} │",
+                    format!("{} inst", res.cpu_instructions),
+                    if res.cpu_instructions > 80_000_000 {
+                        "WARN (>80%)"
+                    } else {
+                        "OK"
+                    }
+                );
+                println!(
+                    "│ Read Bytes            │ {:<22} │ {:<12} │",
+                    format!("{} B", res.read_bytes),
+                    if res.read_bytes > 160_000 {
+                        "WARN (>80%)"
+                    } else {
+                        "OK"
+                    }
+                );
+                println!(
+                    "│ Write Bytes           │ {:<22} │ {:<12} │",
+                    format!("{} B", res.write_bytes),
+                    if res.write_bytes > 104_000 {
+                        "WARN (>80%)"
+                    } else {
+                        "OK"
+                    }
+                );
+                println!(
+                    "│ Read-Only Keys        │ {:<22} │ {:<12} │",
+                    res.read_only_entries,
+                    if res.read_only_entries + res.read_write_entries > 32 {
+                        "WARN (>80%)"
+                    } else {
+                        "OK"
+                    }
+                );
+                println!(
+                    "│ Read-Write Keys       │ {:<22} │ {:<12} │",
+                    res.read_write_entries,
+                    if res.read_write_entries > 20 {
+                        "WARN (>80%)"
+                    } else {
+                        "OK"
+                    }
+                );
+                println!("└───────────────────────┴────────────────────────┴──────────────┘");
+                if res.approaches_limits {
+                    println!("\n[!] WARNING: Transaction approaches network resource limits (>80% of limit):");
+                    for w in &res.limit_warnings {
+                        println!("    * {w}");
+                    }
+                }
+            }
+            println!("\nNo transaction was broadcast to the network.");
+            Ok(())
+        }
+        OutputFormat::Json => {
+            let data = serde_json::json!({
+                "dry_run": true,
+                "function": result.function_name,
+                "simulated_ledger": result.latest_ledger,
+                "estimated_fee_stroops": result.total_fee,
+                "min_resource_fee_stroops": result.min_resource_fee,
+                "cpu_instructions": result.resources.as_ref().map(|r| r.cpu_instructions),
+                "read_bytes": result.resources.as_ref().map(|r| r.read_bytes),
+                "write_bytes": result.resources.as_ref().map(|r| r.write_bytes),
+                "read_only_entries": result.resources.as_ref().map(|r| r.read_only_entries),
+                "read_write_entries": result.resources.as_ref().map(|r| r.read_write_entries),
+                "approaches_limits": result.resources.as_ref().map(|r| r.approaches_limits).unwrap_or(false),
+                "limit_warnings": result.resources.as_ref().map(|r| &r.limit_warnings),
+            });
+            emit_ok(output, || {}, data)
+        }
+    }
 }
 
 /// A CSV row that has passed every local check, ready to be submitted.
@@ -1563,6 +1743,7 @@ fn submit_bulk_row(
         schema_uid: row.schema_uid.clone(),
         time: ctx.issuance_time,
         expiration_time: row.expiration,
+        valid_from: 0,
         ref_uid: hex::encode([0u8; 32]),
         recipient: row.recipient.clone(),
         attester: ctx.attester.to_string(),
@@ -1604,6 +1785,7 @@ fn run_attest(
             rpc_url,
             allow_local_time,
             max_ledger_skew,
+            dry_run,
         } => {
             let secret_key = resolve_secret_key(secret_key, identity.as_deref(), hardware)?;
             let network_passphrase =
@@ -1650,6 +1832,7 @@ fn run_attest(
                 schema_uid: schema_uid.clone(),
                 time: issuance_time,
                 expiration_time: expiration,
+                valid_from: 0,
                 ref_uid: hex::encode([0u8; 32]),
                 recipient,
                 attester,
@@ -1657,6 +1840,13 @@ fn run_attest(
                 data: hex::encode(&data_bytes),
             };
             let attestation = offchain::parse_attestation(&env, &input)?;
+
+            if dry_run {
+                let result = client
+                    .attest_dry_run(&rpc, &seed, attestation)
+                    .map_err(|e| e.to_string())?;
+                return print_dry_run_result(result, output);
+            }
 
             let result = client
                 .attest(&rpc, &network_passphrase, &seed, attestation)
@@ -1934,6 +2124,7 @@ fn run_attest(
             network_passphrase,
             contract_id,
             rpc_url,
+            dry_run,
         } => {
             let secret_key = resolve_secret_key(secret_key, identity.as_deref(), hardware)?;
             let network_passphrase =
@@ -1943,6 +2134,12 @@ fn run_attest(
             let seed = offchain::parse_secret_seed(&secret_key)?;
             let rpc = soroban_sas_sdk::rpc::RpcClient::new(rpc_url);
             let client = soroban_sas_sdk::client::SASClient::new(contract_id);
+            if dry_run {
+                let result = client
+                    .revoke_dry_run(&rpc, &seed, &uid)
+                    .map_err(|e| e.to_string())?;
+                return print_dry_run_result(result, output);
+            }
             let result = client
                 .revoke(&rpc, &network_passphrase, &seed, &uid)
                 .map_err(|e| e.to_string())?;
@@ -2151,6 +2348,44 @@ fn print_schema_registration_result(
         }
     }
     Ok(())
+}
+
+/// Success reporting for `schema wizard` (#469): the same status/UID/hash
+/// lines as [`print_schema_registration_result`] plus the off-chain labels
+/// the wizard collected, with the JSON half wrapped in the standard
+/// `{"status":"ok","data":…}` envelope (`--output json`).
+fn print_wizard_registration_result(
+    result: soroban_sas_sdk::rpc::GetTransactionResult,
+    uid_hex: &str,
+    answers: &wizard::WizardAnswers,
+    output: OutputFormat,
+) -> Result<(), String> {
+    if result.status != "SUCCESS" {
+        return Err(format!(
+            "schema registration failed with status {}",
+            result.status
+        ));
+    }
+    emit_ok(
+        output,
+        || {
+            println!("Schema registered: {uid_hex}");
+            if let Some(hash) = &result.hash {
+                println!("Transaction hash:  {hash}");
+            }
+            println!("Name:             {}", answers.name);
+            if let Some(uri) = &answers.metadata_uri {
+                println!("Metadata URI:     {uri}");
+            }
+        },
+        serde_json::json!({
+            "submitted": true,
+            "schema_uid": uid_hex,
+            "hash": result.hash.clone(),
+            "name": answers.name.clone(),
+            "metadata_uri": answers.metadata_uri.clone(),
+        }),
+    )
 }
 
 fn print_transaction_result(
@@ -2506,6 +2741,27 @@ fn run_schema(
 ) -> Result<(), String> {
     let env = soroban_sdk::Env::default();
     match action {
+        SchemaCommands::Lint { schema } => {
+            let linted = json_schema::lint_schema(&schema)?;
+            let round_tripped = json_schema::round_trip_schema(&schema)?;
+            let pretty = serde_json::to_string_pretty(&linted.document)
+                .map_err(|e| format!("serialization failed: {e}"))?;
+            let warnings = linted.warnings.clone();
+            emit_ok(
+                output,
+                || {
+                    for warning in &warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                    println!("{pretty}");
+                },
+                serde_json::json!({
+                    "json_schema": linted.document,
+                    "warnings": linted.warnings,
+                    "sas_schema": round_tripped,
+                }),
+            )
+        }
         SchemaCommands::Register {
             schema,
             resolver,
@@ -2585,6 +2841,97 @@ fn run_schema(
                 )
                 .map_err(|e| e.to_string())?;
             print_schema_registration_result(result, &uid_hex, output)
+        }
+        SchemaCommands::Wizard {
+            resolver,
+            secret_key,
+            network_passphrase,
+            registry_contract_id,
+            rpc_url,
+        } => {
+            use std::io::BufRead;
+            // Everything sourced from flags/environment resolves *before* the
+            // first prompt (#469): a missing credential or endpoint should
+            // fail fast, not after every answer has been typed.
+            let secret_key = resolve_secret_key(secret_key, identity.as_deref(), hardware)?;
+            let seed = offchain::parse_secret_seed(&secret_key)?;
+            let rpc_url = resolve_rpc_url(rpc_url, network.as_deref())?;
+            let network_passphrase =
+                resolve_network_passphrase(network_passphrase, network.as_deref())?;
+
+            let mode = wizard::Mode::detect();
+            let stdin = std::io::stdin();
+            let mut lines = stdin.lock().lines();
+            let answers = wizard::collect(mode, &mut lines, resolver.as_deref())?;
+
+            // The UID preimage is exactly (schema, resolver, revocable), so
+            // computing it locally also validates the resolver as a C...
+            // contract address before any RPC call is made.
+            let uid_hex = compute_schema_uid_hex(
+                &env,
+                &answers.schema,
+                &answers.resolver,
+                answers.revocable,
+            )?;
+
+            let rpc = soroban_sas_sdk::rpc::RpcClient::new(rpc_url);
+            let client = soroban_sas_sdk::client::SASClient::new(registry_contract_id.clone());
+            // Estimate the network fee by simulating the exact call a real
+            // submission would send (#329's dry run): no signature, no
+            // sequence consumed, nothing submitted. An unavailable estimate
+            // is reported but never blocks — the submission itself still
+            // simulates before signing, so a doomed call fails there with the
+            // same on-chain reason.
+            let fee_estimate = match client.register_schema_dry_run(
+                &rpc,
+                &seed,
+                &registry_contract_id,
+                &answers.schema,
+                &answers.resolver,
+                answers.revocable,
+            ) {
+                Ok(dry_run) => Some(dry_run.total_fee),
+                Err(error) => {
+                    let reason = humanize_rpc_failure(&error.to_string());
+                    let reason = reason.lines().next().unwrap_or("unknown error");
+                    eprintln!("warning: network fee estimate unavailable: {reason}");
+                    None
+                }
+            };
+
+            wizard::print_summary(
+                &answers,
+                &uid_hex,
+                fee_estimate,
+                &network_passphrase,
+                &registry_contract_id,
+            );
+
+            if !wizard::confirm(mode, &mut lines)? {
+                return emit_ok(
+                    output,
+                    || println!("Aborted: no transaction was submitted."),
+                    serde_json::json!({
+                        "submitted": false,
+                        "schema_uid": uid_hex,
+                        "name": answers.name.clone(),
+                        "metadata_uri": answers.metadata_uri.clone(),
+                    }),
+                );
+            }
+
+            let result = client
+                .register_schema(
+                    &rpc,
+                    &network_passphrase,
+                    &seed,
+                    &registry_contract_id,
+                    &answers.schema,
+                    &answers.resolver,
+                    answers.revocable,
+                )
+                .map_err(|e| e.to_string())?;
+            print_wizard_registration_result(result, &uid_hex, &answers, output)
         }
         SchemaCommands::Get {
             uid,
