@@ -19,6 +19,9 @@
       "require": "./dist/testing.cjs"
     }
   },
+  "bin": {
+    "sas-typegen": "dist/cli.js"
+  },
   "files": [
     "dist"
   ],

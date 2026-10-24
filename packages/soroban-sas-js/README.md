@@ -74,6 +74,37 @@ pub struct Claim {}
 The registry validates schema syntax but does not enforce payload field types
 on-chain. Both codecs validate their supported types before encoding.
 
+## Schema type generation
+
+The SDK exports `parseSchema`, `generateTypeScript`, `encodeSchemaValue`, and
+`decodeSchemaValue`. Generated interfaces preserve field order and include a
+comment with each source schema type. Payload values encode as a Soroban
+`ScVal` vector in schema field order, matching a Soroban struct's XDR shape.
+
+```ts
+import { encodeSchemaValue, generateTypeScript } from "@soroban-sas/sdk";
+
+const schema = "name string, age uint32, verified bool, account address";
+const source = generateTypeScript(schema, "Profile");
+const xdr = encodeSchemaValue(schema, {
+  name: "Ada",
+  age: 37,
+  verified: true,
+  account: "G...",
+});
+```
+
+Install the package to use the `sas-typegen` CLI:
+
+```sh
+sas-typegen "name string, age uint32, verified bool, account address" --name Profile
+sas-typegen --schema-file schema.txt --name Profile --out profile.ts
+```
+
+Supported schema forms include primitives, `Option<T>` / `T?`, `Vec<T>`,
+`[T]`, `Map<K:V>`, and `Tuple(T1 T2 ...)`. Numeric values wider than 32 bits
+use JavaScript `bigint`; byte values use `Uint8Array`.
+
 ## Delegated attestations
 
 `signDelegatedAttestation` signs `hashTypedData(attestation, domain)` with
