@@ -2,6 +2,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 mod bulk;
 mod cache;
+mod config;
 mod hardware;
 mod identity;
 mod importer;
@@ -17,17 +18,29 @@ mod wizard;
 /// (issue #174): an explicit flag (already merged with its environment
 /// variable fallback by clap's `env = "..."`) always wins; `--network`
 /// supplies the value only when the flag is entirely absent.
+/// If neither is supplied, the active configuration profile is checked (issue #474).
 fn resolve_rpc_url(explicit: Option<String>, network: Option<&str>) -> Result<String, String> {
     if let Some(url) = explicit {
         return Ok(url);
     }
-    match network {
-        Some(name) => Ok(network::resolve_network(name)?.rpc_url),
-        None => Err(
-            "missing --rpc-url: pass it directly, set SOROBAN_RPC_URL, or pass --network"
-                .to_string(),
-        ),
+    if let Some(name) = network {
+        return Ok(network::resolve_network(name)?.rpc_url);
     }
+    let profile_override = config::get_active_profile_override();
+    if profile_override.is_some() {
+        let cfg = config::load_config()?;
+        let (_, p) = cfg.resolve(profile_override.as_deref())?;
+        if !p.rpc_url.is_empty() {
+            return Ok(p.rpc_url);
+        }
+    } else if let Ok(Some(cfg)) = config::load_existing_config() {
+        if let Ok((_, p)) = cfg.resolve(None) {
+            if !p.rpc_url.is_empty() {
+                return Ok(p.rpc_url);
+            }
+        }
+    }
+    Err("missing --rpc-url: pass it directly, set SOROBAN_RPC_URL, or pass --network".to_string())
 }
 
 /// Same precedence as [`resolve_rpc_url`], for the network passphrase half
@@ -39,12 +52,26 @@ fn resolve_network_passphrase(
     if let Some(passphrase) = explicit {
         return Ok(passphrase);
     }
-    match network {
-        Some(name) => Ok(network::resolve_network(name)?.network_passphrase),
-        None => Err("missing --network-passphrase: pass it directly, set \
-             SOROBAN_NETWORK_PASSPHRASE, or pass --network"
-            .to_string()),
+    if let Some(name) = network {
+        return Ok(network::resolve_network(name)?.network_passphrase);
     }
+    let profile_override = config::get_active_profile_override();
+    if profile_override.is_some() {
+        let cfg = config::load_config()?;
+        let (_, p) = cfg.resolve(profile_override.as_deref())?;
+        if !p.network_passphrase.is_empty() {
+            return Ok(p.network_passphrase);
+        }
+    } else if let Ok(Some(cfg)) = config::load_existing_config() {
+        if let Ok((_, p)) = cfg.resolve(None) {
+            if !p.network_passphrase.is_empty() {
+                return Ok(p.network_passphrase);
+            }
+        }
+    }
+    Err("missing --network-passphrase: pass it directly, set \
+         SOROBAN_NETWORK_PASSPHRASE, or pass --network"
+        .to_string())
 }
 
 /// Resolves a subcommand's own `--secret-key` (already merged with
@@ -573,12 +600,25 @@ struct Cli {
     )]
     no_cache: bool,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Named environment configuration profile (stored in ~/.sas/config.toml). \
+                Overrides the default active profile for this invocation (issue #474)."
+    )]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Manage environment-specific configuration profiles (issue #474)
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
     /// Schema registry commands
     Schema {
         #[command(subcommand)]
@@ -625,6 +665,21 @@ enum Commands {
         #[arg(long, help = "Write the man page to this file instead of stdout")]
         path: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// List all configured environment profiles
+    List,
+    /// Set the default active profile
+    Use {
+        /// Profile name (e.g. testnet, mainnet, local)
+        profile: String,
+    },
+    /// Print the path to the configuration file
+    Path,
+    /// Show the active profile and its resolved settings
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -1513,6 +1568,9 @@ enum DelegateCommands {
 fn main() {
     let cli = Cli::parse();
     let output = cli.output;
+    if let Some(ref profile) = cli.profile {
+        config::set_active_profile_override(profile);
+    }
     // Taken before matching on `cli.command`, which moves it.
     let network = cli.network;
     let identity = cli.identity;
@@ -1543,6 +1601,7 @@ fn main() {
         })
     };
     let result = match cli.command {
+        Some(Commands::Config { action }) => run_config(action, output),
         Some(Commands::Offchain { action }) => {
             run_offchain(action, output, network, identity, hardware)
         }
@@ -1611,6 +1670,96 @@ fn main() {
     if let Err(err) = result {
         emit_error(output, &err);
         std::process::exit(1);
+    }
+}
+
+fn run_config(action: ConfigCommands, output: OutputFormat) -> Result<(), String> {
+    match action {
+        ConfigCommands::List => {
+            let cfg = config::load_config()?;
+            emit_ok(
+                output,
+                || {
+                    println!("Configured environments:");
+                    for (name, profile) in &cfg.profiles {
+                        let marker = if *name == cfg.active_profile {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        println!("{marker} {name}");
+                        println!("    rpc_url           : {}", profile.rpc_url);
+                        println!("    network_passphrase: {}", profile.network_passphrase);
+                        println!("    contract_id       : {}", profile.contract_id);
+                        if let Some(sec) = &profile.secondary_contract_id {
+                            println!("    secondary_contract_id: {sec}");
+                        }
+                    }
+                },
+                serde_json::json!({
+                    "active_profile": cfg.active_profile,
+                    "profiles": cfg.profiles,
+                }),
+            )
+        }
+        ConfigCommands::Use { profile } => {
+            let mut cfg = config::load_config()?;
+            if !cfg.profiles.contains_key(&profile) {
+                let mut available: Vec<_> = cfg.profiles.keys().cloned().collect();
+                available.sort();
+                return Err(format!(
+                    "unknown profile '{profile}'; available profiles: {}",
+                    available.join(", ")
+                ));
+            }
+            cfg.active_profile = profile.clone();
+            config::save_config(&cfg)?;
+            emit_ok(
+                output,
+                || {
+                    println!("Active profile set to '{profile}'.");
+                },
+                serde_json::json!({
+                    "active_profile": profile,
+                }),
+            )
+        }
+        ConfigCommands::Path => {
+            let path = config::config_path()?;
+            emit_ok(
+                output,
+                || {
+                    println!("{}", path.display());
+                },
+                serde_json::json!({
+                    "path": path,
+                }),
+            )
+        }
+        ConfigCommands::Show => {
+            let cfg = config::load_config()?;
+            let override_name = config::get_active_profile_override();
+            let (name, profile) = cfg.resolve(override_name.as_deref())?;
+            emit_ok(
+                output,
+                || {
+                    println!("Active profile    : {name}");
+                    println!("rpc_url           : {}", profile.rpc_url);
+                    println!("network_passphrase: {}", profile.network_passphrase);
+                    println!("contract_id       : {}", profile.contract_id);
+                    if let Some(sec) = &profile.secondary_contract_id {
+                        println!("secondary_contract_id: {sec}");
+                    }
+                },
+                serde_json::json!({
+                    "profile": name,
+                    "rpc_url": profile.rpc_url,
+                    "network_passphrase": profile.network_passphrase,
+                    "contract_id": profile.contract_id,
+                    "secondary_contract_id": profile.secondary_contract_id,
+                }),
+            )
+        }
     }
 }
 
