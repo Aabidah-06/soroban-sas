@@ -8,6 +8,8 @@ members = [
     "packages/soroban-sas-cli",
     "contracts/permissive-resolver",
     "contracts/token-gated-resolver",
+    "contracts/multisig-resolver",
+    "contracts/endorsement-resolver",
     "tools/prometheus-exporter",
     "contracts/cross-chain-verifier",
     "contracts/zk-verifier",
