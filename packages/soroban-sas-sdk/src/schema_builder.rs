@@ -10,6 +10,7 @@ pub struct SchemaBuilder {
     schema: std::string::String,
     resolver: Option<std::string::String>,
     revocable: bool,
+    max_ttl: u64,
 }
 
 impl SchemaBuilder {
@@ -23,6 +24,12 @@ impl SchemaBuilder {
         self
     }
 
+    /// Sets the schema definition from a typed schema struct generated via
+    /// `schema_to_struct!`.
+    pub fn with_schema_type<T: crate::schema_macro::SchemaType>(self) -> Self {
+        self.with_schema(T::schema())
+    }
+
     /// Sets the resolver contract address.
     pub fn with_resolver(mut self, addr: &str) -> Self {
         self.resolver = Some(addr.to_string());
@@ -33,6 +40,18 @@ impl SchemaBuilder {
     pub fn with_revocable(mut self, flag: bool) -> Self {
         self.revocable = flag;
         self
+    }
+
+    /// Sets an optional maximum expiration window limit (in seconds) for this schema (#441).
+    /// `0` (the default) allows any valid expiration time or perpetual attestations.
+    pub fn with_max_ttl(mut self, ttl: u64) -> Self {
+        self.max_ttl = ttl;
+        self
+    }
+
+    /// Returns the configured max_ttl.
+    pub fn max_ttl(&self) -> u64 {
+        self.max_ttl
     }
 
     /// Builds a `SchemaRecord`, deriving its UID from the schema definition.
@@ -65,6 +84,7 @@ impl SchemaBuilder {
             resolver,
             revocable: self.revocable,
             schema,
+            deprecated: false,
         })
     }
 }

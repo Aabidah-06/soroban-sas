@@ -19,6 +19,7 @@
 //! one contract tooling is meant to use off-chain.
 
 use crate::errors::SdkError;
+use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
     DecoratedSignature, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits, Memo,
     MuxedAccount, Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScSymbol, ScVal,
@@ -26,7 +27,9 @@ use soroban_sdk::xdr::{
     TransactionExt, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
     TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
-use soroban_sdk::{Bytes, Env, TryFromVal, TryIntoVal, Val};
+use soroban_sdk::Env;
+#[cfg(not(target_arch = "wasm32"))]
+use soroban_sdk::{TryFromVal, TryIntoVal, Val};
 
 /// Placeholder source account used for read-only `simulateTransaction`
 /// calls, which never touch ledger state or require a real signer — RPC
@@ -49,6 +52,7 @@ pub fn build_invoke_transaction(
     contract_id: &str,
     function_name: &str,
     args: Vec<ScVal>,
+    auth: soroban_sdk::xdr::VecM<soroban_sdk::xdr::SorobanAuthorizationEntry>,
 ) -> Result<Transaction, SdkError> {
     let contract = stellar_strkey::Contract::from_string(contract_id).map_err(|e| {
         SdkError::DecodingError(format!("invalid contract id {contract_id}: {e:?}"))
@@ -72,7 +76,7 @@ pub fn build_invoke_transaction(
         source_account: None,
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
             host_function,
-            auth: VecM::default(),
+            auth,
         }),
     };
 
@@ -113,11 +117,15 @@ pub fn build_simulate_transaction_xdr(
         contract_id,
         function_name,
         args,
+        soroban_sdk::xdr::VecM::default(),
     )?;
     unsigned_envelope_xdr(tx)
 }
 
-pub(crate) fn unsigned_envelope_xdr(tx: Transaction) -> Result<String, SdkError> {
+/// Converts an unsigned `Transaction` into a base64-encoded `TransactionEnvelope`.
+///
+/// Exposed for advanced users who need to build custom transaction workflows.
+pub fn unsigned_envelope_xdr(tx: Transaction) -> Result<String, SdkError> {
     let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
         tx,
         signatures: VecM::default(),
@@ -131,7 +139,9 @@ pub(crate) fn unsigned_envelope_xdr(tx: Transaction) -> Result<String, SdkError>
 /// ensuring operation count, type, and invoke arguments are unchanged. Returns
 /// `Err` if the simulation response was malformed or contained substitutions
 /// that would cross a trust boundary before signing.
-pub(crate) fn validate_simulated_transaction(
+///
+/// Exposed for advanced users who need custom validation workflows.
+pub fn validate_simulated_transaction(
     tx: &Transaction,
     contract_id: &str,
     function_name: &str,
@@ -204,8 +214,30 @@ pub(crate) fn validate_simulated_transaction(
 /// submitting and authorizing its own call. A relayer submitting on behalf
 /// of a different `require_auth` address would need an explicit, separately
 /// signed `SorobanAuthorizationEntry`, which this does not build.
+///
+/// `env` is accepted for API compatibility only: hashing is done with a
+/// pure-Rust SHA-256 so the same code path also runs off the host
+/// (see [`sign_transaction_with_network_id`]).
 pub fn sign_transaction(
     env: &Env,
+    network_id: &[u8; 32],
+    tx: Transaction,
+    secret_seed: &[u8; 32],
+) -> Result<String, SdkError> {
+    let _ = env;
+    sign_transaction_with_network_id(network_id, tx, secret_seed)
+}
+
+/// `SHA-256(network_passphrase)` — the network ID every Stellar transaction
+/// signature commits to.
+pub fn network_id(network_passphrase: &str) -> [u8; 32] {
+    Sha256::digest(network_passphrase.as_bytes()).into()
+}
+
+/// [`sign_transaction`] without a host [`Env`]. Because `Env` is `!Send`,
+/// this is the variant the SDK's `*_async` methods use on their I/O worker
+/// thread; the produced envelope is byte-for-byte identical.
+pub fn sign_transaction_with_network_id(
     network_id: &[u8; 32],
     tx: Transaction,
     secret_seed: &[u8; 32],
@@ -232,10 +264,7 @@ pub fn sign_transaction(
     let payload_bytes = payload.to_xdr(Limits::none()).map_err(|e| {
         SdkError::DecodingError(format!("failed to encode signature payload: {e:?}"))
     })?;
-    let hash: [u8; 32] = env
-        .crypto()
-        .sha256(&Bytes::from_slice(env, &payload_bytes))
-        .to_array();
+    let hash: [u8; 32] = Sha256::digest(&payload_bytes).into();
 
     let signature_bytes = crate::signature::generate_delegated_signature(secret_seed, &hash);
     let hint = SignatureHint([
@@ -267,6 +296,11 @@ pub fn sign_transaction(
 
 /// Converts a Rust value into an `ScVal` contract-call argument, via the
 /// host `Val` bridge (see module docs for why not the direct `ScVal` impl).
+///
+/// Host-only: the `Val` bridge is provided by the native Soroban
+/// environment, which does not exist on `wasm32` targets (#553). Edge
+/// runtimes build contract-call arguments directly as `ScVal` values.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn encode_arg<T>(env: &Env, value: &T) -> Result<ScVal, SdkError>
 where
     T: TryIntoVal<Env, Val>,
@@ -285,16 +319,36 @@ where
 /// direct `T: TryFromVal<Env, ScVal>` bound, since `soroban-sdk` only
 /// generates that direct impl for `#[contracttype]` types behind the
 /// `test`/`testutils` cfg (see module docs).
+///
+/// Host-only: the `Val` bridge is provided by the native Soroban
+/// environment, which does not exist on `wasm32` targets (#553). Edge
+/// runtimes use [`decode_scval`] to decode the raw `ScVal` instead.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn decode_result<T>(env: &Env, result_xdr_base64: &str) -> Result<T, SdkError>
 where
     T: TryFromVal<Env, Val>,
 {
-    let sc_val = ScVal::from_xdr_base64(result_xdr_base64, Limits::none())
-        .map_err(|e| SdkError::DecodingError(format!("failed to decode result xdr: {e:?}")))?;
+    // RPC-supplied payload: bound recursion depth and size (issue #136).
+    let sc_val = decode_scval(result_xdr_base64)?;
     let val: Val = Val::try_from_val(env, &sc_val)
         .map_err(|_| SdkError::DecodingError("failed to convert ScVal to host Val".to_string()))?;
     T::try_from_val(env, &val)
         .map_err(|_| SdkError::DecodingError("failed to convert Val to target type".to_string()))
+}
+
+/// Decodes the base64 `ScVal` XDR returned in a successful simulation's
+/// `results[0].xdr` field into an `ScVal`.
+///
+/// This is the portable counterpart of [`decode_result`]: it only needs the
+/// XDR codec, so it works on every target, including `wasm32` edge runtimes
+/// where the host `Val` bridge does not exist (#553).
+pub fn decode_scval(result_xdr_base64: &str) -> Result<ScVal, SdkError> {
+    // RPC-supplied payload: bound recursion depth and size (issue #136).
+    ScVal::from_xdr_base64(
+        result_xdr_base64,
+        crate::limits::default_rpc_response_limits(),
+    )
+    .map_err(|e| SdkError::DecodingError(format!("failed to decode result xdr: {e:?}")))
 }
 
 #[cfg(test)]
@@ -302,7 +356,21 @@ mod tests {
     use super::*;
     use soroban_sas_common::UID;
     use soroban_sdk::xdr::Limits as XdrLimits;
+    use soroban_sdk::Bytes;
     use soroban_sdk::BytesN;
+
+    #[test]
+    fn network_id_matches_host_sha256() {
+        // The Env-free hash must agree with the host's, or signatures
+        // produced by the async path would be rejected by the network.
+        let env = Env::default();
+        let passphrase = "Test SDF Network ; September 2015";
+        let host: [u8; 32] = env
+            .crypto()
+            .sha256(&Bytes::from_slice(&env, passphrase.as_bytes()))
+            .to_array();
+        assert_eq!(network_id(passphrase), host);
+    }
 
     #[test]
     fn builds_a_well_formed_invoke_transaction() {
@@ -351,6 +419,7 @@ mod tests {
             &contract,
             "attest",
             vec![],
+            soroban_sdk::xdr::VecM::default(),
         )
         .unwrap();
 
@@ -403,6 +472,7 @@ mod tests {
             &contract,
             "attest",
             vec![],
+            soroban_sdk::xdr::VecM::default(),
         )
         .unwrap();
 
@@ -474,6 +544,7 @@ mod tests {
             &contract1,
             "test_func",
             vec![ScVal::Void],
+            soroban_sdk::xdr::VecM::default(),
         )
         .unwrap();
 
@@ -494,6 +565,7 @@ mod tests {
             &contract,
             "func_a",
             vec![ScVal::Void],
+            soroban_sdk::xdr::VecM::default(),
         )
         .unwrap();
 
@@ -514,6 +586,7 @@ mod tests {
             &contract,
             "test_func",
             vec![ScVal::Void, ScVal::Bool(true)],
+            soroban_sdk::xdr::VecM::default(),
         )
         .unwrap();
 
@@ -534,6 +607,7 @@ mod tests {
             &contract,
             "test_func",
             vec![ScVal::Bool(true)],
+            soroban_sdk::xdr::VecM::default(),
         )
         .unwrap();
 
@@ -556,6 +630,7 @@ mod tests {
             &contract,
             "test_func",
             args.clone(),
+            soroban_sdk::xdr::VecM::default(),
         )
         .unwrap();
 
@@ -605,5 +680,184 @@ mod tests {
 
         let result = validate_simulated_transaction(&tx, &contract, "test_func", &[ScVal::Void]);
         assert!(matches!(result, Err(SdkError::ValidationError(_))));
+    }
+
+    // ─── Issue #97: Comprehensive envelope verification tests ───────────────
+
+    #[test]
+    fn signed_envelope_fails_verification_with_wrong_network_id() {
+        use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
+
+        let env = Env::default();
+        let seed = [5u8; 32];
+        let correct_network_id = [6u8; 32];
+        let wrong_network_id = [7u8; 32];
+        let contract = stellar_strkey::Contract([0u8; 32]).to_string();
+
+        let public_key = crate::signature::derive_public_key(&seed);
+        let tx = build_invoke_transaction(
+            &public_key,
+            42,
+            100,
+            TransactionExt::V0,
+            &contract,
+            "attest",
+            vec![],
+            soroban_sdk::xdr::VecM::default(),
+        )
+        .unwrap();
+
+        // Sign with correct network ID
+        let signed_xdr = sign_transaction(&env, &correct_network_id, tx.clone(), &seed).unwrap();
+        let envelope = TransactionEnvelope::from_xdr_base64(signed_xdr, XdrLimits::none()).unwrap();
+        let TransactionEnvelope::Tx(v1) = envelope else {
+            panic!("expected a V1 transaction envelope");
+        };
+        assert_eq!(v1.signatures.len(), 1);
+
+        let sig = &v1.signatures[0];
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = DalekSignature::from_slice(sig.signature.0.as_slice()).unwrap();
+
+        // Verify signature fails when computed over wrong network ID
+        let wrong_payload = TransactionSignaturePayload {
+            network_id: Hash(wrong_network_id),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx.clone()),
+        };
+        let wrong_payload_bytes = wrong_payload.to_xdr(Limits::none()).unwrap();
+        let wrong_hash: [u8; 32] = env
+            .crypto()
+            .sha256(&Bytes::from_slice(&env, &wrong_payload_bytes))
+            .to_array();
+
+        assert!(verifying_key.verify(&wrong_hash, &signature).is_err());
+
+        // Verify signature succeeds when computed over correct network ID
+        let correct_payload = TransactionSignaturePayload {
+            network_id: Hash(correct_network_id),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx),
+        };
+        let correct_payload_bytes = correct_payload.to_xdr(Limits::none()).unwrap();
+        let correct_hash: [u8; 32] = env
+            .crypto()
+            .sha256(&Bytes::from_slice(&env, &correct_payload_bytes))
+            .to_array();
+
+        assert!(verifying_key.verify(&correct_hash, &signature).is_ok());
+    }
+
+    #[test]
+    fn signed_envelope_fails_verification_when_transaction_is_tampered() {
+        use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
+
+        let env = Env::default();
+        let seed = [8u8; 32];
+        let network_id = [9u8; 32];
+        let contract = stellar_strkey::Contract([0u8; 32]).to_string();
+
+        let public_key = crate::signature::derive_public_key(&seed);
+        let tx = build_invoke_transaction(
+            &public_key,
+            43,
+            100,
+            TransactionExt::V0,
+            &contract,
+            "attest",
+            vec![],
+            soroban_sdk::xdr::VecM::default(),
+        )
+        .unwrap();
+
+        let signed_xdr = sign_transaction(&env, &network_id, tx.clone(), &seed).unwrap();
+        let envelope = TransactionEnvelope::from_xdr_base64(signed_xdr, XdrLimits::none()).unwrap();
+        let TransactionEnvelope::Tx(v1) = envelope else {
+            panic!("expected a V1 transaction envelope");
+        };
+        assert_eq!(v1.signatures.len(), 1);
+
+        let sig = &v1.signatures[0];
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = DalekSignature::from_slice(sig.signature.0.as_slice()).unwrap();
+
+        // Tamper with the transaction: change the fee
+        let mut tampered_tx = tx.clone();
+        tampered_tx.fee = 200;
+
+        let tampered_payload = TransactionSignaturePayload {
+            network_id: Hash(network_id),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tampered_tx),
+        };
+        let tampered_payload_bytes = tampered_payload.to_xdr(Limits::none()).unwrap();
+        let tampered_hash: [u8; 32] = env
+            .crypto()
+            .sha256(&Bytes::from_slice(&env, &tampered_payload_bytes))
+            .to_array();
+
+        // Signature must fail verification over tampered transaction
+        assert!(verifying_key.verify(&tampered_hash, &signature).is_err());
+
+        // Signature succeeds over original transaction
+        let original_payload = TransactionSignaturePayload {
+            network_id: Hash(network_id),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx),
+        };
+        let original_payload_bytes = original_payload.to_xdr(Limits::none()).unwrap();
+        let original_hash: [u8; 32] = env
+            .crypto()
+            .sha256(&Bytes::from_slice(&env, &original_payload_bytes))
+            .to_array();
+
+        assert!(verifying_key.verify(&original_hash, &signature).is_ok());
+    }
+
+    #[test]
+    fn signed_envelope_retains_all_transaction_fields_unchanged() {
+        let env = Env::default();
+        let seed = [10u8; 32];
+        let network_id = [11u8; 32];
+        let contract = stellar_strkey::Contract([2u8; 32]).to_string();
+
+        let public_key = crate::signature::derive_public_key(&seed);
+        let original_tx = build_invoke_transaction(
+            &public_key,
+            999,
+            250,
+            TransactionExt::V0,
+            &contract,
+            "register_schema",
+            vec![ScVal::Bool(true), ScVal::U32(42)],
+            soroban_sdk::xdr::VecM::default(),
+        )
+        .unwrap();
+
+        let signed_xdr = sign_transaction(&env, &network_id, original_tx.clone(), &seed).unwrap();
+        let envelope = TransactionEnvelope::from_xdr_base64(signed_xdr, XdrLimits::none()).unwrap();
+        let TransactionEnvelope::Tx(v1) = envelope else {
+            panic!("expected a V1 transaction envelope");
+        };
+
+        // All fields except signatures must be byte-for-byte identical
+        assert_eq!(v1.tx.source_account, original_tx.source_account);
+        assert_eq!(v1.tx.fee, original_tx.fee);
+        assert_eq!(v1.tx.seq_num, original_tx.seq_num);
+        assert_eq!(v1.tx.cond, original_tx.cond);
+        assert_eq!(v1.tx.memo, original_tx.memo);
+        assert_eq!(v1.tx.operations.len(), original_tx.operations.len());
+        assert_eq!(v1.tx.operations[0], original_tx.operations[0]);
+        assert_eq!(v1.tx.ext, original_tx.ext);
+
+        // Signatures vector must contain exactly one signature
+        assert_eq!(v1.signatures.len(), 1);
+
+        // Signature hint must be the last 4 bytes of the public key
+        assert_eq!(
+            v1.signatures[0].hint.0,
+            [
+                public_key[28],
+                public_key[29],
+                public_key[30],
+                public_key[31]
+            ]
+        );
     }
 }

@@ -1,7 +1,9 @@
 #![allow(unexpected_cfgs)]
 #![no_std]
+pub mod eip712;
 pub mod errors;
 pub mod events;
+pub mod frost;
 pub mod macros;
 pub mod merkle;
 pub mod signature;
@@ -10,44 +12,143 @@ pub mod validation;
 
 pub use errors::*;
 pub use events::*;
+pub use frost::*;
 pub use merkle::*;
 pub use signature::*;
 pub use typed_data::*;
 pub use validation::*;
 
-use soroban_sdk::{contracttype, Address, Bytes, String};
+// Re-exported by name rather than with a glob: `eip712` also exports a `v1`
+// submodule, and a glob would lift `v1` (and its items) into the crate root,
+// where it can collide with names from other modules.
+pub use eip712::{
+    encode_data, encode_type, find_struct, hash_struct, hash_typed_data,
+    hash_typed_data_with_prefix, tag_matches_defs, type_hash, FieldDef, FieldType, FieldValue,
+    SchemaError, StructDef, DOMAIN_STRUCT_NAME, EIP712_PREFIX,
+};
+
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Symbol};
 
 /// Approximate number of ledgers in one year at five seconds per ledger.
 pub const LEDGERS_IN_ONE_YEAR: u32 = 6_307_200;
+
+/// TTL threshold, in ledgers, below which instance storage should be
+/// renewed. Instance storage holds a contract's core configuration (e.g.
+/// SAS's admin, schema registry, and indexer bindings): unlike persistent
+/// entries, if it is allowed to expire the entire contract becomes
+/// unusable, since even reading the configuration needed to renew it is no
+/// longer possible. Chosen well above `INSTANCE_EXTEND_TO_LEDGERS` so
+/// ordinary read/write traffic renews it long before expiry risk, without
+/// requiring a bump on every single call.
+pub const INSTANCE_TTL_THRESHOLD_LEDGERS: u32 = 500_000;
+
+/// Number of ledgers instance storage is extended to whenever it is
+/// renewed, once remaining TTL falls below
+/// `INSTANCE_TTL_THRESHOLD_LEDGERS`. Set to one year, matching the
+/// persistent-storage retention window (`LEDGERS_IN_ONE_YEAR`) used
+/// elsewhere, so configuration and the data it governs expire on
+/// comparable horizons.
+pub const INSTANCE_EXTEND_TO_LEDGERS: u32 = LEDGERS_IN_ONE_YEAR;
+
+/// Renews the calling contract's instance storage TTL using the shared
+/// `INSTANCE_TTL_THRESHOLD_LEDGERS`/`INSTANCE_EXTEND_TO_LEDGERS` policy.
+///
+/// Call this from `init` (so configuration starts with a full TTL) and
+/// from admin and commonly used public entry points (so ordinary traffic
+/// keeps the TTL renewed without any single call being responsible for
+/// it). Cheap to call on every invocation: `extend_ttl` is a no-op unless
+/// the entry's remaining TTL has actually fallen below the threshold.
+pub fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD_LEDGERS, INSTANCE_EXTEND_TO_LEDGERS);
+}
+/// Maximum byte length of `Attestation.data` accepted on-chain.
+///
+/// Large payloads increase hashing, XDR encoding, event emission, storage,
+/// and cross-contract invocation costs. A bounded ceiling keeps these within
+/// the measured Soroban budget envelope and prevents unpredictable budget
+/// exhaustion or ledger-entry size violations. The value is chosen to be
+/// well within Soroban limits while accommodating typical attestation
+/// payloads. (#157)
+pub const MAX_ATTESTATION_DATA_BYTES: u32 = 10_000;
+
+/// Maximum number of attestations accepted by the SAS batch issuance entrypoints.
+pub const MAX_MULTI_ATTEST: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UID(pub soroban_sdk::BytesN<32>);
 
-/// Tri-state on-chain schema revocation policy (#448).
+/// Derives a schema's UID the same way `SchemaRegistry::register` does:
+/// `sha256(schema || resolver || [revocable as u8])`, each field XDR-encoded.
+/// Schema identity is content-addressed on the schema string, resolver, and
+/// revocability flag together, so two registrations that differ only in
+/// resolver or revocability policy never collide (see
+/// `specs/protocol-v1.md#schema-identity`).
 ///
-/// A schema creator uses this to constrain the `revocable` flag of every
-/// attestation issued under the schema:
+/// Exposed here (rather than kept private to the contract) so off-chain
+/// callers — the SDK, the CLI, indexers — can compute a schema's UID from
+/// the same inputs they registered it with, without an extra round trip.
+pub fn schema_uid(env: &Env, schema: &String, resolver: &Address, revocable: bool) -> UID {
+    use soroban_sdk::xdr::ToXdr;
+    let mut payload = Bytes::new(env);
+    payload.append(&schema.clone().to_xdr(env));
+    payload.append(&resolver.clone().to_xdr(env));
+    payload.append(&Bytes::from_slice(env, &[revocable as u8]));
+    UID(env.crypto().sha256(&payload).into())
+}
+
+/// Derives an attestation's content-addressed UID:
+/// `sha256(xdr(schema_uid) || xdr(recipient) || xdr(attester) || xdr(data))`,
+/// each field XDR-encoded. This is the canonical way to compute the `uid` an
+/// attestation must carry on issuance — see `SAS::attest_internal`, which
+/// rejects any attestation whose `uid` field doesn't match this hash (#215).
 ///
-/// * `RevocableOnly` — every attestation MUST be revocable; issuing an
-///   irrevocable attestation fails with [`SASError::InvalidRevocability`].
-/// * `IrrevocableOnly` — every attestation MUST be irrevocable; issuing a
-///   revocable attestation fails with [`SASError::NotRevocable`]. This is the
-///   policy that the legacy boolean `revocable: false` maps to.
-/// * `Permissive` — the attester chooses either flag freely. This is the
-///   policy that the legacy boolean `revocable: true` maps to.
+/// Exposed here so off-chain callers — the SDK, the CLI — can compute the
+/// same UID they must submit, without duplicating the hashing scheme.
+pub fn attestation_uid(
+    env: &Env,
+    schema_uid: &UID,
+    recipient: &Address,
+    attester: &Address,
+    data: &Bytes,
+) -> UID {
+    use soroban_sdk::xdr::ToXdr;
+    let mut payload = Bytes::new(env);
+    payload.append(&schema_uid.clone().to_xdr(env));
+    payload.append(&recipient.clone().to_xdr(env));
+    payload.append(&attester.clone().to_xdr(env));
+    payload.append(&data.clone().to_xdr(env));
+    UID(env.crypto().sha256(&payload).into())
+}
+
+/// A delegated-verification key registered for an attester via
+/// `SAS::register_attester_key`/`rotate_attester_key`/`revoke_attester_key`.
 ///
-/// Existing boolean `revocable` schemas map cleanly via [`From<bool>`], so the
-/// policy model is backwards compatible with records registered before #448.
+/// `version` starts at `1` on first registration and increases by one on
+/// every rotation or post-revocation re-registration, so consumers can
+/// order key changes for the same attester. A `revoked` record is kept
+/// (not deleted) so a stale signature made under it fails closed rather
+/// than falling through to "no record found".
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttesterKeyRecord {
+    pub public_key: BytesN<32>,
+    pub version: u32,
+    pub revoked: bool,
+}
+
+/// On-chain schema revocation policy enforcement (#448).
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum RevocationPolicy {
-    /// All attestations under this schema must be revocable.
+    /// Schema creator mandates that all attestations issued under this schema must be revocable.
     RevocableOnly = 1,
-    /// All attestations under this schema must be irrevocable.
+    /// Schema creator mandates that all attestations issued under this schema must be irrevocable.
     IrrevocableOnly = 2,
-    /// The attester may choose whether each attestation is revocable.
+    /// Attester may choose whether each attestation is revocable or irrevocable.
     Permissive = 3,
 }
 
@@ -61,13 +162,29 @@ impl From<bool> for RevocationPolicy {
     }
 }
 
+/// Lifecycle of a schema record (#539).
+///
+/// `Quarantined` pauses new attestations while leaving historical ones
+/// readable. Stored beside the record so existing `SchemaRecord` bytes stay
+/// compatible.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SchemaStatus {
+    Active = 0,
+    Deprecated = 1,
+    Quarantined = 2,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)] // Optimize storage serialization (#284)
 pub struct SchemaRecord {
     pub uid: UID,
     pub resolver: Address,
     pub revocable: bool,
     pub schema: String,
+    pub deprecated: bool,
 }
 
 #[contracttype]
@@ -84,6 +201,230 @@ pub struct Attestation {
     pub attester: Address,
     pub revocable: bool,
     pub data: Bytes,
+    pub valid_from: u64,
+}
+
+/// Compact internal storage representation for Attestation records (#438).
+///
+/// Bit-packs boolean flags (`revocable`, `revoked`, `deprecated`) and 64-bit
+/// timestamps (`time`, `expiration_time`, `revocation_time`) into a contiguous
+/// 25-byte binary layout (`packed_meta`), and avoids redundant on-chain storage
+/// of `uid` (which already serves as the storage key).
+///
+/// Reduces contract state size by >18% per attestation, lowering rent costs
+/// and speeding up host serialization/deserialization.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct CompactAttestation {
+    pub schema_uid: UID,
+    pub ref_uid: UID,
+    pub recipient: Address,
+    pub attester: Address,
+    pub packed_meta: BytesN<25>,
+    pub data: Bytes,
+}
+
+impl CompactAttestation {
+    pub const FLAG_REVOCABLE: u8 = 1 << 0;
+    pub const FLAG_REVOKED: u8 = 1 << 1;
+    pub const FLAG_DEPRECATED: u8 = 1 << 2;
+
+    pub fn pack_meta(
+        time: u64,
+        expiration_time: u64,
+        revocation_time: u64,
+        revocable: bool,
+        deprecated: bool,
+    ) -> [u8; 25] {
+        let mut buf = [0u8; 25];
+        let mut flags = 0u8;
+        if revocable {
+            flags |= Self::FLAG_REVOCABLE;
+        }
+        if revocation_time > 0 {
+            flags |= Self::FLAG_REVOKED;
+        }
+        if deprecated {
+            flags |= Self::FLAG_DEPRECATED;
+        }
+        buf[0] = flags;
+        buf[1..9].copy_from_slice(&time.to_be_bytes());
+        buf[9..17].copy_from_slice(&expiration_time.to_be_bytes());
+        buf[17..25].copy_from_slice(&revocation_time.to_be_bytes());
+        buf
+    }
+
+    pub fn unpack_meta(&self) -> (u64, u64, u64, bool, bool, bool) {
+        let mut buf = [0u8; 25];
+        self.packed_meta.copy_into_slice(&mut buf);
+        let flags = buf[0];
+        let revocable = (flags & Self::FLAG_REVOCABLE) != 0;
+        let revoked = (flags & Self::FLAG_REVOKED) != 0;
+        let deprecated = (flags & Self::FLAG_DEPRECATED) != 0;
+
+        let mut time_bytes = [0u8; 8];
+        time_bytes.copy_from_slice(&buf[1..9]);
+        let time = u64::from_be_bytes(time_bytes);
+
+        let mut exp_bytes = [0u8; 8];
+        exp_bytes.copy_from_slice(&buf[9..17]);
+        let expiration_time = u64::from_be_bytes(exp_bytes);
+
+        let mut rev_bytes = [0u8; 8];
+        rev_bytes.copy_from_slice(&buf[17..25]);
+        let revocation_time = u64::from_be_bytes(rev_bytes);
+
+        (
+            time,
+            expiration_time,
+            revocation_time,
+            revocable,
+            revoked,
+            deprecated,
+        )
+    }
+
+    pub fn from_attestation(env: &Env, attestation: &Attestation) -> Self {
+        let meta = Self::pack_meta(
+            attestation.time,
+            attestation.expiration_time,
+            attestation.revocation_time,
+            attestation.revocable,
+            false,
+        );
+        Self {
+            schema_uid: attestation.schema_uid.clone(),
+            ref_uid: attestation.ref_uid.clone(),
+            recipient: attestation.recipient.clone(),
+            attester: attestation.attester.clone(),
+            packed_meta: BytesN::from_array(env, &meta),
+            data: attestation.data.clone(),
+        }
+    }
+
+    pub fn to_attestation(&self, _env: &Env, uid: &UID) -> Attestation {
+        let (time, expiration_time, revocation_time, revocable, _revoked, _deprecated) =
+            self.unpack_meta();
+        Attestation {
+            uid: uid.clone(),
+            schema_uid: self.schema_uid.clone(),
+            time,
+            expiration_time,
+            revocation_time,
+            ref_uid: self.ref_uid.clone(),
+            recipient: self.recipient.clone(),
+            attester: self.attester.clone(),
+            revocable,
+            data: self.data.clone(),
+            valid_from: 0,
+        }
+    }
+
+    pub fn time(&self) -> u64 {
+        self.unpack_meta().0
+    }
+
+    pub fn expiration_time(&self) -> u64 {
+        self.unpack_meta().1
+    }
+
+    pub fn revocation_time(&self) -> u64 {
+        self.unpack_meta().2
+    }
+
+    pub fn is_revocable(&self) -> bool {
+        self.unpack_meta().3
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.unpack_meta().4
+    }
+
+    pub fn is_deprecated(&self) -> bool {
+        self.unpack_meta().5
+    }
+
+    pub fn set_revocation_time(&mut self, env: &Env, new_revocation_time: u64) {
+        let (time, expiration_time, _, revocable, _, deprecated) = self.unpack_meta();
+        let meta = Self::pack_meta(
+            time,
+            expiration_time,
+            new_revocation_time,
+            revocable,
+            deprecated,
+        );
+        self.packed_meta = BytesN::from_array(env, &meta);
+    }
+
+    pub fn set_time(&mut self, env: &Env, new_time: u64) {
+        let (_, expiration_time, revocation_time, revocable, _, deprecated) = self.unpack_meta();
+        let meta = Self::pack_meta(
+            new_time,
+            expiration_time,
+            revocation_time,
+            revocable,
+            deprecated,
+        );
+        self.packed_meta = BytesN::from_array(env, &meta);
+    }
+
+    pub fn set_deprecated(&mut self, env: &Env, new_deprecated: bool) {
+        let (time, expiration_time, revocation_time, revocable, _, _) = self.unpack_meta();
+        let meta = Self::pack_meta(
+            time,
+            expiration_time,
+            revocation_time,
+            revocable,
+            new_deprecated,
+        );
+        self.packed_meta = BytesN::from_array(env, &meta);
+    }
+}
+
+/// Versioned storage key wrapper for CompactAttestation (#438).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactAttestationKey {
+    pub uid: UID,
+}
+
+/// Expiration status bucket for indexing attestations by their expiration
+/// time. Perpetual attestations (expiration_time == 0) are indexed separately
+/// from time-bound attestations to enable efficient queries for time-sensitive
+/// use cases.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpirationStatus {
+    Perpetual,
+    Expiring,
+}
+
+/// Typed storage key for tracking per-attester delegation nonces (#237).
+///
+/// Serializes as ScVec rather than ScMap (which a raw `(DELEGATION_NONCE, attester)`
+/// tuple serializes to), reducing instance storage overhead and read costs.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationNonceKey {
+    pub attester: Address,
+}
+
+/// Separate recipient consent nonce space, so a recipient who is also an
+/// attester can sign both roles without their nonce watermarks colliding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientConsentNonceKey {
+    /// Distinguishes this key's ScVec encoding from `DelegationNonceKey`.
+    pub scope: Symbol,
+    pub recipient: Address,
+}
+
+/// Typed storage key wrapper for attester key records (#237).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttesterKeyStorageKey {
+    pub attester: Address,
 }
 
 #[cfg(test)]

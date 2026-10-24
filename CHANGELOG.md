@@ -6,7 +6,224 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Contract WASM SHA-256 Checksums
+| Contract | File | SHA-256 Checksum |
+|---|---|---|
+| Schema Registry | `schema_registry.wasm` | `TBD` |
+| Core SAS | `sas.wasm` | `TBD` |
+| Indexer | `soroban_sas_indexer.wasm` | `TBD` |
+
 ### Added
+- FROST threshold endorsement for delegated attestations (#534). A schema may
+  declare a required Ed25519 FROST group with
+  `SchemaRegistry::set_schema_frost_group` (`get_schema_frost_group` /
+  `clear_schema_frost_group` round out the API), authenticated to the schema
+  owner or registry admin and emitted as `SchemaFrostGroupUpdated`. When a
+  group is declared, `attest_by_delegation`, `multi_attest_by_delegation`,
+  `revoke_by_delegation`, `multi_revoke_by_delegation`, and
+  `verify_offchain_attestation` accept only the group public key and verify the
+  single 64-byte aggregate with one ordinary Ed25519 verification. The calldata
+  footprint and verification cost are therefore identical to single-signature
+  delegated attestations, while aggregates made with fewer than `threshold`
+  shares fail validation. Golden vectors for 2-of-3 and 3-of-5 groups live in
+  `packages/soroban-sas-common/test_vectors/frost_threshold.tsv` and are
+  exercised end-to-end against the real contracts.
+- `contracts/time-window-resolver`, a schema resolver that enforces a
+  configurable `cooldown_period_seconds` between attestations issued to the
+  same recipient. It records `last_attested_time` per recipient in persistent
+  storage, rejects issuance while `last + cooldown` is still in the future
+  with the new `SASError::CooldownActive` (code `421`), and lets the resolver
+  admin change the window with authorization (`COOLDOWN_UPDATED` event).
+  Different recipients have independent windows; exactly-at-boundary issuance
+  succeeds and refreshes the timestamp. See
+  [`docs/time-window-resolver.md`](docs/time-window-resolver.md). (#549)
+- Newest-first convenience reads for every lookup dimension:
+  `get_atts_by_recipient_recent`, `get_atts_by_schema_recent`, and
+  `get_atts_by_attester_recent` return the newest `limit` UIDs (newest
+  first) without a cursor, deriving the start position from the tail
+  counter and reading backward across chunk boundaries. The
+  `get_recipient_recent_filtered` / `get_schema_recent_filtered` /
+  `get_attester_recent_filtered` variants add `include_revoked` so the
+  active-only view keeps descending order while skipping revoked/replaced
+  UIDs. (#450)
+- `Indexer::is_attestation_indexed(uid)`: a fast existence check that reads
+  the UID's `(INDEXED_KEY, uid)` idempotency record directly instead of
+  walking recipient, schema, or attester chunks. It renews the instance TTL
+  (and the record's TTL when present), writes nothing, creates no storage for
+  unknown UIDs, and does not count toward the per-ledger query limit. A unit
+  test meters it against a paginated chunk walk over the same UIDs and
+  requires at least 70% fewer CPU instructions. (#542)
+- Reverse cursor pagination for recipient, schema, and attester index lookups,
+  with stable next cursors and bounded chunk reads. (#449)
+- Version 2 Axelar GMP proof payloads with EVM schema UID, EVM recipient,
+  explicit Soroban recipient mapping, and raw attestation data. The verifier
+  retains gateway approval and revision checks and exposes `get_proof`. (#458)
+- Indexer pagination for every lookup dimension:
+  `get_atts_by_schema_paginated` and `get_atts_by_attester_paginated` join
+  `get_atts_by_recipient_paginated`, all backed by one chunk-window reader
+  with a documented contract (insertion order, exact page lengths, empty page
+  past the end). The SDK adds `IndexerClient::get_attestations_by_*_paginated`,
+  and the CLI's `query by-*` commands accept `--cursor`/`--limit`, reporting
+  `total` and `next_cursor`. Unpaginated output is unchanged. (#306)
+- SAS -> Indexer integration tests that deploy the real schema-registry, SAS,
+  and Indexer contracts together and cross-check indexed data against SAS
+  state and events. They cover ordering, authorization, rejected issuance,
+  revocation, replacement, fail-open/fail-closed outages, reindexing, rebinding,
+  and pagination. (#309)
+- CLI end-to-end tests that run the compiled binary against a local JSON-RPC
+  host executing the real contracts. They cover indexed queries, pagination,
+  on-chain verification, and missing-recipient handling. (#332)
+- Batched off-chain delegation signatures: `SAS::multi_attest_by_delegation`
+  and `SAS::multi_revoke_by_delegation` accept parallel `attestations`/`uids`,
+  `nonces`, `signatures`, and `public_keys` vectors and validate each item
+  independently, so one relayed transaction can carry signatures from several
+  attesters. Length mismatches fail with `InvalidValue`, oversized batches
+  with `BatchTooLarge`, and a failure on any item reverts the whole batch
+  (no partial issuance and no consumed nonce). The SAS contract reuses the
+  same per-attester nonce high-watermark as the single-item paths. (#293)
+- `soroban-sas-sdk` gains `delegation`, with `sign_offchain_attestation`,
+  `sign_delegated_revocation`, `delegation_domain`,
+  `attestation_digest`/`revocation_digest`, and local
+  `verify_offchain_attestation`/`verify_delegated_revocation` helpers. These
+  let wallets and dApps produce (and self-check) the typed-data signature the
+  delegated entry points verify, instead of relying on the CLI's private
+  signing code. The SDK client also exposes
+  `multi_attest_by_delegation`/`multi_revoke_by_delegation` submission
+  wrappers. (#293)
+- `docs/local-development.md`: end-to-end local environment guide covering
+  toolchain bootstrap, build/test, git hooks, the Docker Quickstart node,
+  local deployment, integration tests, JS packages and troubleshooting.
+  `scripts/deploy.sh` gains `--network local` (alias `standalone`) targeting
+  the docker-compose node, with local Friendbot funding, and the Makefile
+  gains `fmt`, `lint`, `install-hooks`, `localnet`, `localnet-down` and
+  `deploy-local` targets. (#349)
+- `docs/getting-started.md`: guide for DApp developers covering schema
+  design, resolvers, registration, issuance rules and their error codes,
+  off-chain and on-chain (cross-contract) verification, indexer queries,
+  revocation, and a security checklist. (#366)
+- Opt-in git hooks in `.githooks/`: `pre-commit` runs
+  `cargo fmt --all -- --check` on staged Rust changes and `bash -n` on
+  staged scripts; `pre-push` runs CI's fmt and
+  `clippy --workspace --all-targets -- -D warnings` gates. Install with
+  `./scripts/install_hooks.sh`; covered by `scripts/test_git_hooks.sh` in the
+  new *Developer Tooling* workflow. `.gitattributes` pins LF endings for
+  shell scripts, hooks and Rust sources. (#355)
+- `tools/schema-explorer`: prototype read-only web dashboard that pages
+  through a Schema Registry, looks schemas up by UID, shows parsed fields,
+  owner and flags, and validates draft schema strings. Its TypeScript
+  validator and `validate_schema_syntax` both replay the shared golden
+  vectors in `packages/soroban-sas-common/test_vectors/schema_syntax.tsv`.
+  Built and tested in the *Developer Tooling* workflow. (#346)
+- Nullifier set management in the ZK verifier contract. Checking and
+  recording a nullifier is now a single atomic step: a nullifier is spent
+  only when the whole proof verification succeeds, so a rejected proof never
+  burns its nullifier, and a nullifier that was already spent is rejected
+  with `ZKError::NullifierSpent` (the contract error type `ZkVerifierError`
+  is aliased as `ZKError`). Nullifier records are renewed with the contract
+  instance's own TTL policy, so a spent nullifier never expires before the
+  instance that guards it. The new `are_nullifiers_used` query lets
+  off-chain clients check a whole batch of nullifiers with a single contract
+  call instead of one call per nullifier. (#547)
+- WebAssembly build of the Rust SDK for serverless edge runtimes
+  (`wasm32-unknown-unknown`). The new `wasm` feature replaces the native
+  `ureq` transport with a `web-sys` `fetch` implementation, so RPC calls are
+  awaited through the runtime's global `fetch` instead of blocking the event
+  loop; the synchronous RPC methods are wasm-only errors that point at their
+  `*_async` counterparts. Host-only APIs (`SASClient`, the `Val` bridge
+  helpers) are compiled out for wasm, and the new
+  `soroban_sas_sdk::attestation` module decodes attestations straight from
+  the XDR wire format into a JSON-serializable `AttestationRecord`, so edge
+  runtimes can read attestations without a Soroban host environment.
+  `examples/cloudflare-worker` is a deployable Worker template that answers
+  `GET /attestation/{uid}` from a Soroban RPC node, `docs/edge-runtime.md`
+  documents the feature and the deployment steps, and CI keeps the edge build
+  working through the new `wasm-sdk` job. (#553)
+- `soroban-sas schema wizard`: interactive schema registration that prompts
+  for a name, field-by-field definitions, revocability, an optional resolver
+  address, and a metadata URI, validating every answer as it is typed
+  (dialoguer prompts on a TTY; a line-based fallback reads piped stdin when
+  not). It estimates the network fee by simulating the exact call, shows a
+  summary for confirmation, and only then signs and submits the
+  registration. The name and metadata URI are off-chain labels echoed in the
+  result, since the registry identifies schemas by the
+  `(schema, resolver, revocable)` tuple alone. (#469)
+
+### Fixed
+- Missing recipients are handled gracefully. `AttestationRequestBuilder` no
+  longer traps the host (panicking the caller) on a malformed or empty
+  recipient/attester strkey. It and the CLI's on-chain issuance commands now
+  reject the zero-address "no recipient" sentinel and self-attestation
+  locally, with the contract's own `InvalidRecipient` rule
+  (`soroban_sas_common::validate_attestation_parties`, now also used by
+  `SAS::attest_internal`). (#304)
+- `SAS::bulk_reindex` passed the whole attestation as a single argument to
+  `Indexer::index_attestation`, so every replay failed against a real Indexer.
+  All three SAS -> Indexer push sites now share one call encoding. (#309)
+- Revocability semantics coverage: delegated, batch, and paid issuance now
+  each have an acceptance test for `revocable = true` under a revocable
+  schema (rejection was already covered on every issuance path),
+  `replace_attestation` is covered replacing a revocable attestation with an
+  irrevocable successor, and `soroban-sas-common` unit tests pin the
+  `check_revocable` truth table and `schema_uid`'s sensitivity to the flag.
+  (#303)
+- Generic EIP-712 structured-data hashing in `soroban-sas-common::eip712`:
+  `encode_type`/`type_hash`/`encode_data`/`hash_struct`/`hash_typed_data`
+  derived from `StructDef`/`FieldDef` declarations, covering nested structs,
+  dynamic arrays, sign-extended `intN` and right-aligned `address` words, with
+  strict `SchemaError` reporting instead of silent field dropping. Adds a `v1`
+  declaration set that checks each v1 literal type tag against the field list it
+  describes, an `eip712_encode_fuzz` fuzz target, and benchmarks for type-string
+  derivation, nested-struct, array, and full-digest hashing. (#299)
+- `SchemaRegistry::upgrade` now emits the standardized `ContractUpgraded` event
+  (`("UPGRADED", authorizer)` with `old_wasm_hash`/`new_wasm_hash`) in addition
+  to its versioned `UPGRADE` event, tracking the activated WASM hash in instance
+  storage so later activations report the hash they replaced. The upgrade path
+  is split into `validate_upgrade`/`commit_upgrade`, dropping the previous
+  test-only event helper, with coverage for validation rejections, the first
+  activation, and hash history. (#283)
+- Fuzz target `indexer_idempotency_fuzz` and seed corpus verifying `Indexer::index_attestation` idempotency invariants across first calls, retries, and mutated triples (#235).
+- Fee payment lifecycle coverage in `scripts/smoke_test.sh` covering token deployment, `set_treasury`, `set_fee`, `attest_with_value`, balance assertions, `withdraw_tokens`, and zero-fee paths (#239).
+- Operational runbook `docs/reconciliation.md` documenting detection, enumeration, CLI/SDK invocation, and health checks for `reindex_attestation` fail-open recovery (#238).
+- Typed `DelegationNonceKey` storage key wrapper in `soroban-sas-common` and `contracts/sas` reducing instance storage XDR serialization overhead (#237).
+- `SAS::admin()` and `SASClient::fetch_admin()` expose the initialized SAS
+  administrator through stable contract and SDK APIs. (#241)
+- Delegated issuance and dynamic schema allow-lists: schema owners can authorize
+  and revoke delegates via `add_delegate` and `remove_delegate` on `SchemaRegistry`.
+  Authorized delegates can issue and revoke attestations against the schema with
+  the same authority as the original owner (`is_authorized` cross-contract verification). (#7)
+- `SchemaDelegateAdded` and `SchemaDelegateRemoved` events emitted on delegate modification. (#7)
+- SDK client methods `add_delegate`, `remove_delegate`, `is_delegate`, and `is_authorized` in `soroban-sas-sdk`. (#7)
+- Meaningful benchmarks for UID, domain, attestation, and payload hashing
+  across small, typical, and maximum payload sizes. (#183)
+- Runnable `basic_attestation` example with dry-run mode and optional
+  testnet submission. (#181)
+- Fuzz targets exercising schema validation, typed-data hashing, event
+  decoding, CLI JSON parsing, and XDR decoding. (#182)
+
+### Removed
+- `soroban_sas_sdk::init()`: the undocumented no-op entry point has been
+  removed. Callers should instantiate `SASClient` and builders directly. (#180)
+
+### Added
+- `Indexer::index_attestation` is now idempotent: a repeated call with the
+  same `(recipient, schema_uid, attester)` triple for a UID is a no-op, and a
+  repeated call with a different triple is rejected with
+  `SASError::DuplicateAttestation`. Adds `Indexer::get_attestation_status` and
+  the `IndexStatus` type. (#129)
+- `soroban-sas-sdk`: `RpcClient` now bounds RPC response bodies
+  (`with_max_response_bytes`, default 4 MiB) and decodes every RPC-supplied
+  XDR payload with finite depth/size limits (`soroban_sas_sdk::limits`),
+  returning `SdkError::ResponseTooLarge` instead of allocating without
+  bound. (#136)
+- `soroban-sas-sdk`: `SequenceManager` hands out collision-free account
+  sequence numbers to concurrent writers
+  (`SASClient::with_sequence_manager`), resynchronising and retrying once on
+  a `txBadSeq` rejection. (#132)
+- `soroban-sas-sdk`: `SubmissionPolicy` makes write settlement configurable —
+  poll interval, wall-clock deadline, poll cap, fixed/exponential backoff,
+  and blocking vs. asynchronous mode (`SASClient::with_submission_policy`).
+  `GetTransactionResult` gains a `hash` field. (#133)
 - Initial workspace structure and foundational crates.
 - Schema Registry contract implementation.
 - SAS core contract implementation for issuing and revoking attestations.
@@ -25,6 +242,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LEDGERS_IN_ONE_YEAR` common constant for persistent storage TTL bumps.
 
 ### Changed
+- The workspace and fuzz harness now use `soroban-sdk` 21.7.7. The migration
+  adapts SDK 21's `sha256` `Hash<32>` return values to the existing `BytesN<32>`
+  UID/domain types and updates Stellar asset test registration to the v2 test
+  helper. Dependency locks keep the SDK 21 graph compatible with the project's
+  existing Rust 1.79 toolchain by resolving `ed25519-dalek` 2.1.1. (#230)
+- `soroban-sas-sdk`: a blocking write that never settles now returns
+  `SdkError::SettlementTimeout { hash, last_status, polls }` instead of a
+  generic `SdkError::RpcError`, and a `sendTransaction` rejection returns
+  `SdkError::SubmissionRejected` — so timeout, RPC failure, and terminal
+  on-chain failure are distinguishable. (#133)
 - All contract failure paths now panic with typed `SASError` variants instead
   of bare `panic!` strings, so callers can distinguish failures by error code.
 - `SAS::attest_with_value` now performs the SEP-41 token transfer from the
@@ -36,6 +263,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SAS` can bind an `Indexer` and mirror newly issued attestations so
   replacements are discoverable through indexer lookups.
 
+### Fixed
+- `SAS::set_indexer` and `SAS::attest` no longer trap when the contract has
+  not been initialized. Both now report `SASError::NotInitialized` through a
+  shared `require_admin` / `require_registry` guard, so SDK and CLI callers
+  get one stable error code for a missing `init` instead of an unclassified
+  host trap. `set_indexer` classifies the pre-init case before requiring
+  authorization; `attest` resolves the registry before payload validation so
+  a configuration failure is never masked by a payload complaint.
+  (#76, #77)
+- `Indexer::get_attestations_by_recipient` / `_by_schema` / `_by_attester`
+  now walk every chunk backing a lookup key instead of returning chunk 0
+  only, so a key with more than 100 UIDs is no longer silently truncated.
+  All three dimensions share the same cursor model as the paginated and
+  filtered reads. (#78)
+- Indexer chunk reads now extend the TTL of the entries they touch, so a
+  frequently queried but rarely updated index is not archived out from under
+  its callers. Reads of a missing chunk return empty without creating storage
+  or trapping. (#79)
+- `SchemaRegistry::deprecate` now requires authorization from the schema's
+  creator or the registry admin before writing the deprecation tombstone,
+  closing a privilege-escalation gap where any account could deprecate any
+  schema and invalidate every attestation issued under it. Emits a
+  `SchemaDeprecated { schema_uid, deprecated_by }` event on the first
+  successful deprecation; repeated calls stay idempotent and do not
+  re-publish the event. (#218)
+- `Indexer::get_count_by_recipient`, `get_count_by_schema`, and
+  `get_count_by_attester` return the total number of UIDs indexed under a
+  key without fetching any of them, letting callers compute pagination
+  totals (`ceil(count / page_size)`) up front. Backed by the same
+  persistent counter `index_total` derives chunk cursors from (see #219),
+  renewed on read, and unaffected by `Active` -> `Revoked`/`Replaced`
+  status transitions. Adds matching `IndexerClient::get_count_by_recipient`
+  / `get_count_by_schema` / `get_count_by_attester` helpers to
+  `soroban-sas-sdk`. (#220)
+- `validate_schema_syntax` now rejects a schema with more than
+  `MAX_SCHEMA_FIELDS` (64) comma-separated fields. `MAX_SCHEMA_LENGTH`
+  bounds the string's byte length but not its field count, so a string
+  packed with many tiny fields could pack up to 256 fields into the 1024
+  byte budget and impose unbounded per-decode iteration cost on schema
+  resolvers and off-chain SDK parsers. (#217)
+- `Indexer`'s per-key UID counters (`RCOUNT`/`SCOUNT`/`ACOUNT`) now live in
+  persistent storage instead of instance storage, on the same
+  `LEDGERS_IN_ONE_YEAR` renewal horizon as the chunk data they count. Instance
+  storage expires independently of persistent storage, so a counter left in
+  instance storage could silently reset to zero while its chunks survived —
+  the next `index_attestation` for that key would then recompute chunk 0 from
+  a stale cursor and duplicate a UID into it. (#219)
+
 ### Known Issues
-- `SchemaRegistry::deprecate` currently lacks an authorization check.
-- Delegated attest/revoke signatures do not bind the full attestation payload or a nonce, permitting potential replay.
+- Off-chain delegated signatures are ed25519-only and must bind to a classic
+  Ed25519 account via the structural address check, or to a key registered
+  on-chain with `register_attester_key`. There is no off-chain key-registration
+  flow yet.

@@ -3,12 +3,32 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use soroban_sdk::xdr::{
-    AccountEntry, AccountEntryExt, AccountId, ExtensionPoint, LedgerEntryData, LedgerFootprint,
-    Limits, Memo, MuxedAccount, Preconditions, PublicKey, SequenceNumber, SorobanResources,
-    SorobanTransactionData, String32, Thresholds, Transaction, TransactionEnvelope, TransactionExt,
-    TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    AccountEntry, AccountEntryExt, AccountId, ExtensionPoint, HostFunction, LedgerEntryData,
+    LedgerFootprint, Limits, Memo, MuxedAccount, OperationBody, Preconditions, PublicKey, ReadXdr,
+    SequenceNumber, SorobanResources, SorobanTransactionData, String32, Thresholds, Transaction,
+    TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 use soroban_sdk::{Bytes, Env};
+
+/// Base64 XDR of a well-formed, empty V1 `TransactionEnvelope`, used by the
+/// mock RPC's `getTransaction` reply so the SDK's envelope-variant check
+/// (which rejects V0 / fee-bump envelopes) has something real to decode.
+fn sample_v1_envelope_xdr() -> String {
+    TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(0),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: VecM::default(),
+            ext: TransactionExt::V0,
+        },
+        signatures: VecM::default(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap()
+}
 
 /// Strkey `G...` address of the account derived from `seed`.
 fn strkey_account(seed: [u8; 32]) -> String {
@@ -150,11 +170,11 @@ fn test_attestation_builder_uid_is_deterministic_and_content_addressed() {
     let uid_b = build_uid(b"different data", [0u8; 32]);
     assert_ne!(uid_a, uid_b, "different data must produce a different UID");
 
+    // `ref_uid` is deliberately not part of the content-addressing preimage
+    // (`sha256(schema_uid || recipient || attester || data)`, #215), so it
+    // must not affect the derived UID.
     let uid_c = build_uid(b"same data", [9u8; 32]);
-    assert_ne!(
-        uid_a, uid_c,
-        "a different ref_uid must produce a different UID"
-    );
+    assert_eq!(uid_a, uid_c, "ref_uid must not affect the derived UID");
 }
 
 #[test]
@@ -187,6 +207,110 @@ fn test_attestation_builder_rejects_missing_required_fields() {
     }
 }
 
+// ---- #304: missing / malformed recipients never panic ----
+
+fn complete_builder(
+    env: &Env,
+    recipient: &str,
+    attester: &str,
+) -> crate::attestation_builder::AttestationRequestBuilder {
+    crate::attestation_builder::AttestationRequestBuilder::new()
+        .with_recipient(recipient)
+        .with_attester(attester)
+        .with_schema_uid([2u8; 32])
+        .with_data(Bytes::from_slice(env, b"payload"))
+}
+
+#[test]
+fn test_attestation_builder_missing_recipient_is_an_error_not_a_panic() {
+    let env = Env::default();
+    let attester = strkey_account([4u8; 32]);
+
+    // Every other field set: the only gap is the recipient.
+    let result = crate::attestation_builder::AttestationRequestBuilder::new()
+        .with_attester(&attester)
+        .with_schema_uid([2u8; 32])
+        .with_data(Bytes::new(&env))
+        .build(&env);
+    match result {
+        Err(crate::errors::SdkError::RpcError(msg)) => assert!(msg.contains("recipient")),
+        other => panic!("expected a missing-recipient error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_attestation_builder_rejects_malformed_recipient_without_trapping_the_host() {
+    let env = Env::default();
+    let attester = strkey_account([4u8; 32]);
+    let secret_seed_strkey = "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF7U";
+
+    // Each of these used to reach `Address::from_string` unvalidated, which
+    // traps the host and panics the calling process.
+    for bad in ["", "   ", "not-a-strkey", "G", secret_seed_strkey] {
+        match complete_builder(&env, bad, &attester).build(&env) {
+            Err(crate::errors::SdkError::DecodingError(msg)) => {
+                assert!(msg.contains("recipient"), "{bad:?}: {msg}")
+            }
+            other => panic!("recipient {bad:?}: expected DecodingError, got {other:?}"),
+        }
+    }
+
+    // The attester goes through the same guard.
+    let recipient = strkey_account([3u8; 32]);
+    match complete_builder(&env, &recipient, "not-a-strkey").build(&env) {
+        Err(crate::errors::SdkError::DecodingError(msg)) => assert!(msg.contains("attester")),
+        other => panic!("expected DecodingError for the attester, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_attestation_builder_rejects_no_recipient_sentinels_and_self_attestation() {
+    let env = Env::default();
+    let attester = strkey_account([4u8; 32]);
+    let zero_account = stellar_strkey::ed25519::PublicKey([0u8; 32]).to_string();
+    let zero_contract = stellar_strkey::Contract([0u8; 32]).to_string();
+
+    for missing in [zero_account.as_str(), zero_contract.as_str(), &attester] {
+        match complete_builder(&env, missing, &attester).build(&env) {
+            Err(crate::errors::SdkError::InvalidInput(msg)) => {
+                assert!(msg.contains("InvalidRecipient"), "{missing}: {msg}");
+                assert!(msg.contains("402"), "{missing}: {msg}");
+            }
+            other => panic!("recipient {missing}: expected InvalidInput, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_attestation_builder_valid_recipient_regression() {
+    let env = Env::default();
+    let attester = strkey_account([4u8; 32]);
+
+    // Account and contract recipients both remain accepted, and the UID is
+    // still the canonical content address the contract validates (#215).
+    for recipient in [
+        strkey_account([3u8; 32]),
+        stellar_strkey::Contract([7u8; 32]).to_string(),
+    ] {
+        let attestation = complete_builder(&env, &recipient, &attester)
+            .build(&env)
+            .unwrap();
+        let expected_recipient =
+            soroban_sdk::Address::from_string(&soroban_sdk::String::from_str(&env, &recipient));
+        assert_eq!(attestation.recipient, expected_recipient);
+        assert_eq!(
+            attestation.uid,
+            soroban_sas_common::attestation_uid(
+                &env,
+                &attestation.schema_uid,
+                &attestation.recipient,
+                &attestation.attester,
+                &attestation.data,
+            )
+        );
+    }
+}
+
 /// Answers one JSON-RPC request on `stream` with a canned Soroban RPC
 /// response. `account_entry_xdr` and `transaction_data_xdr` are the base64
 /// XDR payloads the account-lookup and simulation steps need.
@@ -194,7 +318,7 @@ fn serve_rpc(
     stream: TcpStream,
     account_entry_xdr: &str,
     transaction_data_xdr: &str,
-    envelope_xdr: &str,
+    _envelope_xdr: &str,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
@@ -217,19 +341,38 @@ fn serve_rpc(
 
     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let method = request["method"].as_str().unwrap_or_default();
+    let id = request["id"].clone();
     let response = match method {
-        "getLedgerEntries" => serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "result": {
-                "entries": [{
-                    "key": "AAAAAA==",
-                    "xdr": account_entry_xdr,
-                    "lastModifiedLedgerSeq": 1
-                }],
-                "latestLedger": 1
-            }
-        }),
+        "getLedgerEntries" => {
+            let entries: Vec<serde_json::Value> = request["params"]["keys"]
+                .as_array()
+                .map(|keys| {
+                    keys.iter()
+                        .map(|k| {
+                            serde_json::json!({
+                                "key": k.as_str().unwrap_or("AAAAAA=="),
+                                "xdr": &account_entry_xdr,
+                                "lastModifiedLedgerSeq": 1
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![serde_json::json!({
+                        "key": "AAAAAA==",
+                        "xdr": &account_entry_xdr,
+                        "lastModifiedLedgerSeq": 1
+                    })]
+                });
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "result": {
+                    "entries": entries,
+                    "latestLedger": 1
+                }
+            })
+        }
         "simulateTransaction" => serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "result": {
+            "jsonrpc": "2.0", "id": id, "result": {
                 "latestLedger": 1,
                 "results": [{"xdr": "AAAAAA=="}],
                 "transactionData": transaction_data_xdr,
@@ -237,17 +380,17 @@ fn serve_rpc(
             }
         }),
         "sendTransaction" => serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "result": {
+            "jsonrpc": "2.0", "id": id, "result": {
                 "status": "PENDING",
                 "hash": "abcd1234",
                 "latestLedger": 1
             }
         }),
         "getTransaction" => serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "result": {
+            "jsonrpc": "2.0", "id": id, "result": {
                 "status": "SUCCESS",
                 "latestLedger": 1,
-                "envelopeXdr": envelope_xdr,
+                "envelopeXdr": sample_v1_envelope_xdr(),
                 "resultXdr": "AAAAAQAAAAA="
             }
         }),
@@ -362,7 +505,6 @@ fn test_attestation_builder_attestation_is_accepted_by_sas_client_attest() {
     let client = crate::client::SASClient::new(contract_id);
     let rpc = crate::rpc::RpcClient::new(url).with_timeout(Duration::from_secs(5));
     let result = client.attest(
-        &env,
         &rpc,
         "Test SDF Network ; September 2015",
         &secret_seed,
@@ -375,4 +517,791 @@ fn test_attestation_builder_attestation_is_accepted_by_sas_client_attest() {
         result.is_ok(),
         "SASClient::attest rejected a builder-produced attestation: {result:?}"
     );
+}
+
+fn write_rpc_response(mut stream: TcpStream, response: &serde_json::Value) {
+    let response = response.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response.len(),
+        response
+    )
+    .unwrap();
+    stream.flush().unwrap();
+}
+
+fn read_rpc_request(stream: &TcpStream) -> serde_json::Value {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).unwrap_or(0);
+        if read == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = value.trim().parse().unwrap();
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn write_pipeline_fixture(seed: [u8; 32]) -> (String, String) {
+    let public_key = crate::signature::derive_public_key(&seed);
+    let account_entry = AccountEntry {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(public_key))),
+        balance: 100_000_000,
+        seq_num: SequenceNumber(7),
+        num_sub_entries: 0,
+        inflation_dest: None,
+        flags: 0,
+        home_domain: String32::default(),
+        thresholds: Thresholds([1, 0, 0, 0]),
+        signers: Default::default(),
+        ext: AccountEntryExt::V0,
+    };
+    let account_xdr = LedgerEntryData::Account(account_entry)
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+    let transaction_data = SorobanTransactionData {
+        ext: ExtensionPoint::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: VecM::default(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            read_bytes: 0,
+            write_bytes: 0,
+        },
+        resource_fee: 0,
+    }
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    (account_xdr, transaction_data)
+}
+
+/// Runs enough of a Soroban RPC to exercise two complete write pipelines and
+/// returns every request to the test for invocation-XDR assertions.
+fn spawn_fee_pipeline_server(
+    seed: [u8; 32],
+    request_tx: std::sync::mpsc::Sender<serde_json::Value>,
+) -> (String, std::thread::JoinHandle<()>) {
+    let (account_xdr, transaction_data) = write_pipeline_fixture(seed);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        for index in 0..8 {
+            let (stream, _) = listener.accept().unwrap();
+            let request = read_rpc_request(&stream);
+            request_tx.send(request.clone()).unwrap();
+            let id = request["id"].clone();
+            let response = match request["method"].as_str().unwrap() {
+                "getLedgerEntries" => {
+                    let entries: Vec<serde_json::Value> = request["params"]["keys"]
+                        .as_array()
+                        .map(|keys| {
+                            keys.iter()
+                                .map(|k| {
+                                    serde_json::json!({
+                                        "key": k.as_str().unwrap_or("AAAAAA=="),
+                                        "xdr": &account_xdr,
+                                        "lastModifiedLedgerSeq": 1
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_else(|| {
+                            vec![serde_json::json!({
+                                "key": "AAAAAA==",
+                                "xdr": &account_xdr,
+                                "lastModifiedLedgerSeq": 1
+                            })]
+                        });
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": {
+                            "entries": entries,
+                            "latestLedger": 1
+                        }
+                    })
+                }
+                "simulateTransaction" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "latestLedger": 1,
+                        "results": [{"xdr": "AAAAAA=="}],
+                        "transactionData": transaction_data,
+                        "minResourceFee": "0"
+                    }
+                }),
+                "sendTransaction" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "status": "PENDING", "hash": format!("fee-hash-{index}"), "latestLedger": 1
+                    }
+                }),
+                "getTransaction" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "status": "SUCCESS", "latestLedger": 1,
+                        "envelopeXdr": sample_v1_envelope_xdr(), "resultXdr": "AAAAAQAAAAA="
+                    }
+                }),
+                method => panic!("unexpected RPC method: {method}"),
+            };
+            write_rpc_response(stream, &response);
+        }
+    });
+    (url, handle)
+}
+
+#[test]
+fn sas_fee_admin_writes_encode_and_settle_sequentially() {
+    let env = Env::default();
+    let seed = [21u8; 32];
+    let contract_id = stellar_strkey::Contract([22u8; 32]).to_string();
+    let token = stellar_strkey::Contract([23u8; 32]).to_string();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (url, server) = spawn_fee_pipeline_server(seed, request_tx);
+    let rpc = crate::rpc::RpcClient::new(url).with_timeout(Duration::from_secs(5));
+    let client = crate::client::SASClient::new(contract_id);
+
+    let set_result = client
+        .set_fee(
+            &rpc,
+            "Test SDF Network ; September 2015",
+            &seed,
+            &token,
+            1_000_000,
+        )
+        .unwrap();
+    let clear_result = client
+        .clear_fee(&rpc, "Test SDF Network ; September 2015", &seed)
+        .unwrap();
+    assert_eq!(set_result.status, "SUCCESS");
+    assert_eq!(clear_result.status, "SUCCESS");
+    server.join().unwrap();
+
+    let requests: Vec<_> = request_rx.try_iter().collect();
+    let methods: Vec<_> = requests
+        .iter()
+        .map(|request| request["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "getLedgerEntries",
+            "simulateTransaction",
+            "sendTransaction",
+            "getTransaction",
+            "getLedgerEntries",
+            "simulateTransaction",
+            "sendTransaction",
+            "getTransaction"
+        ]
+    );
+
+    let invocations: Vec<_> = requests
+        .iter()
+        .filter(|request| request["method"] == "simulateTransaction")
+        .map(|request| {
+            let xdr = request["params"]["transaction"].as_str().unwrap();
+            let TransactionEnvelope::Tx(envelope) =
+                TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).unwrap()
+            else {
+                panic!("expected V1 transaction envelope");
+            };
+            let OperationBody::InvokeHostFunction(operation) = &envelope.tx.operations[0].body
+            else {
+                panic!("expected InvokeHostFunction operation");
+            };
+            let HostFunction::InvokeContract(invocation) = &operation.host_function else {
+                panic!("expected InvokeContract host function");
+            };
+            invocation.clone()
+        })
+        .collect();
+    assert_eq!(invocations[0].function_name.0.to_string(), "set_fee");
+    assert_eq!(invocations[0].args.len(), 2);
+    let token_address =
+        crate::strkey::parse_address(&env, &token, crate::strkey::AddressKind::Contract, "token")
+            .unwrap();
+    assert_eq!(
+        invocations[0].args[0],
+        crate::simulate::encode_arg(&env, &token_address).unwrap()
+    );
+    assert_eq!(
+        invocations[0].args[1],
+        crate::simulate::encode_arg(&env, &1_000_000i128).unwrap()
+    );
+    assert_eq!(invocations[1].function_name.0.to_string(), "clear_fee");
+    assert!(invocations[1].args.is_empty());
+}
+
+#[test]
+fn sas_set_fee_rejects_invalid_amount_before_rpc() {
+    let _env = Env::default();
+    let client = crate::client::SASClient::new(stellar_strkey::Contract([24u8; 32]).to_string());
+    let rpc = crate::rpc::RpcClient::new("http://127.0.0.1:1".to_string());
+    let token = stellar_strkey::Contract([25u8; 32]).to_string();
+    for amount in [0, -1] {
+        let error = client
+            .set_fee(&rpc, "network", &[26u8; 32], &token, amount)
+            .unwrap_err();
+        assert!(matches!(error, crate::errors::SdkError::InvalidInput(_)));
+    }
+}
+
+#[test]
+fn sas_set_fee_surfaces_unauthorized_simulation_as_contract_error_301() {
+    let _env = Env::default();
+    let seed = [27u8; 32];
+    let (account_xdr, _) = write_pipeline_fixture(seed);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for expected_method in ["getLedgerEntries", "simulateTransaction"] {
+            let (stream, _) = listener.accept().unwrap();
+            let request = read_rpc_request(&stream);
+            assert_eq!(request["method"], expected_method);
+            let id = request["id"].clone();
+            let response = if expected_method == "getLedgerEntries" {
+                let requested_key = request["params"]["keys"][0].as_str().unwrap_or("AAAAAA==");
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "entries": [{"key": requested_key, "xdr": account_xdr, "lastModifiedLedgerSeq": 1}],
+                        "latestLedger": 1
+                    }
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "latestLedger": 1,
+                        "error": "HostError: Error(301, Unauthorized)"
+                    }
+                })
+            };
+            write_rpc_response(stream, &response);
+        }
+    });
+
+    let rpc = crate::rpc::RpcClient::new(url).with_timeout(Duration::from_secs(5));
+    let client = crate::client::SASClient::new(stellar_strkey::Contract([28u8; 32]).to_string());
+    let token = stellar_strkey::Contract([29u8; 32]).to_string();
+    let error = client
+        .set_fee(&rpc, "network", &seed, &token, 1)
+        .unwrap_err();
+    server.join().unwrap();
+    assert!(matches!(error, crate::errors::SdkError::ContractError(301)));
+}
+
+#[test]
+fn schema_withdraw_fees_encodes_amount_and_settles() {
+    let env = Env::default();
+    let seed = [51u8; 32];
+    let registry_contract_id = stellar_strkey::Contract([52u8; 32]).to_string();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (url, server) = spawn_fee_pipeline_server(seed, request_tx);
+    let rpc = crate::rpc::RpcClient::new(url).with_timeout(Duration::from_secs(5));
+    let client = crate::client::SASClient::new(registry_contract_id.clone());
+
+    let first = client
+        .withdraw_schema_fees(
+            &rpc,
+            "Test SDF Network ; September 2015",
+            &seed,
+            &registry_contract_id,
+            500,
+        )
+        .unwrap();
+    let second = client
+        .withdraw_schema_fees(
+            &rpc,
+            "Test SDF Network ; September 2015",
+            &seed,
+            &registry_contract_id,
+            250,
+        )
+        .unwrap();
+    assert_eq!(first.status, "SUCCESS");
+    assert_eq!(second.status, "SUCCESS");
+    server.join().unwrap();
+
+    let requests: Vec<_> = request_rx.try_iter().collect();
+    let methods: Vec<_> = requests
+        .iter()
+        .map(|request| request["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "getLedgerEntries",
+            "simulateTransaction",
+            "sendTransaction",
+            "getTransaction",
+            "getLedgerEntries",
+            "simulateTransaction",
+            "sendTransaction",
+            "getTransaction"
+        ]
+    );
+
+    let invocations: Vec<_> = requests
+        .iter()
+        .filter(|request| request["method"] == "simulateTransaction")
+        .map(|request| {
+            let xdr = request["params"]["transaction"].as_str().unwrap();
+            let TransactionEnvelope::Tx(envelope) =
+                TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).unwrap()
+            else {
+                panic!("expected V1 transaction envelope");
+            };
+            let OperationBody::InvokeHostFunction(operation) = &envelope.tx.operations[0].body
+            else {
+                panic!("expected InvokeHostFunction operation");
+            };
+            let HostFunction::InvokeContract(invocation) = &operation.host_function else {
+                panic!("expected InvokeContract host function");
+            };
+            invocation.clone()
+        })
+        .collect();
+    assert_eq!(invocations[0].function_name.0.to_string(), "withdraw_fees");
+    assert_eq!(invocations[0].args.len(), 1);
+    assert_eq!(
+        invocations[0].args[0],
+        crate::simulate::encode_arg(&env, &500i128).unwrap()
+    );
+    assert_eq!(invocations[1].function_name.0.to_string(), "withdraw_fees");
+    assert_eq!(
+        invocations[1].args[0],
+        crate::simulate::encode_arg(&env, &250i128).unwrap()
+    );
+}
+
+#[test]
+fn schema_withdraw_fees_rejects_non_positive_amount_before_rpc() {
+    let _env = Env::default();
+    let client = crate::client::SASClient::new(stellar_strkey::Contract([53u8; 32]).to_string());
+    let rpc = crate::rpc::RpcClient::new("http://127.0.0.1:1".to_string());
+    let registry_contract_id = stellar_strkey::Contract([53u8; 32]).to_string();
+    for amount in [0, -1] {
+        let error = client
+            .withdraw_schema_fees(&rpc, "network", &[54u8; 32], &registry_contract_id, amount)
+            .unwrap_err();
+        assert!(matches!(error, crate::errors::SdkError::InvalidInput(_)));
+    }
+}
+
+#[test]
+fn schema_withdraw_fees_surfaces_unauthorized_simulation_as_contract_error_301() {
+    let _env = Env::default();
+    let seed = [55u8; 32];
+    let (account_xdr, _) = write_pipeline_fixture(seed);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for expected_method in ["getLedgerEntries", "simulateTransaction"] {
+            let (stream, _) = listener.accept().unwrap();
+            let request = read_rpc_request(&stream);
+            assert_eq!(request["method"], expected_method);
+            let id = request["id"].clone();
+            let response = if expected_method == "getLedgerEntries" {
+                let requested_key = request["params"]["keys"][0].as_str().unwrap_or("AAAAAA==");
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "entries": [{"key": requested_key, "xdr": account_xdr, "lastModifiedLedgerSeq": 1}],
+                        "latestLedger": 1
+                    }
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "latestLedger": 1,
+                        "error": "HostError: Error(301, Unauthorized)"
+                    }
+                })
+            };
+            write_rpc_response(stream, &response);
+        }
+    });
+
+    let rpc = crate::rpc::RpcClient::new(url).with_timeout(Duration::from_secs(5));
+    let client = crate::client::SASClient::new(stellar_strkey::Contract([56u8; 32]).to_string());
+    let registry_contract_id = stellar_strkey::Contract([56u8; 32]).to_string();
+    let error = client
+        .withdraw_schema_fees(&rpc, "network", &seed, &registry_contract_id, 500)
+        .unwrap_err();
+    server.join().unwrap();
+    assert!(matches!(error, crate::errors::SdkError::ContractError(301)));
+}
+
+/// Issue #132 acceptance criterion: two writes for the same account, built
+/// concurrently while sharing one [`SequenceManager`], are handed **distinct**
+/// sequence numbers instead of both reading the same on-chain value and
+/// racing. Exercises the real RPC sequence fetch under the manager's lock.
+#[test]
+fn concurrent_reservations_via_the_manager_get_distinct_sequences() {
+    use crate::sequence::SequenceManager;
+    use std::sync::{Arc, Barrier};
+
+    let public_key = crate::signature::derive_public_key(&[5u8; 32]);
+    let account_entry = AccountEntry {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(public_key))),
+        balance: 100_000_000,
+        seq_num: SequenceNumber(500),
+        num_sub_entries: 0,
+        inflation_dest: None,
+        flags: 0,
+        home_domain: String32::default(),
+        thresholds: Thresholds([1, 0, 0, 0]),
+        signers: Default::default(),
+        ext: AccountEntryExt::V0,
+    };
+    let account_entry_xdr = LedgerEntryData::Account(account_entry)
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+
+    // Mock RPC: every getLedgerEntries reports the same sequence, 500.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => serve_rpc(stream, &account_entry_xdr, "", ""),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let manager = Arc::new(SequenceManager::new());
+    let threads = 8;
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            let (manager, barrier, url) = (manager.clone(), barrier.clone(), url.clone());
+            std::thread::spawn(move || {
+                let rpc = crate::rpc::RpcClient::new(url).with_timeout(Duration::from_secs(5));
+                barrier.wait();
+                manager.reserve(&rpc, &public_key).unwrap().sequence()
+            })
+        })
+        .collect();
+
+    let mut got: Vec<i64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    drop(server);
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        (501..501 + threads as i64).collect::<Vec<_>>(),
+        "concurrent reservations collided or skipped a sequence number"
+    );
+}
+
+#[test]
+fn test_consistent_enum_serialization() {
+    use crate::client::FeePolicy;
+    use crate::events::{EventParseError, EventTrust};
+    use crate::rpc::IssuanceTimeError;
+    use crate::strkey::AddressKind;
+    use crate::transaction::{Backoff, SubmissionMode};
+
+    // 1. SubmissionMode: snake_case string literals
+    assert_eq!(
+        serde_json::to_string(&SubmissionMode::Blocking).unwrap(),
+        "\"blocking\""
+    );
+    assert_eq!(
+        serde_json::to_string(&SubmissionMode::Async).unwrap(),
+        "\"async\""
+    );
+    assert_eq!(
+        serde_json::from_str::<SubmissionMode>("\"blocking\"").unwrap(),
+        SubmissionMode::Blocking
+    );
+    assert_eq!(
+        serde_json::from_str::<SubmissionMode>("\"async\"").unwrap(),
+        SubmissionMode::Async
+    );
+
+    // 2. Backoff: snake_case tags and fields
+    assert_eq!(serde_json::to_string(&Backoff::Fixed).unwrap(), "\"fixed\"");
+    assert_eq!(
+        serde_json::from_str::<Backoff>("\"fixed\"").unwrap(),
+        Backoff::Fixed
+    );
+    let exp = Backoff::Exponential {
+        factor: 2,
+        max_interval: Duration::from_secs(30),
+    };
+    let exp_json = serde_json::to_string(&exp).unwrap();
+    assert!(exp_json.contains("\"exponential\""));
+    assert_eq!(serde_json::from_str::<Backoff>(&exp_json).unwrap(), exp);
+
+    // 3. FeePolicy: snake_case tags and fields
+    assert_eq!(
+        serde_json::to_string(&FeePolicy::Default).unwrap(),
+        "\"default\""
+    );
+    assert_eq!(
+        serde_json::from_str::<FeePolicy>("\"default\"").unwrap(),
+        FeePolicy::Default
+    );
+
+    let fee_pct = FeePolicy::PercentageMargin { percent: 25 };
+    let fee_pct_json = serde_json::to_string(&fee_pct).unwrap();
+    assert_eq!(fee_pct_json, "{\"percentage_margin\":{\"percent\":25}}");
+    assert_eq!(
+        serde_json::from_str::<FeePolicy>(&fee_pct_json).unwrap(),
+        fee_pct
+    );
+
+    let fee_abs = FeePolicy::AbsoluteMargin { stroops: 500 };
+    let fee_abs_json = serde_json::to_string(&fee_abs).unwrap();
+    assert_eq!(fee_abs_json, "{\"absolute_margin\":{\"stroops\":500}}");
+    assert_eq!(
+        serde_json::from_str::<FeePolicy>(&fee_abs_json).unwrap(),
+        fee_abs
+    );
+
+    let fee_max = FeePolicy::MaxFee { max: 10000 };
+    let fee_max_json = serde_json::to_string(&fee_max).unwrap();
+    assert_eq!(fee_max_json, "{\"max_fee\":{\"max\":10000}}");
+    assert_eq!(
+        serde_json::from_str::<FeePolicy>(&fee_max_json).unwrap(),
+        fee_max
+    );
+
+    // 4. AddressKind: snake_case string literals
+    assert_eq!(
+        serde_json::to_string(&AddressKind::Account).unwrap(),
+        "\"account\""
+    );
+    assert_eq!(
+        serde_json::to_string(&AddressKind::Contract).unwrap(),
+        "\"contract\""
+    );
+    assert_eq!(
+        serde_json::to_string(&AddressKind::Either).unwrap(),
+        "\"either\""
+    );
+    assert_eq!(
+        serde_json::from_str::<AddressKind>("\"account\"").unwrap(),
+        AddressKind::Account
+    );
+    assert_eq!(
+        serde_json::from_str::<AddressKind>("\"contract\"").unwrap(),
+        AddressKind::Contract
+    );
+    assert_eq!(
+        serde_json::from_str::<AddressKind>("\"either\"").unwrap(),
+        AddressKind::Either
+    );
+
+    // 5. EventTrust: snake_case tags
+    assert_eq!(
+        serde_json::to_string(&EventTrust::Trusted).unwrap(),
+        "\"trusted\""
+    );
+    let untrusted = EventTrust::Untrusted {
+        expected_role: "sas",
+        contract_id: None,
+    };
+    let untrusted_json = serde_json::to_string(&untrusted).unwrap();
+    assert!(untrusted_json.contains("\"untrusted\""));
+    assert!(untrusted_json.contains("\"expected_role\":\"sas\""));
+
+    // 6. EventParseError: snake_case tags
+    assert_eq!(
+        serde_json::to_string(&EventParseError::NotSasEvent).unwrap(),
+        "\"not_sas_event\""
+    );
+    assert_eq!(
+        serde_json::to_string(&EventParseError::MissingTopic).unwrap(),
+        "\"missing_topic\""
+    );
+    let malformed = EventParseError::MalformedPayload("missing field");
+    let malformed_json = serde_json::to_string(&malformed).unwrap();
+    assert_eq!(malformed_json, "{\"malformed_payload\":\"missing field\"}");
+
+    // 7. IssuanceTimeError: snake_case tags and fields
+    let stale = IssuanceTimeError::LedgerStale {
+        close_time: 100,
+        local_time: 200,
+        max_skew_secs: 60,
+    };
+    let stale_json = serde_json::to_string(&stale).unwrap();
+    assert_eq!(
+        stale_json,
+        "{\"ledger_stale\":{\"close_time\":100,\"local_time\":200,\"max_skew_secs\":60}}"
+    );
+    assert_eq!(
+        serde_json::from_str::<IssuanceTimeError>(&stale_json).unwrap(),
+        stale
+    );
+}
+
+#[test]
+fn test_auth_entry_builder_ed25519_and_secp256k1_signatures() {
+    let contract_id = stellar_strkey::Contract([1u8; 32]).to_string();
+    let account_id = stellar_strkey::ed25519::PublicKey([2u8; 32]).to_string();
+
+    let ed_pk = [3u8; 32];
+    let ed_sig = [4u8; 64];
+
+    let secp_pk = [5u8; 33];
+    let secp_sig = [6u8; 65];
+
+    let entry = crate::auth::AuthEntryBuilder::new()
+        .with_address_strkey(&account_id)
+        .unwrap()
+        .with_nonce(42)
+        .with_signature_expiration_ledger(1000)
+        .with_threshold(2)
+        .with_root_invocation(&contract_id, "attest", vec![])
+        .unwrap()
+        .add_ed25519_signature(&ed_pk, &ed_sig)
+        .unwrap()
+        .add_secp256k1_signature(&secp_pk, &secp_sig)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let soroban_sdk::xdr::SorobanCredentials::Address(ref creds) = entry.credentials else {
+        panic!("expected Address credentials");
+    };
+    assert_eq!(creds.nonce, 42);
+    assert_eq!(creds.signature_expiration_ledger, 1000);
+    assert_eq!(
+        creds.address,
+        soroban_sdk::xdr::ScAddress::Account(soroban_sdk::xdr::AccountId(
+            soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(soroban_sdk::xdr::Uint256([2u8; 32]))
+        ))
+    );
+}
+
+#[test]
+fn test_auth_entry_builder_mismatched_signature_lengths_rejected() {
+    let ed_pk = [1u8; 32];
+    let invalid_ed_sig = [2u8; 63]; // Not 64 bytes
+
+    let res = crate::auth::AuthEntryBuilder::new().add_ed25519_signature(&ed_pk, &invalid_ed_sig);
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert!(matches!(err, crate::errors::SdkError::ValidationError(_)));
+
+    let secp_pk = [3u8; 33];
+    let invalid_secp_sig = [4u8; 63]; // Not 64 or 65 bytes
+    let res =
+        crate::auth::AuthEntryBuilder::new().add_secp256k1_signature(&secp_pk, &invalid_secp_sig);
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert!(matches!(err, crate::errors::SdkError::ValidationError(_)));
+}
+
+#[test]
+fn test_auth_entry_builder_threshold_validation() {
+    let contract_id = stellar_strkey::Contract([1u8; 32]).to_string();
+    let account_id = stellar_strkey::ed25519::PublicKey([2u8; 32]).to_string();
+
+    let ed_pk = [3u8; 32];
+    let ed_sig = [4u8; 64];
+
+    // Threshold of 2 with only 1 signature should fail
+    let res = crate::auth::AuthEntryBuilder::new()
+        .with_address_strkey(&account_id)
+        .unwrap()
+        .with_threshold(2)
+        .with_root_invocation(&contract_id, "attest", vec![])
+        .unwrap()
+        .add_ed25519_signature_with_weight(&ed_pk, &ed_sig, 1)
+        .unwrap()
+        .build();
+
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert!(matches!(err, crate::errors::SdkError::ValidationError(_)));
+
+    // Threshold of 2 with weight of 2 should succeed
+    let res = crate::auth::AuthEntryBuilder::new()
+        .with_address_strkey(&account_id)
+        .unwrap()
+        .with_threshold(2)
+        .with_root_invocation(&contract_id, "attest", vec![])
+        .unwrap()
+        .add_ed25519_signature_with_weight(&ed_pk, &ed_sig, 2)
+        .unwrap()
+        .build();
+
+    assert!(res.is_ok());
+}
+
+#[test]
+fn test_auth_entry_canonical_sorting_and_validation() {
+    let contract_id1 = stellar_strkey::Contract([1u8; 32]).to_string();
+    let contract_id2 = stellar_strkey::Contract([2u8; 32]).to_string();
+    let account_id = stellar_strkey::ed25519::PublicKey([3u8; 32]).to_string();
+
+    let entry1 = crate::auth::AuthEntryBuilder::new()
+        .with_address_strkey(&account_id)
+        .unwrap()
+        .with_root_invocation(&contract_id1, "fn1", vec![])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let entry2 = crate::auth::AuthEntryBuilder::new()
+        .with_address_strkey(&account_id)
+        .unwrap()
+        .with_root_invocation(&contract_id2, "fn2", vec![])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut entries = vec![entry2.clone(), entry1.clone()];
+    // If unsorted, validate_canonical_order should fail if entry2 > entry1
+    if entry2 > entry1 {
+        assert!(crate::auth::AuthEntryBuilder::validate_canonical_order(&entries).is_err());
+        crate::auth::AuthEntryBuilder::canonical_sort(&mut entries);
+        assert!(crate::auth::AuthEntryBuilder::validate_canonical_order(&entries).is_ok());
+    }
+
+    let assembled = crate::auth::AuthEntryBuilder::assemble_entries(vec![entry2, entry1]).unwrap();
+    assert_eq!(assembled.len(), 2);
+    assert!(crate::auth::AuthEntryBuilder::is_canonically_sorted(
+        &assembled
+    ));
+}
+
+#[test]
+fn test_authorization_tree_generation() {
+    let contract_id = stellar_strkey::Contract([1u8; 32]).to_string();
+    let account_id = stellar_strkey::ed25519::PublicKey([2u8; 32]).to_string();
+
+    let sub_invocation = soroban_sdk::xdr::SorobanAuthorizedInvocation {
+        function: soroban_sdk::xdr::SorobanAuthorizedFunction::ContractFn(
+            soroban_sdk::xdr::InvokeContractArgs {
+                contract_address: soroban_sdk::xdr::ScAddress::Contract(soroban_sdk::xdr::Hash(
+                    [9u8; 32],
+                )),
+                function_name: soroban_sdk::xdr::ScSymbol(
+                    soroban_sdk::xdr::StringM::try_from(b"sub_call".to_vec()).unwrap(),
+                ),
+                args: soroban_sdk::xdr::VecM::default(),
+            },
+        ),
+        sub_invocations: soroban_sdk::xdr::VecM::default(),
+    };
+
+    let entry = crate::auth::AuthEntryBuilder::new()
+        .with_address_strkey(&account_id)
+        .unwrap()
+        .with_root_invocation(&contract_id, "parent_call", vec![])
+        .unwrap()
+        .add_sub_invocation(sub_invocation.clone())
+        .build()
+        .unwrap();
+
+    assert_eq!(entry.root_invocation.sub_invocations.len(), 1);
+    assert_eq!(entry.root_invocation.sub_invocations[0], sub_invocation);
 }

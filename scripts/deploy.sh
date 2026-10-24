@@ -11,19 +11,22 @@
 #   3. indexer                               (needs sas address)
 #        └─ Indexer::init(admin, sas)
 #
-# On success the contract IDs, network settings and the admin key are merged
-# into .env using the exact key names from .env.example:
+# On success the contract IDs, network settings and the admin public address
+# are merged into .env using the exact key names from .env.example:
 #
 #   SOROBAN_RPC_URL, SOROBAN_NETWORK_PASSPHRASE,
 #   SAS_CONTRACT_ID, SCHEMA_REGISTRY_CONTRACT_ID, INDEXER_CONTRACT_ID,
-#   ADMIN_SECRET_KEY
+#   ADMIN_PUBLIC_ADDRESS
 #
 # Usage:
-#   ./scripts/deploy.sh [--network testnet|mainnet] [--secret-key S...] \
-#                       [--rpc-url URL] [--env-file FILE] [--skip-build]
+#   ./scripts/deploy.sh [--network testnet|local|mainnet] [--secret-key S...] \
+#                       [--rpc-url URL] [--env-file FILE] [--skip-build] \
+#                       [--json] [--export-secret] [--resume]
 #
 # Flags:
-#   --network <testnet|mainnet>  Target network (default: testnet).
+#   --network <NAME>             testnet (default), mainnet, or local (alias
+#                                standalone): the docker-compose Quickstart
+#                                node at http://localhost:8000/soroban/rpc.
 #   --secret-key <S...>          Funded source account secret key. Falls back
 #                                to $SOROBAN_SECRET_KEY, then $ADMIN_SECRET_KEY,
 #                                so the key can stay out of shell history.
@@ -31,7 +34,22 @@
 #                                (e.g. a local validator or custom provider).
 #   --env-file <FILE>            Where to write results (default: .env).
 #   --skip-build                 Reuse previously built WASM artifacts.
+#   --json                       Emit a single machine-readable JSON summary
+#                                on stdout instead of the human-readable
+#                                report. All progress/log output still goes
+#                                to stderr, so `--json` output stays parseable
+#                                even when piped, e.g.:
+#                                  ./scripts/deploy.sh --json > deployment.json
+#   --export-secret              Opt-in: write ADMIN_SECRET_KEY to .env.
+#                                By default only the admin public address is
+#                                stored; use this flag when plaintext export
+#                                is required for local development.
 #   -h, --help                   Show this help.
+#
+# A child process cannot export variables into the shell that launched it, so
+# on success the script prints the exact command to activate the results:
+#
+#   source .env
 #
 # Exit codes: 0 success, 1 any build/deploy/init/env-write failure (the script
 # stops at the first failing step).
@@ -41,13 +59,22 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Pretty logging helpers
 # ---------------------------------------------------------------------------
-info() { printf '\033[1;34m[deploy]\033[0m %s\n' "$*"; }
-step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+# All progress logging goes to stderr — stdout is reserved for --json output
+# so a caller can safely do: ./scripts/deploy.sh --json > deployment.json
+info() { printf '\033[1;34m[deploy]\033[0m %s\n' "$*" >&2; }
+step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*" >&2; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
-die()  { err "$*"; exit 1; }
+die()  {
+    err "$*"
+    if [[ -n "${MANIFEST_FILE:-}" && -f "$MANIFEST_FILE" ]]; then
+        info "Deployment failed midway. Successfully deployed IDs are saved in $MANIFEST_FILE."
+        info "Resume recovery: $0 --resume"
+    fi
+    exit 1
+}
 
-usage() { sed -n '2,42p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,56p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -56,32 +83,45 @@ NETWORK="testnet"
 SECRET_KEY="${SOROBAN_SECRET_KEY:-${ADMIN_SECRET_KEY:-}}"
 RPC_URL_OVERRIDE=""
 ENV_FILE=".env"
+MANIFEST_FILE=".deploy-manifest.env"
 SKIP_BUILD=false
+JSON_OUTPUT=false
+EXPORT_SECRET=false
+RESUME=false
 
 TESTNET_RPC_URL="https://soroban-testnet.stellar.org:443"
 TESTNET_PASSPHRASE="Test SDF Network ; September 2015"
 MAINNET_RPC_URL="https://soroban-rpc.stellar.org:443"
 MAINNET_PASSPHRASE="Public Global Stellar Network ; September 2015"
+# docker-compose.yml's standalone Quickstart node (see docs/local-development.md).
+LOCAL_RPC_URL="http://localhost:8000/soroban/rpc"
+LOCAL_PASSPHRASE="Standalone Network ; February 2017"
+LOCAL_FRIENDBOT_URL="http://localhost:8000/friendbot"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --network)    NETWORK="${2:?--network requires a value}"; shift 2 ;;
-        --secret-key) SECRET_KEY="${2:?--secret-key requires a value}"; shift 2 ;;
-        --rpc-url)    RPC_URL_OVERRIDE="${2:?--rpc-url requires a value}"; shift 2 ;;
-        --env-file)   ENV_FILE="${2:?--env-file requires a value}"; shift 2 ;;
-        --skip-build) SKIP_BUILD=true; shift ;;
-        -h|--help)    usage; exit 0 ;;
-        *)            die "unknown argument: $1 (see --help)" ;;
+        --network)        NETWORK="${2:?--network requires a value}"; shift 2 ;;
+        --secret-key)     SECRET_KEY="${2:?--secret-key requires a value}"; shift 2 ;;
+        --rpc-url)        RPC_URL_OVERRIDE="${2:?--rpc-url requires a value}"; shift 2 ;;
+        --env-file)       ENV_FILE="${2:?--env-file requires a value}"; shift 2 ;;
+        --skip-build)     SKIP_BUILD=true; shift ;;
+        --json)           JSON_OUTPUT=true; shift ;;
+        --export-secret)  EXPORT_SECRET=true; shift ;;
+        --resume)         RESUME=true; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                die "unknown argument: $1 (see --help)" ;;
     esac
 done
 
 case "$NETWORK" in
     testnet) RPC_URL="$TESTNET_RPC_URL"; PASSPHRASE="$TESTNET_PASSPHRASE" ;;
     mainnet) RPC_URL="$MAINNET_RPC_URL"; PASSPHRASE="$MAINNET_PASSPHRASE" ;;
-    *) die "unsupported network '$NETWORK' (expected testnet or mainnet)" ;;
+    local|standalone)
+        NETWORK="local"; RPC_URL="$LOCAL_RPC_URL"; PASSPHRASE="$LOCAL_PASSPHRASE" ;;
+    *) die "unsupported network '$NETWORK' (expected testnet, local or mainnet)" ;;
 esac
 if [[ -n "$RPC_URL_OVERRIDE" ]]; then
     RPC_URL="$RPC_URL_OVERRIDE"
@@ -118,35 +158,56 @@ WASM_INDEXER="$WASM_DIR/soroban_sas_indexer.wasm"
 # Source account: validate key, derive the admin G... address
 # ---------------------------------------------------------------------------
 if [[ -z "$SECRET_KEY" ]]; then
-    die "no secret key provided. Pass --secret-key S... or export SOROBAN_SECRET_KEY (or ADMIN_SECRET_KEY)"
-fi
-if [[ ! "$SECRET_KEY" =~ ^S[A-Z2-7]{55}$ ]]; then
-    die "secret key must be an ed25519 strkey seed (S...) — got '${SECRET_KEY:0:4}...' with wrong format"
+    die "no secret key provided. Pass --secret-key S... or an existing identity name, or export SOROBAN_SECRET_KEY (or ADMIN_SECRET_KEY)"
 fi
 
-step "Deriving admin address from the provided secret key"
-# Register the key under a well-known local identity so the CLI can resolve
-# both the signing source and the matching G... address. The identity lives
-# in ~/.config/stellar/identity/ and is refreshed on every run.
-IDENTITY_NAME="soroban-sas-deploy-$NETWORK"
-printf '%s\n' "$SECRET_KEY" | "$CLI_BIN" keys add "$IDENTITY_NAME" --secret-key --overwrite >/dev/null
-ADMIN_ADDRESS="$("$CLI_BIN" keys address "$IDENTITY_NAME")"
-[[ "$ADMIN_ADDRESS" =~ ^G[A-Z2-7]{55}$ ]] || die "failed to derive admin address from secret key"
-info "admin address: $ADMIN_ADDRESS"
-
+ENV_WORK=""
+CLEANUP_IDENTITY=""
 cleanup() {
-    rm -f .env.part
+    [[ -n "$ENV_WORK" ]] && rm -f "$ENV_WORK" "$ENV_WORK.next"
+    if [[ -n "$CLEANUP_IDENTITY" ]]; then
+        "$CLI_BIN" keys rm "$CLEANUP_IDENTITY" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
+if [[ "$SECRET_KEY" =~ ^S[A-Z2-7]{55}$ ]]; then
+    step "Deriving admin address from the provided secret key"
+    # Generate a collision-resistant name for a temporary identity
+    IDENTITY_NAME="tmp-deploy-$RANDOM$RANDOM"
+    printf '%s\n' "$SECRET_KEY" | "$CLI_BIN" keys add "$IDENTITY_NAME" --secret-key >/dev/null
+    CLEANUP_IDENTITY="$IDENTITY_NAME"
+else
+    step "Using existing CLI identity: $SECRET_KEY"
+    IDENTITY_NAME="$SECRET_KEY"
+    if ! "$CLI_BIN" keys address "$IDENTITY_NAME" >/dev/null 2>&1; then
+        die "source '$SECRET_KEY' is not a valid seed (S...) and not found in CLI identities"
+    fi
+    # If using an existing identity, we don't have a secret key to export to .env
+    if [[ "$EXPORT_SECRET" == true ]]; then
+        warn "Cannot export secret key for an existing CLI identity; ignoring --export-secret"
+        EXPORT_SECRET=false
+    fi
+    SECRET_KEY=""
+fi
+
+ADMIN_ADDRESS="$("$CLI_BIN" keys address "$IDENTITY_NAME")"
+[[ "$ADMIN_ADDRESS" =~ ^G[A-Z2-7]{55}$ ]] || die "failed to derive admin address from identity '$IDENTITY_NAME'"
+info "admin address: $ADMIN_ADDRESS"
+
 # ---------------------------------------------------------------------------
-# Testnet convenience: top up via Friendbot if needed (best-effort — ignored
-# when the account is already funded). Mainnet accounts must be funded by the
-# operator beforehand.
+# Testnet/local convenience: top up via Friendbot if needed (best-effort —
+# ignored when the account is already funded). Mainnet accounts must be funded
+# by the operator beforehand.
 # ---------------------------------------------------------------------------
-if [[ "$NETWORK" == "testnet" ]]; then
-    step "Ensuring testnet account is funded (Friendbot, best-effort)"
-    if curl -fsS -o /dev/null "https://friendbot.stellar.org?addr=$ADMIN_ADDRESS"; then
+FRIENDBOT_URL=""
+case "$NETWORK" in
+    testnet) FRIENDBOT_URL="https://friendbot.stellar.org" ;;
+    local)   FRIENDBOT_URL="$LOCAL_FRIENDBOT_URL" ;;
+esac
+if [[ -n "$FRIENDBOT_URL" ]]; then
+    step "Ensuring $NETWORK account is funded (Friendbot, best-effort)"
+    if curl -fsS -o /dev/null "$FRIENDBOT_URL?addr=$ADMIN_ADDRESS"; then
         info "account funded via Friendbot"
     else
         warn "Friendbot did not fund the account (probably already funded) — continuing"
@@ -180,7 +241,7 @@ info "  indexer:  $WASM_INDEXER ($(wc -c <"$WASM_INDEXER") bytes)"
 # ---------------------------------------------------------------------------
 # Shared transaction arguments + helpers
 # ---------------------------------------------------------------------------
-NET_ARGS=(--source-account "$SECRET_KEY" --rpc-url "$RPC_URL" --network-passphrase "$PASSPHRASE")
+NET_ARGS=(--source-account "$IDENTITY_NAME" --rpc-url "$RPC_URL" --network-passphrase "$PASSPHRASE")
 
 # deploy_contract WASM LABEL -> echoes ONLY the new C... contract id on
 # stdout. All human-readable logging goes to stderr, because this function's
@@ -206,56 +267,186 @@ invoke() {
 }
 
 # ---------------------------------------------------------------------------
+# Manifest Helpers
+# ---------------------------------------------------------------------------
+load_manifest() {
+    if [[ -f "$MANIFEST_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$MANIFEST_FILE"
+    fi
+}
+
+save_manifest() {
+    local key="$1"
+    local value="$2"
+    if grep -q "^${key}=" "$MANIFEST_FILE" 2>/dev/null; then
+        sed -i -e "s/^${key}=.*/${key}=${value}/" "$MANIFEST_FILE"
+    else
+        echo "${key}=${value}" >> "$MANIFEST_FILE"
+    fi
+}
+
+if [[ "$RESUME" == true ]]; then
+    step "Resuming from $MANIFEST_FILE"
+    if [[ ! -f "$MANIFEST_FILE" ]]; then
+        die "Resume requested but manifest file $MANIFEST_FILE not found."
+    fi
+    load_manifest
+    
+    if [[ "${MANIFEST_NETWORK:-}" != "$NETWORK" ]]; then
+        die "Manifest network '${MANIFEST_NETWORK:-}' does not match requested network '$NETWORK'"
+    fi
+    if [[ "${MANIFEST_ADMIN:-}" != "$ADMIN_ADDRESS" ]]; then
+        die "Manifest admin '${MANIFEST_ADMIN:-}' does not match requested admin '$ADMIN_ADDRESS'"
+    fi
+else
+    # Start fresh
+    rm -f "$MANIFEST_FILE"
+    save_manifest "MANIFEST_NETWORK" "$NETWORK"
+    save_manifest "MANIFEST_ADMIN" "$ADMIN_ADDRESS"
+fi
+
+# ---------------------------------------------------------------------------
 # 1/3 — schema-registry (no dependencies)
 # ---------------------------------------------------------------------------
-REGISTRY_ID="$(deploy_contract "$WASM_REGISTRY" "schema-registry")"
+REGISTRY_ID=""
+if [[ "$RESUME" == true ]] && [[ -n "${MANIFEST_REGISTRY_ID:-}" ]]; then
+    info "Skipping schema-registry deployment, already deployed at ${MANIFEST_REGISTRY_ID}"
+    REGISTRY_ID="${MANIFEST_REGISTRY_ID}"
+else
+    REGISTRY_ID="$(deploy_contract "$WASM_REGISTRY" "schema-registry")"
+    save_manifest "MANIFEST_REGISTRY_ID" "$REGISTRY_ID"
+fi
 
-step "Initializing SchemaRegistry::init(admin)"
-invoke "$REGISTRY_ID" init --admin "$ADMIN_ADDRESS" ||
-    die "SchemaRegistry::init failed"
-info "SchemaRegistry initialized"
+if [[ "$RESUME" == true ]] && [[ "${MANIFEST_REGISTRY_INIT:-}" == "true" ]]; then
+    info "Skipping schema-registry init"
+else
+    step "Initializing SchemaRegistry::init(admin)"
+    invoke "$REGISTRY_ID" init --admin "$ADMIN_ADDRESS" ||
+        die "SchemaRegistry::init failed"
+    save_manifest "MANIFEST_REGISTRY_INIT" "true"
+    info "SchemaRegistry initialized"
+fi
 
 # ---------------------------------------------------------------------------
 # 2/3 — sas (depends on registry)
 # ---------------------------------------------------------------------------
-SAS_ID="$(deploy_contract "$WASM_SAS" "sas")"
+SAS_ID=""
+if [[ "$RESUME" == true ]] && [[ -n "${MANIFEST_SAS_ID:-}" ]]; then
+    info "Skipping sas deployment, already deployed at ${MANIFEST_SAS_ID}"
+    SAS_ID="${MANIFEST_SAS_ID}"
+else
+    SAS_ID="$(deploy_contract "$WASM_SAS" "sas")"
+    save_manifest "MANIFEST_SAS_ID" "$SAS_ID"
+fi
 
-step "Calling SAS::init(admin, registry_address)"
-invoke "$SAS_ID" init --admin "$ADMIN_ADDRESS" --registry "$REGISTRY_ID" ||
-    die "SAS::init failed — sas deployed at $SAS_ID but is NOT initialized"
-info "SAS initialized with registry $REGISTRY_ID"
+if [[ "$RESUME" == true ]] && [[ "${MANIFEST_SAS_INIT:-}" == "true" ]]; then
+    info "Skipping sas init"
+else
+    step "Calling SAS::init(admin, registry_address)"
+    invoke "$SAS_ID" init --admin "$ADMIN_ADDRESS" --registry "$REGISTRY_ID" ||
+        die "SAS::init failed — sas deployed at $SAS_ID but is NOT initialized"
+    save_manifest "MANIFEST_SAS_INIT" "true"
+    info "SAS initialized with registry $REGISTRY_ID"
+fi
 
 # ---------------------------------------------------------------------------
 # 3/3 — indexer (depends on sas)
 # ---------------------------------------------------------------------------
-INDEXER_ID="$(deploy_contract "$WASM_INDEXER" "indexer")"
+INDEXER_ID=""
+if [[ "$RESUME" == true ]] && [[ -n "${MANIFEST_INDEXER_ID:-}" ]]; then
+    info "Skipping indexer deployment, already deployed at ${MANIFEST_INDEXER_ID}"
+    INDEXER_ID="${MANIFEST_INDEXER_ID}"
+else
+    INDEXER_ID="$(deploy_contract "$WASM_INDEXER" "indexer")"
+    save_manifest "MANIFEST_INDEXER_ID" "$INDEXER_ID"
+fi
 
-step "Calling Indexer::init(admin, sas_address)"
-invoke "$INDEXER_ID" init --admin "$ADMIN_ADDRESS" --sas "$SAS_ID" ||
-    die "Indexer::init failed — indexer deployed at $INDEXER_ID but is NOT initialized"
-info "Indexer initialized with sas $SAS_ID"
+if [[ "$RESUME" == true ]] && [[ "${MANIFEST_INDEXER_INIT:-}" == "true" ]]; then
+    info "Skipping indexer init"
+else
+    step "Calling Indexer::init(admin, sas_address)"
+    invoke "$INDEXER_ID" init --admin "$ADMIN_ADDRESS" --sas "$SAS_ID" ||
+        die "Indexer::init failed — indexer deployed at $INDEXER_ID but is NOT initialized"
+    save_manifest "MANIFEST_INDEXER_INIT" "true"
+    info "Indexer initialized with sas $SAS_ID"
+fi
+
+if [[ "$RESUME" == true ]] && [[ "${MANIFEST_SAS_BOUND:-}" == "true" ]]; then
+    info "Skipping binding, already bidirectionally bound"
+else
+    step "Binding SAS to the deployed indexer"
+    invoke "$SAS_ID" set_indexer --indexer "$INDEXER_ID" ||
+        die "SAS::set_indexer failed — indexer was initialized but SAS was not bound"
+    save_manifest "MANIFEST_SAS_BOUND" "true"
+
+    step "Verifying the SAS <-> Indexer binding"
+    # Newer stellar-cli versions (28+) print an Address return value as a
+    # JSON-quoted string (`"C..."`) instead of bare (`C...`); strip a matching
+    # pair of surrounding quotes so the comparison below works against either
+    # CLI generation. A no-op when there are no quotes to strip.
+    strip_quotes() {
+        local v="$1"
+        v="${v%\"}"
+        v="${v#\"}"
+        printf '%s' "$v"
+    }
+    SAS_BOUND="$(strip_quotes "$(invoke "$SAS_ID" get_indexer)")"
+    INDEXER_BOUND="$(strip_quotes "$(invoke "$INDEXER_ID" get_sas)")"
+    if [[ "$SAS_BOUND" != "$INDEXER_ID" || "$INDEXER_BOUND" != "$SAS_ID" ]]; then
+        die "binding verification failed: SAS.get_indexer=$SAS_BOUND, Indexer.get_sas=$INDEXER_BOUND. Re-run with the same admin key, then call 'stellar contract invoke --id $SAS_ID -- set_indexer --indexer $INDEXER_ID' and verify with 'stellar contract invoke --id $INDEXER_ID -- get_sas'"
+    fi
+    info "SAS and Indexer are bidirectionally bound"
+fi
 
 # ---------------------------------------------------------------------------
 # Write .env — merge into any existing file without clobbering unrelated
 # variables. Managed keys use the exact names from .env.example.
+#
+# All managed keys are applied to a single in-memory copy of the file and
+# flushed to disk in one atomic rename, so a reader (or a crash mid-write)
+# never observes a partially-updated file.
 # ---------------------------------------------------------------------------
+rm -f "$MANIFEST_FILE"
+
 step "Writing deployment results to $ENV_FILE"
 
-# upsert KEY VALUE [QUOTED] — replace the key's line in place, or append it
-# when missing. All other lines (comments, unrelated vars) are preserved.
+MANAGED_KEYS=(
+    SOROBAN_RPC_URL
+    SOROBAN_NETWORK_PASSPHRASE
+    SCHEMA_REGISTRY_CONTRACT_ID
+    SAS_CONTRACT_ID
+    INDEXER_CONTRACT_ID
+    ADMIN_SECRET_KEY
+)
+MANAGED_VALUES=(
+    "\"$RPC_URL\""
+    "\"$PASSPHRASE\""
+    "$REGISTRY_ID"
+    "$SAS_ID"
+    "$INDEXER_ID"
+    "$SECRET_KEY"
+)
+
+ENV_WORK="$(mktemp "${ENV_FILE}.XXXXXX")"
+
+if [[ -f "$ENV_FILE" ]]; then
+    cp "$ENV_FILE" "$ENV_FILE.bak"
+    warn "existing $ENV_FILE backed up to $ENV_FILE.bak"
+    cp "$ENV_FILE" "$ENV_WORK"
+else
+    : > "$ENV_WORK"
+fi
+
+# upsert_env KEY VALUE — replace the key's line in place (preserving every
+# other line: comments, blank lines, unrelated vars), or append it when
+# missing. Operates on the local $ENV_WORK scratch copy only.
 upsert_env() {
-    local key="$1" value="$2" quoted="${3:-false}"
-    # `value` stays the logical value (used for equality checks); `written`
-    # is what actually lands in the file (.env.example uses quoted network
-    # strings).
-    local written="$value"
-    if [[ "$quoted" == true ]]; then
-        written="\"$value\""
-    fi
-    if [[ -f "$ENV_FILE" ]] && grep -q "^${key}=" "$ENV_FILE"; then
+    local key="$1" written="$2"
+    if grep -q "^${key}=" "$ENV_WORK"; then
         local current
-        current="$(grep "^${key}=" "$ENV_FILE" | head -n 1 | cut -d= -f2- | tr -d '"')"
-        if [[ -n "$current" && "$current" != "$value" ]]; then
+        current="$(grep "^${key}=" "$ENV_WORK" | head -n 1 | cut -d= -f2-)"
+        if [[ -n "$current" && "$current" != "$written" ]]; then
             warn "overwriting $key in $ENV_FILE:"
             warn "  old: $key=$current"
             warn "  new: $key=$written"
@@ -264,39 +455,79 @@ upsert_env() {
             index($0, k "=") == 1 { print k "=" v; updated = 1; next }
             { print }
             END { if (!updated) print k "=" v }
-        ' "$ENV_FILE" > "$ENV_FILE.part"
-        mv "$ENV_FILE.part" "$ENV_FILE"
+        ' "$ENV_WORK" > "$ENV_WORK.next"
+        mv "$ENV_WORK.next" "$ENV_WORK"
     else
-        printf '%s=%s\n' "$key" "$written" >> "$ENV_FILE"
+        printf '%s=%s\n' "$key" "$written" >> "$ENV_WORK"
     fi
 }
 
-if [[ -f "$ENV_FILE" ]]; then
-    cp "$ENV_FILE" "$ENV_FILE.bak"
-    warn "existing $ENV_FILE backed up to $ENV_FILE.bak"
-fi
+for i in "${!MANAGED_KEYS[@]}"; do
+    upsert_env "${MANAGED_KEYS[$i]}" "${MANAGED_VALUES[$i]}"
+done
 
+chmod 600 "$ENV_WORK" 2>/dev/null || true
+mv "$ENV_WORK" "$ENV_FILE"
+
+ENV_FILE_ABS="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
 upsert_env "SOROBAN_RPC_URL"             "$RPC_URL"    true
 upsert_env "SOROBAN_NETWORK_PASSPHRASE"  "$PASSPHRASE" true
 upsert_env "SCHEMA_REGISTRY_CONTRACT_ID" "$REGISTRY_ID"
 upsert_env "SAS_CONTRACT_ID"             "$SAS_ID"
 upsert_env "INDEXER_CONTRACT_ID"         "$INDEXER_ID"
-upsert_env "ADMIN_SECRET_KEY"            "$SECRET_KEY"
+upsert_env "ADMIN_PUBLIC_ADDRESS"        "$ADMIN_ADDRESS"
 
-chmod 600 "$ENV_FILE" 2>/dev/null || true
+if [[ "$EXPORT_SECRET" == true ]]; then
+    upsert_env "ADMIN_SECRET_KEY"        "$SECRET_KEY"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+    warn "ADMIN_SECRET_KEY written to $ENV_FILE (chmod 600)"
+else
+    # Remove any stale ADMIN_SECRET_KEY from a previous run.
+    if [[ -f "$ENV_FILE" ]] && grep -q "^ADMIN_SECRET_KEY=" "$ENV_FILE"; then
+        sed -i '/^ADMIN_SECRET_KEY=/d' "$ENV_FILE"
+        warn "removed ADMIN_SECRET_KEY from $ENV_FILE (use --export-secret to keep it)"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
-# Summary
+# Summary — human-readable report on stdout, or a single JSON object on
+# stdout when --json was requested. Progress/log lines always go to stderr
+# (see the logging helpers above), so both modes stay clean when redirected.
 # ---------------------------------------------------------------------------
-step "Deployment complete on $NETWORK"
-printf '\n'
-printf '  %-16s %s\n' "schema-registry:" "$REGISTRY_ID"
-printf '  %-16s %s\n' "sas:" "$SAS_ID"
-printf '  %-16s %s\n' "indexer:" "$INDEXER_ID"
-printf '  %-16s %s\n' "admin:" "$ADMIN_ADDRESS"
-printf '  %-16s %s\n' "network:" "$NETWORK ($RPC_URL)"
-printf '\n'
-info "results written to $ENV_FILE (key names match .env.example)"
-info "next step: source $ENV_FILE and use soroban-sas-cli against these contracts,"
-info "e.g.: cargo run -p soroban-sas-cli -- schema register ..."
+if [[ "$JSON_OUTPUT" == true ]]; then
+    printf '{\n'
+    printf '  "network": "%s",\n' "$NETWORK"
+    printf '  "rpcUrl": "%s",\n' "$RPC_URL"
+    printf '  "networkPassphrase": "%s",\n' "$PASSPHRASE"
+    printf '  "admin": "%s",\n' "$ADMIN_ADDRESS"
+    printf '  "contracts": {\n'
+    printf '    "schemaRegistry": "%s",\n' "$REGISTRY_ID"
+    printf '    "sas": "%s",\n' "$SAS_ID"
+    printf '    "indexer": "%s"\n' "$INDEXER_ID"
+    printf '  },\n'
+    printf '  "wasmSha256": {\n'
+    printf '    "schemaRegistry": "%s",\n' "$(sha256sum "$WASM_REGISTRY" | cut -d' ' -f1)"
+    printf '    "sas": "%s",\n' "$(sha256sum "$WASM_SAS" | cut -d' ' -f1)"
+    printf '    "indexer": "%s"\n' "$(sha256sum "$WASM_INDEXER" | cut -d' ' -f1)"
+    printf '  },\n'
+    printf '  "envFile": "%s",\n' "$ENV_FILE_ABS"
+    printf '  "activationCommand": "source %s"\n' "$ENV_FILE"
+    printf '}\n'
+else
+    step "Deployment complete on $NETWORK"
+    printf '\n'
+    printf '  %-16s %s\n' "schema-registry:" "$REGISTRY_ID"
+    printf '  %-16s %s\n' "sas:" "$SAS_ID"
+    printf '  %-16s %s\n' "indexer:" "$INDEXER_ID"
+    printf '  %-16s %s\n' "admin:" "$ADMIN_ADDRESS"
+    printf '  %-16s %s\n' "network:" "$NETWORK ($RPC_URL)"
+    printf '\n'
+fi
 
+info "results written to: $ENV_FILE_ABS (key names match .env.example)"
+info "this script cannot export variables into your shell — activate the"
+info "deployment yourself by running:"
+info ""
+info "    source $ENV_FILE"
+info ""
+info "next step: use soroban-sas-cli against these contracts,"

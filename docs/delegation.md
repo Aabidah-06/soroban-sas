@@ -1,0 +1,488 @@
+# Delegated Issuance, Revocation, and Replacement
+
+Delegation lets an issuer authorize an attestation or revocation with an
+off-chain ed25519 signature, then let another account submit and pay for the
+transaction. Replacement can also require a recipient counter-signature.
+This keeps signing keys out of an online relayer. For
+example, an issuer can sign with a hardware-backed or offline key and hand the
+resulting JSON to an online service for submission.
+
+The relayer does not become the attester and does not need to control the
+attester account. Its secret seed only authorizes and funds the transaction.
+The SAS contract authenticates the requested action from the issuer's signed
+payload.
+
+This guide describes delegated on-chain issuance, revocation, and replacement. For the
+underlying off-chain attestation format and its stable byte layout, see
+[Off-Chain Attestations](offchain-attestations.md).
+
+## Delegated attestation flow
+
+`attest_by_delegation` receives an `Attestation`, a `u64` nonce, a 64-byte
+signature, and a 32-byte public key. The contract:
+
+1. Requires `revocation_time` to be zero.
+2. Binds the supplied public key to `attestation.attester`. For a classic
+   ed25519 account, the key must match the account address structurally. The
+   contract also accepts the current non-revoked key stored by
+   `register_attester_key` or `rotate_attester_key`. When the schema declares a
+   FROST group, only that group public key is accepted instead — see
+   [Threshold endorsement with FROST](#threshold-endorsement-with-frost).
+3. Constructs the signed `AttestationDomain` from the current network ID, the
+   current SAS contract address, and the supplied nonce.
+4. Hashes the domain together with the signed attestation fields and verifies
+   the ed25519 signature.
+5. Consumes the nonce for the attester.
+6. Runs the normal attestation validation and storage path.
+
+The signed attestation fields are `uid`, `schema_uid`, `time`,
+`expiration_time`, `ref_uid`, `recipient`, `attester`, `revocable`, and the
+SHA-256 hash of `data`. `revocation_time` is deliberately excluded because the
+contract mutates it when an attestation is revoked. A signature is therefore
+bound to the attestation content, network, SAS contract, and nonce.
+
+The entrypoint does not call `require_auth` on the attester or require the
+transaction source to equal the attester. Any funded relayer can submit a valid
+signed payload.
+
+## Delegated revocation flow
+
+`revoke_by_delegation` receives an attestation UID, nonce, signature, and
+public key. It first loads the recorded attestation. The contract uses that
+record's `attester` for both the public-key binding and the signed revocation
+body, so a caller cannot substitute a different issuer.
+
+Revocation uses the same `AttestationDomain` model—current network ID, current
+SAS contract address, and nonce—but hashes a body containing the UID and
+recorded attester under `DELEGATED_REVOCATION_TYPE_TAG`. That tag is distinct
+from `ATTESTATION_TYPE_TAG`, and the two actions use different hash layouts.
+Consequently, a signature created for an attestation cannot authorize a
+revocation, or vice versa.After signature verification, the contract consumes the nonce for the recorded
+attester and runs the normal revocation checks. The attestation must exist, be
+revocable, and not already be revoked.
+
+## Threshold endorsement with FROST
+
+Consortiums and decentralized identity groups often need several independent
+signing nodes to endorse one attestation. A schema can require a
+[FROST](https://datatracker.ietf.org/doc/draft-irtf-cfrg-frost/) threshold group
+instead of a single attester key:
+
+```rust
+// Schema owner or registry admin declares a 2-of-3 group.
+registry.set_schema_frost_group(
+    &owner,
+    &schema_uid,
+    &FrostGroup {
+        group_public_key, // aggregated Ed25519 key produced by the DKG
+        threshold: 2,
+        max_signers: 3,
+    },
+);
+```
+
+The group is stored beside the schema record (`get_schema_frost_group`), so the
+on-chain `SchemaRecord` layout is unchanged. Declaring or rotating a group emits
+`SchemaFrostGroupUpdated`; `clear_schema_frost_group` restores the ordinary
+single-key behaviour. Only a schema owner (creator or configured owner-set
+member) or the registry admin may change it.
+
+Once declared, every delegated path verifies against the group key and ignores
+the attester account key and any `register_attester_key` record for that schema:
+
+- `attest_by_delegation` and `multi_attest_by_delegation`
+- `revoke_by_delegation` and `multi_revoke_by_delegation`
+- `verify_offchain_attestation`
+
+A submitted public key that is not the declared group key fails with
+`SASError::Unauthorized`. There is no separate threshold argument: FROST
+aggregation outputs one ordinary 64-byte Ed25519 signature, so the call's
+calldata stays identical to a single-signer delegated attestation.
+
+Verification is plain Ed25519: `R || s` is checked against
+`A = group_public_key` over the usual SAS delegated digest. A ceremony that
+combined fewer than `threshold` shares does not produce a valid signature under
+`A`, so under-threshold aggregates fail the same way any bad signature does. The
+contract makes exactly one `ed25519_verify` call, the same cost as the
+single-key path; the `threshold`/`max_signers` metadata is advisory for clients
+and indexers.
+
+The group public key must be produced by a DKG (or a trusted dealer for test
+environments) so no single participant knows the group secret. Rotating the
+schema's group key immediately invalidates signatures made under the previous
+key. Test vectors for 2-of-3 and 3-of-5 groups live in
+`packages/soroban-sas-common/test_vectors/frost_threshold.tsv`.
+
+The direct (non-delegated) entry points `attest`, `multi_attest`,
+`attest_with_value`, and `replace_attestation` remain authorized by the
+attester address's own `require_auth`; a FROST declaration governs the
+*off-chain endorsement* paths. Consortiums that also want to gate direct
+issuance should make `attestation.attester` an address they control jointly
+(for example a contract or multisig account).
+
+## Delegated replacement with recipient consent
+
+`replace_by_delegation_consent` accepts an old UID, a complete replacement
+`Attestation`, and one `ReplacementApproval` from each party. Each approval
+contains a nonce, Ed25519 public key, and signature. The shorter name is required by Soroban's
+32-character contract function limit. The relayer pays for the transaction.
+
+Both parties sign the same SHA-256 digest:
+
+```text
+SorobanSAS DelegatedReplacementConsent v1(network_id,contract,attester_nonce,recipient_nonce,old_uid,new_attestation)
+|| network_id (32 bytes)
+|| contract (ScVal XDR)
+|| attester_nonce (u64 big-endian)
+|| recipient_nonce (u64 big-endian)
+|| old_uid (32 bytes)
+|| hash_attestation_struct(new_attestation) (32 bytes)
+```
+
+Use `hash_delegated_replacement_consent` and `ReplacementConsentDomain` from
+`soroban-sas-common` to construct this digest. The replacement hash binds the
+UID, schema, time, expiration, reference UID, recipient, attester, revocability,
+and SHA-256 of data. Like delegated issuance, `revocation_time` is excluded;
+the replacement must have zero revocation time. Both signatures bind both
+nonces, the old UID, and the full new claim. The contract checks each public
+key against its party's account address or that party's registered key.
+
+The attester nonce uses the same high-watermark as delegated issuance and
+revocation. Recipient consent has an independent high-watermark, readable via
+`get_recipient_consent_nonce(recipient)`. Each supplied nonce must exceed its
+stored value. The contract verifies both signatures and consumes both nonces
+in one atomic invocation, then uses the normal replacement path to revoke the
+old claim, issue the linked replacement, and notify the indexer. A failed
+signature, nonce check, or replacement rolls back both nonces and all state.
+
+Recipient consent only applies to this entrypoint; `replace_attestation`
+continues to support the existing direct attester-authorized path.
+
+## Batch delegation
+
+Issuers that produce many signatures (for example an offline job that signs a
+day's worth of claims) can hand a relayer a single batch call instead of one
+call per signature. `multi_attest_by_delegation` and
+`multi_revoke_by_delegation` mirror `multi_attest` and `multi_revoke`, which
+already batch the direct paths.
+
+Both entry points take four parallel vectors, which must all have the same
+length:
+
+- `multi_attest_by_delegation(attestations, nonces, signatures, public_keys)`
+- `multi_revoke_by_delegation(uids, nonces, signatures, public_keys)`
+
+`multi_attest_by_delegation` accepts at most `MAX_MULTI_ATTEST` (100) items and
+`multi_revoke_by_delegation` at most `MAX_MULTI_REVOKE` (100); a larger batch
+fails with `SASError::BatchTooLarge` before any signature is verified or state
+is written. A length mismatch fails with `SASError::InvalidValue`.
+
+Each item is verified and authorized independently: it carries its own nonce,
+signature, and public key, so one transaction can relay signatures produced by
+several different attesters. The per-attester nonce high-watermark described
+below is unchanged — within one batch, items for the same attester must appear
+in strictly increasing nonce order, exactly as if they were submitted one call
+at a time. `multi_revoke_by_delegation` additionally rejects duplicate UIDs in
+a batch with `SASError::DuplicateAttestation`, and checks each signature
+against the *recorded* attester of that attestation, never a caller-supplied
+one.
+
+A Soroban invocation is atomic, so a failure on any item reverts the whole
+batch: no attestation is issued, no revocation is written, and no nonce is
+consumed. The batch's `BatchAttested` / `BatchRevoked` summary event is emitted
+only after every per-item event, so a consumer that sees the summary knows the
+whole batch committed.
+
+The Rust SDK's `delegation::DelegatedBatchSigner` can create batch signatures
+without an RPC client or network connection. It uses the same typed-data
+digest helper as contract verification and checks batch length, strictly
+increasing nonces, signer-to-attester binding, attestation UID, revocation
+timestamp, and payload size locally. Its `DelegatedBatchSignaturePacket`
+contains the matching attestations and parallel nonce, signature, public-key,
+and digest vectors, which can be passed to
+`SASClient::multi_attest_by_delegation`. `to_json` exports an offline relay
+packet with attestations as hex-encoded XDR and the signature material as
+lowercase hex.
+
+## Nonce model and limitations
+
+Delegated attestations and delegated revocations share one per-attester `u64`
+high-watermark. The highest consumed value is stored in contract instance
+storage under the typed `DelegationNonceKey { attester }` representation. The
+same watermark is shared by delegated attestation and delegated revocation
+flows. A delegated operation is accepted only when `nonce > last_nonce`;
+otherwise it fails with
+`SASError::DelegationReplay` (code `303`). On the first operation for an
+attester, no watermark exists; issuers should start their increasing sequence
+at `1`.
+
+For example, after nonce `5` succeeds, nonce `5` and every value below `5`
+fail. Nonce `6`, or any value greater than `5`, can succeed. If nonce `8` is
+submitted before an already-signed operation using nonce `7`, the watermark
+becomes `8` and the nonce-`7` operation can no longer succeed. Concurrent
+signers and relayers therefore need a coordinated allocator and submission
+policy; merely choosing distinct values is not sufficient when they can arrive
+out of order.
+
+Delegation activity renews the SAS contract's instance TTL, so the watermark's
+lifetime tracks contract liveness rather than a separate per-signature
+tombstone. This is not permanent storage: if the contract's instance storage
+truly expires and its prior state is not restored, the watermark can be lost or
+reset. Operators must keep the contract live and maintain its TTL. Restoring
+archived instance state should preserve that state; redeploying or
+reinitializing a contract is not a nonce-recovery mechanism and creates a
+different signing domain when the contract address changes.
+
+The contract exposes `get_delegation_nonce(attester) -> Option<u64>` for
+inspecting this state. `None` means that no delegation nonce has been consumed
+for the attester. `Some(n)` means that `n` is the current consumed
+high-watermark, so the next valid nonce must be strictly greater than `n`.
+Calling the getter also renews the contract's instance TTL.
+
+The SDK wraps the contract getter as
+`SASClient::fetch_delegation_nonce(&env, &rpc, &attester)`. Integrators should
+read the current watermark before allocating and signing a new nonce. The read
+is only a snapshot: two concurrent callers can observe the same value, and a
+higher submission can land before a lower one. Offline and concurrent signers
+must therefore still coordinate through a durable allocator rather than
+treating the getter as an atomic nonce reservation.
+
+## Issuer guidance
+
+- Use a monotonically increasing counter. Allocate each value centrally,
+  persist it before handing work to a signer or relayer, and retain the last
+  allocated and last confirmed-consumed values.
+- When several signers or relayers act for one attester, use a shared durable
+  allocator and control submission order. Remember that attestations and
+  revocations consume the same sequence.
+- Unix timestamps can be nonces only when the issuer guarantees strict
+  monotonicity. Equal timestamps, clock rollback, and a lower timestamp after a
+  higher one was submitted all cause failures.
+- Random nonces are unsafe unless the issuer knows the selected value is above
+  the current high-watermark. Uniqueness alone does not satisfy the contract's
+  ordering rule.
+- If the watermark is uncertain, first reconcile durable allocator records,
+  signed-payload inventories, and relayer receipts, and query
+  `get_delegation_nonce` (or the SDK's `fetch_delegation_nonce` wrapper). Choose
+  a value above both the on-chain high-watermark and every locally allocated
+  nonce that might still be submitted. A `DelegationReplay` response means a
+  competing operation advanced the watermark; query it again and allocate a
+  newly signed higher nonce. Avoid jumping unnecessarily close to `u64::MAX`,
+  because no greater nonce remains after that value is consumed.
+
+Nonce state is keyed by `attester`, not by public key. Registering, rotating,
+revoking, or re-registering a delegated-verification key does not reset the
+attester's watermark. A rotated or revoked registered fallback key no longer
+matches the current registered record, so signatures that depend on that
+record stop authorizing new delegated operations. However, the implementation
+accepts a key when it either structurally matches a classic ed25519 attester
+address **or** matches the current registered record. Registered-key revocation
+therefore does not act as a denylist for a key that independently passes the
+classic-account structural check.
+
+## CLI workflow
+
+Use obvious environment placeholders or a configured `--identity`; do not put
+production secret seeds in shell history. The attestation input format is the
+one documented in [Off-Chain Attestations](offchain-attestations.md#cli).
+
+Sign an attestation with the offline issuer key. The nonce is shared with the
+issuer's delegated revocations and must be above its current watermark:
+
+```sh
+cargo run -p soroban-sas-cli -- offchain sign \
+  --data-file attestation.json \
+  --secret-key "$ISSUER_SECRET_SEED" \
+  --nonce 6 \
+  --network-passphrase "$NETWORK_PASSPHRASE" \
+  --contract-id "$SAS_CONTRACT_ID" \
+  --output signed-attestation.json
+```
+
+Move only the signed JSON to the online environment, then submit it with a
+funded relayer account:
+
+```sh
+cargo run -p soroban-sas-cli -- delegate submit-attest \
+  --file signed-attestation.json \
+  --secret-key "$RELAYER_SECRET_SEED" \
+  --rpc-url "$SOROBAN_RPC_URL"
+```
+
+To revoke, sign an action-specific payload with a new nonce. `--attester` must
+be the recorded attester and must match the issuer signing key:
+
+```sh
+cargo run -p soroban-sas-cli -- delegate sign-revoke \
+  --uid "$ATTESTATION_UID_HEX" \
+  --attester "$ATTESTER_ADDRESS" \
+  --nonce 7 \
+  --network-passphrase "$NETWORK_PASSPHRASE" \
+  --contract-id "$SAS_CONTRACT_ID" \
+  --secret-key "$ISSUER_SECRET_SEED" \
+  --output signed-revocation.json
+```
+
+Submit the signed revocation through the relayer:
+
+```sh
+cargo run -p soroban-sas-cli -- delegate submit-revoke \
+  --file signed-revocation.json \
+  --secret-key "$RELAYER_SECRET_SEED" \
+  --rpc-url "$SOROBAN_RPC_URL"
+```
+
+`submit-attest` and `submit-revoke` use the network passphrase and contract ID
+embedded in the signed file. The offline signer should verify those values
+before signing, and the relayer should treat signed files as security-sensitive
+input.
+
+## Rust SDK submission
+
+The SDK exposes `AttestationRequestBuilder` through its
+`attestation_builder` module; it is not re-exported at the crate root. The
+builder derives the content-addressed UID and initializes `time` and
+`revocation_time` consistently with the current contract. This example also
+reads the current nonce high-watermark through the SDK before submitting:
+
+```rust,no_run
+use soroban_sas_sdk::attestation_builder::AttestationRequestBuilder;
+use soroban_sas_sdk::{client::SASClient, rpc::RpcClient};
+use soroban_sdk::{Bytes, Env};
+
+let env = Env::default();
+let rpc = RpcClient::new("https://example.invalid");
+let client = SASClient::new("C...SAS_CONTRACT".to_string());
+
+// Load real strkey addresses from trusted configuration.
+let recipient = std::env::var("RECIPIENT").expect("RECIPIENT is required");
+let attester = std::env::var("ATTESTER").expect("ATTESTER is required");
+let attestation = AttestationRequestBuilder::new()
+    .with_schema_uid([2_u8; 32])
+    .with_recipient(&recipient)
+    .with_attester(&attester)
+    .with_data(Bytes::from_slice(&env, b"example payload"))
+    .with_expiration(0)
+    .with_revocable(true)
+    .with_ref_uid([0_u8; 32])
+    .build(&env)?;
+
+// This simple next-value calculation assumes one coordinated allocator.
+// Persist the allocation before sending the nonce to an offline signer.
+let watermark = client.fetch_delegation_nonce(&env, &rpc, &attestation.attester)?;
+let nonce = watermark
+    .unwrap_or(0)
+    .checked_add(1)
+    .expect("delegation nonce space exhausted");
+
+// These values must be loaded securely and must contain the issuer's
+// signature over this exact attestation and nonce.
+let signature: [u8; 64] = /* decoded issuer signature */ [0_u8; 64];
+let public_key: [u8; 32] = /* issuer ed25519 public key */ [0_u8; 32];
+let relayer_secret_seed: [u8; 32] = /* loaded securely */ [0_u8; 32];
+
+let result = client.attest_by_delegation(
+    &env,
+    &rpc,
+    "Test SDF Network ; September 2015",
+    &relayer_secret_seed,
+    attestation,
+    nonce,
+    &signature,
+    &public_key,
+)?;
+# Ok::<(), soroban_sas_sdk::errors::SdkError>(())
+```
+
+The fixed schema UID and zero-filled key/signature arrays above are explicit
+placeholders, not valid production values. The built attestation, allocated
+nonce, signature, public key, network passphrase, and contract ID must all
+correspond to the same signed payload. Reading the watermark and submitting an
+operation are separate calls, so production allocators must handle concurrent
+advances between them.
+
+For revocation, supply the UID bytes and an action-specific revocation
+signature created with a new nonce:
+
+```rust,no_run
+# use soroban_sas_sdk::{client::SASClient, rpc::RpcClient};
+# use soroban_sdk::Env;
+# let env = Env::default();
+# let rpc = RpcClient::new("https://example.invalid");
+# let client = SASClient::new("C...SAS_CONTRACT".to_string());
+# let relayer_secret_seed = [0_u8; 32];
+# let public_key = [0_u8; 32];
+let uid: [u8; 32] = [1_u8; 32];
+let nonce: u64 = 7;
+let revocation_signature: [u8; 64] = [0_u8; 64];
+
+let result = client.revoke_by_delegation(
+    &env,
+    &rpc,
+    "Test SDF Network ; September 2015",
+    &relayer_secret_seed,
+    &uid,
+    nonce,
+    &revocation_signature,
+    &public_key,
+)?;
+# Ok::<(), soroban_sas_sdk::errors::SdkError>(())
+```
+
+These SDK methods submit already-signed operations; they do not allocate a
+nonce. They do, however, take an already-created issuer signature, and the SDK
+can produce that signature too.
+
+Since a batch is submitted with the same four parallel vectors the contract
+takes, use `SASClient::multi_attest_by_delegation` /
+`SASClient::multi_revoke_by_delegation` for the batched forms.
+
+### Producing the signature from the SDK
+
+The `soroban_sas_sdk::delegation` module signs with the same
+`soroban_sas_common` hashing the contract verifies against, so a wallet or
+offline signer does not need the CLI or a second implementation of the
+byte layout:
+
+```rust,no_run
+use soroban_sas_sdk::delegation::{
+    delegation_domain, sign_delegated_revocation, sign_offchain_attestation,
+    verify_offchain_attestation,
+};
+# use soroban_sas_common::{Attestation, UID};
+# use soroban_sdk::Env;
+# fn example(
+#     env: &Env,
+#     attestation: &Attestation,
+#     uid: &UID,
+# ) -> Result<(), soroban_sas_sdk::errors::SdkError> {
+let issuer_seed: [u8; 32] = /* loaded securely */ [0_u8; 32];
+let network = "Test SDF Network ; September 2015";
+let contract_id = "C...SAS_CONTRACT";
+
+// Attestation: signs the full payload plus network, contract, and nonce.
+let signed = sign_offchain_attestation(env, &issuer_seed, attestation, 1, network, contract_id)?;
+let domain = delegation_domain(env, network, contract_id, signed.nonce)?;
+verify_offchain_attestation(env, attestation, &domain, &signed.public_key, &signed.signature)?;
+
+// Revocation: signs the UID and the recorded attester instead.
+let signed_revocation = sign_delegated_revocation(
+    env,
+    &issuer_seed,
+    uid,
+    &attestation.attester,
+    2,
+    network,
+    contract_id,
+)?;
+# let _ = signed_revocation;
+# Ok(())
+# }
+```
+
+`sign_offchain_attestation` and `sign_delegated_revocation` return a
+`DelegationSignature { nonce, public_key, signature, digest }`. Feed
+`public_key`, `signature`, and `nonce` to the matching submission helper (or to
+a `multi_*_by_delegation` call as single-element slices). Both reject a key
+that is not the declared attester with `SdkError::ValidationError` instead of
+producing a signature the contract would refuse.

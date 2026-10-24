@@ -1,8 +1,15 @@
 use soroban_sas_common::{
-    events::{ATTESTED, NONCES_INVALIDATED, REVOKED},
-    Attestation, AttestationIssuedEvent, AttestationRevokedEvent, NoncesInvalidatedEvent, UID,
+    events::{
+        ADMIN_TRANSFER_COMPLETED, ADMIN_TRANSFER_PROPOSED, ATTESTATION_RENEWED, ATTESTED,
+        BATCH_ATTESTED, BATCH_REVOKED, CONTRACT_PAUSED, CONTRACT_UNPAUSED, CONTRACT_UPGRADED,
+        INDEXER_STRICT_UPDATED, INDEXER_UPDATED, NONCES_INVALIDATED, REVOKED,
+    },
+    AdminTransferCompletedEvent, AdminTransferProposedEvent, Attestation, AttestationIssuedEvent,
+    AttestationRenewedEvent, AttestationRevokedEvent, BatchAttestedEvent, BatchRevokedEvent,
+    ContractPausedEvent, ContractUnpausedEvent, ContractUpgradedEvent, IndexerStrictUpdatedEvent,
+    IndexerUpdatedEvent, NoncesInvalidatedEvent, UID,
 };
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{symbol_short, Address, Env};
 
 /// Publishes the `AttestationIssued` event.
 ///
@@ -38,7 +45,215 @@ pub fn publish_revoked(env: &Env, uid: &UID, timestamp: u64) {
     );
 }
 
-/// Publishes the `NoncesInvalidated` event (#437).
+/// Publishes the `IndexerUpdated` event.
+///
+/// Topics: `(INDEXER_UPDATED, authorizer)`. Called only after
+/// `set_indexer` has already written the new binding to instance storage,
+/// so a failed or unauthorized call never emits this event.
+pub fn publish_indexer_updated(
+    env: &Env,
+    old_indexer: Option<Address>,
+    new_indexer: Address,
+    authorizer: Address,
+) {
+    env.events().publish(
+        (INDEXER_UPDATED, authorizer.clone()),
+        IndexerUpdatedEvent {
+            old_indexer: old_indexer.into(),
+            new_indexer,
+            authorizer,
+        },
+    );
+}
+
+/// Publishes the `IndexerStrictUpdated` event.
+///
+/// Topics: `(INDEXER_STRICT_UPDATED, admin)`. Called only after
+/// `set_indexer_strict` has already written the new policy to instance
+/// storage, so a failed or unauthorized call never emits this event.
+pub fn publish_indexer_strict_updated(
+    env: &Env,
+    old_strict: bool,
+    new_strict: bool,
+    admin: Address,
+) {
+    env.events().publish(
+        (INDEXER_STRICT_UPDATED, admin.clone()),
+        IndexerStrictUpdatedEvent {
+            old_strict,
+            new_strict,
+            admin,
+        },
+    );
+}
+
+/// Publishes the upgrade success event as the final operation before the
+/// caller requests the WASM swap.
+pub fn publish_contract_upgraded(env: &Env, event: ContractUpgradedEvent) {
+    env.events()
+        .publish((CONTRACT_UPGRADED, event.authorizer.clone()), event);
+}
+
+/// Publishes `IndexFailed` when a bound Indexer could not be notified of a
+/// newly issued attestation under the fail-open policy (#161).
+///
+/// Topic: `(IDXFAIL, uid)`. The data payload repeats `uid` so consumers that
+/// only read data still get it.
+pub fn publish_index_failed(env: &Env, uid: &UID) {
+    env.events()
+        .publish((symbol_short!("IDXFAIL"), uid.clone()), uid.clone());
+}
+
+/// Publishes `Reindexed` after `reindex_attestation` replays a
+/// previously-missed attestation to the Indexer (#161).
+///
+/// Topic: `(REINDEX, uid)`.
+pub fn publish_reindexed(env: &Env, uid: &UID) {
+    env.events()
+        .publish((symbol_short!("REINDEX"), uid.clone()), uid.clone());
+}
+
+/// Publishes the `BatchAttested` summary event marking the end of a
+/// successful `multi_attest` call. Must be called only after every per-item
+/// `AttestationIssued` event for the batch has already been published, and
+/// only on the batch's success path — never on a reverted call (#213).
+///
+/// Topics: `(BATCH_ATTESTED,)`.
+pub fn publish_batch_attested(env: &Env, count: u32, attester_count: u32) {
+    env.events().publish(
+        (BATCH_ATTESTED,),
+        BatchAttestedEvent {
+            count,
+            attester_count,
+        },
+    );
+}
+
+/// Publishes the `BatchRevoked` summary event marking the end of a
+/// successful `multi_revoke` call, after every per-item `AttestationRevoked`
+/// event for the batch. See `publish_batch_attested` for the shared
+/// ordering/failure-path guarantees.
+///
+/// Topics: `(BATCH_REVOKED,)`.
+pub fn publish_batch_revoked(env: &Env, count: u32, attester_count: u32) {
+    env.events().publish(
+        (BATCH_REVOKED,),
+        BatchRevokedEvent {
+            count,
+            attester_count,
+        },
+    );
+}
+
+pub fn publish_withdrawal(
+    env: &Env,
+    token: &Address,
+    amount: i128,
+    destination: &Address,
+    authorizer: &Address,
+) {
+    env.events().publish(
+        (symbol_short!("WITHDRAW"), token.clone(), authorizer.clone()),
+        (
+            amount,
+            destination.clone(),
+            token.clone(),
+            authorizer.clone(),
+        ),
+    );
+}
+
+/// Publishes the `AdminTransferProposed` event.
+///
+/// Topics: `(ADMIN_TRANSFER_PROPOSED, current_admin)`.
+pub fn publish_admin_transfer_proposed(
+    env: &Env,
+    current_admin: &Address,
+    proposed_admin: &Address,
+) {
+    env.events().publish(
+        (ADMIN_TRANSFER_PROPOSED, current_admin.clone()),
+        AdminTransferProposedEvent {
+            current_admin: current_admin.clone(),
+            proposed_admin: proposed_admin.clone(),
+        },
+    );
+}
+
+/// Publishes the `AdminTransferCompleted` event.
+///
+/// Topics: `(ADMIN_TRANSFER_COMPLETED, old_admin)`.
+pub fn publish_admin_transfer_completed(env: &Env, old_admin: &Address, new_admin: &Address) {
+    env.events().publish(
+        (ADMIN_TRANSFER_COMPLETED, old_admin.clone()),
+        AdminTransferCompletedEvent {
+            old_admin: old_admin.clone(),
+            new_admin: new_admin.clone(),
+        },
+    );
+}
+
+/// Publishes the fee change immediately after its storage mutation.
+pub fn publish_fee_config_updated(
+    env: &Env,
+    old: Option<(Address, i128)>,
+    new: Option<(Address, i128)>,
+    authorizer: Address,
+) {
+    use soroban_sas_common::{FeeConfigUpdatedEvent, FEECFG_UPDATED};
+    env.events().publish(
+        (FEECFG_UPDATED, authorizer.clone()),
+        FeeConfigUpdatedEvent {
+            old_token: old.as_ref().map(|(token, _)| token.clone()).into(),
+            old_amount: old.map(|(_, amount)| amount),
+            new_token: new.as_ref().map(|(token, _)| token.clone()).into(),
+            new_amount: new.map(|(_, amount)| amount),
+            authorizer,
+        },
+    );
+}
+
+/// Publishes the `ContractPaused` event when the contract is paused.
+///
+/// Topics: `(CONTRACT_PAUSED, authorizer)`.
+pub fn publish_contract_paused(env: &Env, authorizer: Address) {
+    env.events().publish(
+        (CONTRACT_PAUSED, authorizer.clone()),
+        ContractPausedEvent { authorizer },
+    );
+}
+
+/// Publishes the `ContractUnpaused` event when the contract is unpaused.
+///
+/// Topics: `(CONTRACT_UNPAUSED, authorizer)`.
+pub fn publish_contract_unpaused(env: &Env, authorizer: Address) {
+    env.events().publish(
+        (CONTRACT_UNPAUSED, authorizer.clone()),
+        ContractUnpausedEvent { authorizer },
+    );
+}
+
+/// Publishes the `AttestationRenewed` event when an attestation's expiration
+/// time is extended via `SAS::renew_attestation`.
+///
+/// Topics: `(ATTESTATION_RENEWED, uid, attester)`.
+pub fn publish_attestation_renewed(
+    env: &Env,
+    uid: &UID,
+    attester: &Address,
+    new_expiration_time: u64,
+) {
+    let event = AttestationRenewedEvent {
+        uid: uid.clone(),
+        attester: attester.clone(),
+        new_expiration_time,
+    };
+    env.events()
+        .publish((ATTESTATION_RENEWED, uid.clone(), attester.clone()), event);
+}
+
+/// Publishes the `NoncesInvalidated` event when an attester advances their
+/// nonce high-water mark (#437).
 ///
 /// Topics: `(NONCES_INVALIDATED, attester)`. `min_nonce`/`max_nonce` describe
 /// the inclusive range of delegation nonces cancelled by the watermark advance.

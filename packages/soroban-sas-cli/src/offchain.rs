@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use soroban_sas_common::{
     hash_delegated_revocation, hash_offchain_attestation, Attestation, AttestationDomain, UID,
 };
-use soroban_sdk::{Address, Bytes, BytesN, Env, String as SorobanString};
+use soroban_sas_sdk::strkey::{parse_address, AddressKind};
+use soroban_sdk::{Address, Bytes, BytesN, Env};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationInput {
@@ -30,6 +31,9 @@ pub struct AttestationInput {
     /// Arbitrary attestation data, hex encoded (may be empty).
     #[serde(default)]
     pub data: String,
+    /// Activation timestamp in Unix seconds; 0 means valid immediately upon issuance (#439).
+    #[serde(default)]
+    pub valid_from: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,36 +77,84 @@ pub fn parse_attestation(env: &Env, input: &AttestationInput) -> Result<Attestat
             env,
             &decode_hex32("ref_uid", &input.ref_uid)?,
         )),
-        recipient: Address::from_string(&SorobanString::from_str(env, &input.recipient)),
-        attester: Address::from_string(&SorobanString::from_str(env, &input.attester)),
+        recipient: parse_address(env, &input.recipient, AddressKind::Either, "recipient")
+            .map_err(|e| e.to_string())?,
+        attester: parse_address(env, &input.attester, AddressKind::Either, "attester")
+            .map_err(|e| e.to_string())?,
         revocable: input.revocable,
         data: Bytes::from_slice(env, &data),
+        valid_from: input.valid_from,
     })
 }
 
-/// Derives a fresh 32-byte UID for a new attestation from its content plus
-/// `entropy` (the issuing call's timestamp in nanoseconds), so the CLI's
+/// Rejects, before any RPC call, an attestation SAS would refuse to issue
+/// because it has no usable recipient (#304): the zero-address "no
+/// recipient" sentinel, or the attester naming itself. Delegates to
+/// [`soroban_sas_common::validate_attestation_parties`], the same rule
+/// `SAS::attest_internal` enforces, so the CLI can never disagree with the
+/// contract about what counts as a missing recipient.
+///
+/// Only on-chain issuance paths call this. Off-chain signing/verification
+/// does not, because `SAS::verify_offchain_attestation` places no
+/// constraint on the recipient.
+pub fn validate_onchain_parties(env: &Env, attestation: &Attestation) -> Result<(), String> {
+    check_onchain_parties(env, &attestation.recipient, &attestation.attester)
+}
+
+/// Parses `recipient`/`attester` strkeys and applies
+/// [`validate_onchain_parties`]'s rule, for callers that have not built an
+/// `Attestation` yet.
+pub fn validate_onchain_recipient(
+    env: &Env,
+    recipient: &str,
+    attester: &str,
+) -> Result<(), String> {
+    let recipient = parse_address(env, recipient, AddressKind::Either, "recipient")
+        .map_err(|e| e.to_string())?;
+    let attester =
+        parse_address(env, attester, AddressKind::Either, "attester").map_err(|e| e.to_string())?;
+    check_onchain_parties(env, &recipient, &attester)
+}
+
+fn check_onchain_parties(env: &Env, recipient: &Address, attester: &Address) -> Result<(), String> {
+    let Err(err) = soroban_sas_common::validate_attestation_parties(env, recipient, attester)
+    else {
+        return Ok(());
+    };
+    let reason = if soroban_sas_common::validate_recipient(env, recipient).is_err() {
+        "recipient is missing: the zero-address \"no recipient\" sentinel cannot be \
+         attested on-chain; pass a concrete G... or C... recipient"
+    } else if recipient == attester {
+        "recipient must differ from the attester"
+    } else {
+        "attester is the zero-address sentinel"
+    };
+    Err(format!("{reason} (SASError::{err:?}, code {})", err as u32))
+}
+
+/// Derives the content-addressed UID for a new attestation, so the CLI's
 /// `attest attest` subcommand can issue an attestation without requiring the
-/// caller to pick a UID by hand. Not a content hash in the cryptographic
-/// sense — `entropy` exists purely so two attestations with identical
-/// content don't collide.
+/// caller to pick a UID by hand. Delegates to
+/// [`soroban_sas_common::attestation_uid`], the same hash the SAS contract
+/// validates `Attestation.uid` against on issuance — see #215.
 pub fn generate_uid(
     env: &Env,
     schema_uid: &[u8; 32],
     recipient: &str,
     attester: &str,
     data: &[u8],
-    entropy: u128,
-) -> [u8; 32] {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(schema_uid);
-    buf.extend_from_slice(recipient.as_bytes());
-    buf.extend_from_slice(attester.as_bytes());
-    buf.extend_from_slice(data);
-    buf.extend_from_slice(&entropy.to_be_bytes());
-    env.crypto()
-        .sha256(&Bytes::from_slice(env, &buf))
-        .to_array()
+) -> Result<[u8; 32], String> {
+    let schema_uid = UID(BytesN::from_array(env, schema_uid));
+    let recipient = parse_address(env, recipient, AddressKind::Either, "recipient")
+        .map_err(|e| e.to_string())?;
+    let attester =
+        parse_address(env, attester, AddressKind::Either, "attester").map_err(|e| e.to_string())?;
+    let data = Bytes::from_slice(env, data);
+    Ok(
+        soroban_sas_common::attestation_uid(env, &schema_uid, &recipient, &attester, &data)
+            .0
+            .to_array(),
+    )
 }
 
 /// Computes the payload digest for `input` bound to the given network
@@ -119,8 +171,9 @@ pub fn compute_payload_hash(
         .crypto()
         .sha256(&Bytes::from_slice(&env, network_passphrase.as_bytes()));
     let domain = AttestationDomain {
-        network_id,
-        contract: Address::from_string(&SorobanString::from_str(&env, contract_id)),
+        network_id: network_id.into(),
+        contract: parse_address(&env, contract_id, AddressKind::Contract, "contract_id")
+            .map_err(|e| e.to_string())?,
         nonce,
     };
     let hash: BytesN<32> = hash_offchain_attestation(&env, &attestation, &domain);
@@ -234,13 +287,15 @@ pub fn sign_delegated_revocation(
 
     let env = Env::default();
     let uid = UID(BytesN::from_array(&env, &decode_hex32("uid", uid_hex)?));
-    let attester_address = Address::from_string(&SorobanString::from_str(&env, attester));
+    let attester_address = parse_address(&env, attester, AddressKind::Either, "attester")
+        .map_err(|e| e.to_string())?;
     let network_id = env
         .crypto()
         .sha256(&Bytes::from_slice(&env, network_passphrase.as_bytes()));
     let domain = AttestationDomain {
-        network_id,
-        contract: Address::from_string(&SorobanString::from_str(&env, contract_id)),
+        network_id: network_id.into(),
+        contract: parse_address(&env, contract_id, AddressKind::Contract, "contract_id")
+            .map_err(|e| e.to_string())?,
         nonce,
     };
     let payload_hash = hash_delegated_revocation(&env, &uid, &attester_address, &domain);

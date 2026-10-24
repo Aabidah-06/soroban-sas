@@ -16,7 +16,7 @@ The primary goal is to offer a seamless and intuitive user experience:
 ## Example Use Cases
 
 - **Decentralized Identity (DID)**: Issue proofs of personhood or identity verification.
-- **DeFi Compliance**: Attach KYC/AML attestations to accounts for permissioned liquidity pools.
+- `DeFi Compliance`**: Attach KYC/AML attestations to accounts for permissioned liquidity pools.
 - **DAO Governance**: Issue reputation scores or contribution attestations to weight voting power.
 - **Social Networks**: Create a web of trust with user-issued endorsements and social graphs.
 
@@ -27,6 +27,8 @@ For an in-depth look at how state is managed, the interactions between various s
 ## Security and Threat Mitigation
 
 Details about our security perimeter, administrative capabilities, and known vulnerabilities can be found in the [Security Assumptions and Threat Model](docs/security.md) guide.
+
+Dependency security checks and indexer fuzzing commands are described in [Contributing](CONTRIBUTING.md).
 
 ## Project Status
 
@@ -54,13 +56,31 @@ The workspace has evolved beyond initial mocks and now includes comprehensive do
   - Associates individual attestations with their defining schemas.
   - Records the core attestation payload along with issuer and recipient details.
   - Applies rules surrounding revocation, expiration, and any associated fees.
-  - Facilitates off-chain verification processes, akin to EIP-712 standards.
+  - Facilitates off-chain verification processes, kin to EIP-712 standards.
 
 - `contracts/indexer`
   **Role**: Provides efficient lookup and query functionalities.
   **Duties**:
   - Maintains mappings from recipient addresses to their respective attestations.
   - Maintains mappings from schemas to all associated attestations.
+  - Supports newest-first cursor pages for recipient, schema, and attester history.
+  - Answers whether a UID has been indexed with one direct record read (`is_attestation_indexed`), without walking chunks.
+
+- `contracts/cross-chain-verifier`
+  **Role**: Verifies remote attestation status updates authenticated by an Axelar GMP gateway.
+  **Duties**:
+  - Binds one remote chain and source contract at deployment.
+  - Rejects unapproved, stale or expired updates and exposes short-lived remote verdicts.
+  - Accepts versioned proof payloads carrying EVM schema, recipient, mapped Stellar address, and data.
+  - Documents its [wire format and trust limits](docs/cross-chain-verification.md).
+
+- `contracts/time-window-resolver`
+  **Role**: Enforces a minimum delay between attestations issued to the same recipient.
+  **Duties**:
+  - Records the last accepted issuance time per recipient.
+  - Rejects issuance inside the configured cooldown with `SASError::CooldownActive`.
+  - Lets the resolver admin adjust the cooldown window with authorization.
+  - Documents its [cooldown semantics and storage limits](docs/time-window-resolver.md).
 
 ### Rust Packages
 
@@ -70,54 +90,154 @@ The workspace has evolved beyond initial mocks and now includes comprehensive do
 - `packages/soroban-sas-sdk`
   A streamlined Rust Software Development Kit designed to facilitate future integrations with wallets and decentralized applications.
   It includes builders such as `SchemaBuilder` and client helpers such as
-  `SASClient::multi_attest` for batch attestation submission.
+  `SASClient::multi_attest` for batch attestation submission and
+  `SASClient::fetch_admin` for deployment and governance verification.
+  API documentation is published to GitHub Pages at
+  https://soroban-sas.github.io/soroban-sas/soroban-sas_sdk/. To build it locally:
+  ```bash
+  cargo doc -p soroban-sas-sdk --no-deps
+  ```
+  The generated HTML lands in `target/doc/soroban-sas_sdk/index.html`.
 
 ### CLI and Operations
 
-- `cli/`
+- `packages/soroban-sas-cli`
   A straightforward command-line interface for tasks such as registering new schemas, issuing claims, and revoking existing ones.
 
 - `scripts/`
   A collection of shell scripts to assist with local environment setup, contract deployment, and invocation.
 
+- `tools/schema-explorer`
+  A prototype read-only web dashboard for browsing a Schema Registry and validating draft schemas.
+  See the [Schema Explorer README](tools/schema-explorer/README.md).
+
+- `tools/prometheus-exporter`
+  A Prometheus metrics exporter that monitors SAS contract events and exposes metrics for observability.
+  See the [Prometheus Exporter README](tools/prometheus-exporter/README.md).
+- `.github_workflows/docs.yml`
+  Builds the `soroban-sas-sdk` rustdoc and deploys it to GitHub Pages on every push to `main`.
+
+- `.githooks/`
+  Opt-in `pre-commit` and `pre-push` hooks that run CI's formatting and lint checks locally.
+  Enable them with `./scripts/install_hooks.sh`.
+
 ## Command-Line Interface
 
-Most read commands support `--json` for machine-readable output; `attest attest` supports `--output human` (default) or `--output json`.
+All commands support `--output human` (default) or `--output json` for machine-readable output.
 
 Usage examples:
 
 ```bash
-cargo run -p soroban-sas-cli -- schema get --uid UID... --registry-contract-id C... --rpc-url URL --json
-cargo run -p soroban-sas-cli -- attest verify --uid UID... --contract-id C... --rpc-url URL --json
-cargo run -p soroban-sas-cli -- attest attest \
+cargo run -p soroban-sas-cli -- --output json schema get --uid UID... --registry-contract-id C... --rpc-url URL
+cargo run -p soroban-sas-cli -- --output json schema withdraw-fees --amount 1000000 \
+  --secret-key S... --network-passphrase "Test SDF Network ; September 2015" \
+  --registry-contract-id C... --rpc-url URL
+cargo run -p soroban-sas-cli -- --output json attest verify --uid UID... --contract-id C... --rpc-url URL
+cargo run -p soroban-sas-cli -- --output json attest attest \
   --schema-uid UID... --recipient G... --data 0xdeadbeef \
   --secret-key S... --network-passphrase "Test SDF Network ; September 2015" \
-  --contract-id C... --rpc-url URL --output json
-cargo run -p soroban-sas-cli -- query by-recipient --address G... --contract-id C... --rpc-url URL --json
+  --contract-id C... --rpc-url URL
+cargo run -p soroban-sas-cli -- --output json query by-recipient --address G... --contract-id C... --rpc-url URL
+cargo run -p soroban-sas-cli -- --output json query by-attester \
+  --address G... --contract-id C... --rpc-url URL
+# One page (1-100 UIDs) of a large history; follow `next_cursor` until it is null
+cargo run -p soroban-sas-cli -- --output json query by-schema \
+  --uid UID... --contract-id C... --rpc-url URL --cursor 0 --limit 50
+# Preview a whole CSV batch without submitting anything
+cargo run -p soroban-sas-cli -- --output json attest bulk \
+  --csv-file attestations.csv --contract-id C... --rpc-url URL --dry-run
+# Issue it for real
+cargo run -p soroban-sas-cli -- --output json attest bulk \
+  --csv-file attestations.csv --secret-key S... \
+  --network-passphrase "Test SDF Network ; September 2015" \
+  --contract-id C... --rpc-url URL
 ```
 
-## Shell Auto-Completion
+Without `--cursor`/`--limit`, `query by-*` returns the complete history as
+`{"uids": [...]}`, exactly as before. With either flag it returns one page:
+`{"uids", "cursor", "limit", "total", "next_cursor"}`, where `next_cursor` is
+`null` once the history is exhausted.
 
-You can generate shell completion scripts on the fly:
+`attest attest`, `attest create`, `attest replace`, and `delegate
+submit-attest` reject an attestation with no usable recipient (the zero-address
+"no recipient" sentinel, or the attester itself) before any RPC call, with the
+same `InvalidRecipient` (402) error the SAS contract would return. SAS has no
+recipient-less on-chain attestations; `offchain sign`/`verify` do not
+constrain the recipient.
 
-- **Bash**: `cargo run -p soroban-sas-cli -- completions bash > ~/.local/share/bash-completion/completions/soroban-sas`
-- **Zsh**: `cargo run -p soroban-sas-cli -- completions zsh > ~/.local/share/zsh/site-functions/_soroban-sas`
-- **Fish**: `cargo run -p soroban-sas-cli -- completions fish > ~/.config/fish/completions/soroban-sas.fish`
-
-Alternatively, have the tool install them automatically based on your current shell:
+Detailed usage and flags for every subcommand are available via:
 
 ```bash
-cargo run -p soroban-sas-cli -- completions install
+cargo run -p soroban-sas-cli -- --help
 ```
 
-Detailed usage instructions are also available via `soroban-sas --help`.
+### Shell Completions
 
-## Continuous Integration Artifacts
+Generate shell completions for tab-completing commands, subcommands, and flags:
 
-Our CI pipeline automatically compiles the contracts and generates a `soroban-contract-artifacts` package, which includes the WASM binaries and JSON specifications.
+```bash
+# Bash
+cargo run -p soroban-sas-cli -- completions bash > ~/.local/share/bash-completion/completions/sas
 
-- `tests/`
-  This directory holds shared test fixtures and frameworks for integration testing across the workspace.
+# Zsh
+cargo run -p soroban-sas-cli -- completions zsh > ~/.zfunc/_sas
+
+# Fish
+cargo run -p soroban-sas-cli -- completions fish > ~/.config/fish/completions/sas.fish
+
+# PowerShell
+cargo run -p soroban-sas-cli -- completions powershell > ./sas.ps1
+```
+
+
+## TOML Configuration File
+
+The CLI can read default RPC and network settings from a TOML configuration file.
+This avoids repeating `--rpc-url` and `--network-passphrase` on every invocation.
+
+The config file is discovered in this order:
+
+1. `$SOROBAN_SAS_CONFIG` environment variable (explicit path).
+2. `./soroban-sas.toml` in the current working directory.
+3. `$HOME/.config/soroban-sas/config.toml`.
+
+Example `soroban-sas.toml`:
+
+```toml
+default_network = "testnet"
+rpc_url = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
+```
+
+Precedence (explicit flag > environment variable > TOML default > built-in network name):
+
+1. An explicit subcommand flag (`--rpc-url`, `--network-passphrase`, `--network`).
+2. The matching environment variable (`SOROBAN_RPC_URL`, `SOROBAN_NETWORK_PASSPHRASE`).
+3. TOML configuration file defaults.
+4. Built-in network name resolution (`testnet`, `futurenet`, `mainnet`, `local`).
+
+## Delegated Issuance
+
+Delegated issuance, revocation, and consented replacement let parties sign an operation off-chain
+while a separate relayer submits and pays for the transaction. See
+[Delegated Issuance and Replacement](docs/delegation.md) for the typed-data
+domain, nonce high-watermark rules, key rotation behavior, CLI commands, and
+SDK workflow.
+
+## Local Development Network
+
+A local standalone Stellar node with Soroban RPC is available via Docker Compose using a pinned Stellar Quickstart image (`stellar/quickstart:testing@sha256:2182a7558123ff6420ea5516283616634673956530a8edf89796ebe4b58bd784`):
+
+```bash
+docker compose up -d
+./scripts/wait_for_localnet.sh
+```
+
+The health check ensures JSON-RPC is healthy and the local ledger is advancing before tests or deployment scripts run.
+
+## Continuous Integration
+
+Our CI pipeline automatically validates formatting (`cargo fmt`), executes linter checks (`cargo clippy`), runs workspace tests (`cargo test`), compiles optimized WASM artifacts (`wasm32-unknown-unknown`), and checks documentation consistency.
 
 ## Core Data Structures
 
@@ -174,13 +294,50 @@ The shared validation libraries enforce several key constraints:
 - Expiration timestamps must be explicitly provided for temporary claims.
 - Both the issuer and the recipient fields must contain valid identifiers.
 
+## SDK Usage Examples
+
+Runnable examples under `examples/` demonstrate the Rust SDK (`soroban-sas-sdk`)
+end to end. Each accepts `--dry-run` to build and print its payload without any
+network call or funded key, and prints usage with `--help`.
+
+- `examples/basic_attestation.rs` — build a single attestation, compute its
+  content-addressed UID and typed-data hash, and optionally submit it via
+  `SASClient::attest`.
+  ```bash
+  cargo run --example basic_attestation
+  ```
+- `examples/multi_attest.rs` — build a batch of attestations and submit them
+  atomically via `SASClient::multi_attest`; prints every UID in the batch and
+  reports that none were issued if the batch submission fails.
+  ```bash
+  cargo run --example multi_attest -- --dry-run
+  ```
+- `examples/delegated_attest.rs` — sign a delegated attestation's typed-data
+  hash with the attester's ed25519 key, then relay it via
+  `SASClient::attest_by_delegation` from a separate, funded relayer account
+  that never holds the attester's key.
+  ```bash
+  cargo run --example delegated_attest -- --dry-run
+  ```
+
+The SDK also runs on serverless edge runtimes. With the `wasm` feature it
+compiles to `wasm32-unknown-unknown` and talks to Soroban RPC through the
+runtime's global `fetch`, which is what the
+[Cloudflare Worker template](examples/cloudflare-worker) uses. See
+[Edge Runtimes](docs/edge-runtime.md) for the full walkthrough.
+
 ## Getting Started
+
+- **Building an app on soroban-sas?** Follow [Getting Started for DApp Developers](docs/getting-started.md):
+  register a schema, issue, verify, query and revoke an attestation.
+- **Contributing to this repository?** [Local Development Environment](docs/local-development.md)
+  covers the toolchain, tests, git hooks, a local Stellar node and local deployment.
 
 ### System Requirements
 
-- A recent stable version of the Rust toolchain.
+- A recent stable version of the Rust toolchain (pinned to `1.83.0` via `rust-toolchain.toml`).
 - WebAssembly compilation target: `rustup target add wasm32-unknown-unknown`
-- The Soroban CLI suite: `cargo install --locked soroban-cli`
+- The Stellar CLI suite: `cargo install --locked stellar-cli`
 
 ### Automated Setup (Recommended)
 
@@ -195,7 +352,7 @@ To automatically install or verify your toolchain environment, use the provided 
 Clone the repository and format the source code:
 
 ```bash
-git clone https://github.com/0xVida/soroban-sas.git
+git clone https://github.com/Soroban-Eas/soroban-sas.git
 cd soroban-sas
 cargo fmt --all
 ```
@@ -210,10 +367,41 @@ TMPDIR=/tmp cargo test --workspace
 
 ## Documentation
 
+- [Getting Started for DApp Developers](docs/getting-started.md): schema
+  design, resolvers, issuance rules, off-chain and on-chain verification,
+  indexer queries, and a security checklist.
+- [Stellar SEP-8 Regulated Assets Guide](docs/guides/sep8-regulated-assets.md): complete
+  technical walkthrough for issuing Stellar SEP-8 compliant regulated tokens with Soroban
+  smart contracts, perpetual and expiring SAS attestations, issuer revocation flows, and
+  a sample token wrapper contract.
+- [Local Development Environment](docs/local-development.md): toolchain,
+  build and test, git hooks, local network, local deployment, and
+  troubleshooting.
 - Documentation on Schema Syntax and Payloads: `docs/schemas.md`
+- [Attestation Lifecycle](docs/attestations.md): issuance, expiration,
+  revocation, and replacement semantics, including `replace_attestation`'s
+  expiration monotonicity rule.
+- [Batch Attestations (Merkle Commitments)](docs/batch-attestations.md):
+  when to use off-chain Merkle batching instead of on-chain `multi_attest`,
+  the normative leaf/node hashing rules, and a selective-disclosure example.
+- [Bulk Attestation Creation from CSV](docs/bulk-csv-attestations.md): the
+  `attest bulk` CSV format, the validate-everything-before-submitting
+  guarantee, `--dry-run`, and when to prefer Merkle batching instead.
 - [Deployment Guide](docs/DEPLOYMENT.md): build optimized WASM, deploy
   `schema-registry`, `sas` and `indexer` to Testnet (via `scripts/deploy.sh` or
-  the Stellar CLI), verify the deployment, and a Mainnet operational checklist.
+  `scripts/deploy_testnet.sh`), verify the deployment, and a Mainnet operational checklist.
+- [Edge Runtimes](docs/edge-runtime.md): build the Rust SDK for
+  `wasm32-unknown-unknown` and run it on Cloudflare Workers, Deno and other
+  serverless edge platforms, including a deployable Worker template.
+- [Soroban Mainnet Launch Preparation](docs/mainnet-launch-preparation.md): launch phases, key custody, reproducible builds, and operational runbooks.
+- [Fee Collection and Treasury Mechanics](docs/fee-collection-and-treasury.md): protocol fee configuration, treasury routing, and token withdrawals.
+- [Internationalization (i18n) and Translation Guidelines](docs/i18n-translation-guidelines.md): localization conventions, terminology glossary, and contribution guidelines.
+- [Upgrade Runbook](docs/UPGRADE_RUNBOOK.md): staged upgrade and forward-recovery procedures for `schema-registry`, `sas`, and `indexer`.
+- [Operations and Alerts Runbook](docs/OPERATIONS_AND_ALERTS_RUNBOOK.md): alert triage, incident response procedures, Alertmanager routing, and notification setup for PagerDuty and Discord.
+- [Time-Window Resolver](docs/time-window-resolver.md): enforcing minimum
+  delays between recurring attestations issued to the same recipient, with
+  cooldown boundaries, administrative updates, and storage expiry limits.
+- [Glossary of Terms](docs/glossary.md): authoritative protocol definitions for Attestation, Schema, Issuer, Resolver, UID, and lifecycle terms.
 
 ## Project Roadmap
 

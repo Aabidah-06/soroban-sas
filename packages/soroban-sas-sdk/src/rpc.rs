@@ -4,12 +4,133 @@
 //! SDK needs to submit and track transactions, sends them over HTTP via
 //! `ureq`, and parses the matching JSON-RPC responses.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Read;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::errors::SdkError;
+use crate::limits::{rpc_response_limits, DEFAULT_MAX_RESPONSE_BYTES};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use soroban_sdk::xdr::{Limits, ReadXdr, TransactionEnvelope};
+use soroban_sdk::xdr::{ReadXdr, TransactionEnvelope};
+#[cfg(not(target_arch = "wasm32"))]
 use ureq::{Agent, AgentBuilder};
+
+/// Trait for custom RPC backend implementations.
+///
+/// Allows advanced users to provide their own RPC implementations
+/// for testing, custom routing, or specialized network configurations.
+pub trait RpcBackend {
+    /// POST a JSON-RPC request and return the response body.
+    fn post_json(&self, body: &str) -> Result<String, SdkError>;
+
+    /// Get the network URL this backend targets.
+    fn network_url(&self) -> &str;
+}
+
+// ─── Rate-limit retry policy ─────────────────────────────────────────────────
+
+/// Default maximum number of retries on HTTP 429 responses.
+pub const DEFAULT_RATE_LIMIT_MAX_RETRIES: u32 = 3;
+
+/// Default initial delay before the first retry (before jitter), in milliseconds.
+pub const DEFAULT_RATE_LIMIT_INITIAL_DELAY_MS: u64 = 500;
+
+/// Default upper bound on the computed backoff, in milliseconds.
+pub const DEFAULT_RATE_LIMIT_MAX_DELAY_MS: u64 = 30_000;
+
+/// Default base delay before the first retry (before jitter).
+pub const DEFAULT_RATE_LIMIT_BASE_DELAY: Duration =
+    Duration::from_millis(DEFAULT_RATE_LIMIT_INITIAL_DELAY_MS);
+
+/// Default upper bound on the computed backoff (before jitter).
+pub const DEFAULT_RATE_LIMIT_MAX_DELAY: Duration =
+    Duration::from_millis(DEFAULT_RATE_LIMIT_MAX_DELAY_MS);
+
+/// Policy for automatic retries on HTTP 429 Too Many Requests.
+///
+/// When an HTTP response has status 429, the client:
+/// 1. Checks whether `Retry-After` header is present; if so, waits that duration.
+/// 2. Otherwise, waits `min(initial_delay_ms * 2^attempt + jitter, max_delay_ms)` ms.
+/// 3. Retries the request.
+/// 4. After `max_retries` exhausted attempts, returns `SdkError::RateLimited { retries: u32 }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitPolicy {
+    /// Maximum number of retries after a 429 (0 = surface the error immediately).
+    pub max_retries: u32,
+    /// Initial delay for the first retry, before jitter (in milliseconds).
+    pub initial_delay_ms: u64,
+    /// Upper bound on the computed exponential delay, before jitter (in milliseconds).
+    pub max_delay_ms: u64,
+}
+
+impl Default for RateLimitPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_RATE_LIMIT_MAX_RETRIES,
+            initial_delay_ms: DEFAULT_RATE_LIMIT_INITIAL_DELAY_MS,
+            max_delay_ms: DEFAULT_RATE_LIMIT_MAX_DELAY_MS,
+        }
+    }
+}
+
+impl RateLimitPolicy {
+    /// Creates a policy with default values (3 retries, 500ms initial, 30s cap).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of retries.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Sets the initial delay for exponential backoff in milliseconds.
+    pub fn with_initial_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.initial_delay_ms = delay_ms;
+        self
+    }
+
+    /// Sets the upper bound on the computed backoff in milliseconds.
+    pub fn with_max_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.max_delay_ms = delay_ms;
+        self
+    }
+
+    /// Sets the base delay for exponential backoff from a [`Duration`].
+    pub fn with_base_delay(mut self, delay: Duration) -> Self {
+        self.initial_delay_ms = delay.as_millis() as u64;
+        self
+    }
+
+    /// Sets the upper bound on the computed backoff from a [`Duration`].
+    pub fn with_max_delay(mut self, delay: Duration) -> Self {
+        self.max_delay_ms = delay.as_millis() as u64;
+        self
+    }
+
+    /// Computes the backoff duration for attempt `n` (0-indexed) using
+    /// exponential backoff with jitter:
+    ///
+    /// ```text
+    /// min(initial_delay_ms * 2^attempt + jitter, max_delay_ms)
+    /// ```
+    pub fn backoff_for_attempt(&self, attempt: u32) -> Duration {
+        let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+        let base_ms = self.initial_delay_ms.saturating_mul(factor);
+        let jitter = if self.initial_delay_ms == 0 {
+            0
+        } else {
+            let seed = (attempt as u64).wrapping_add(1);
+            let rand = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223) ^ (seed >> 16);
+            rand % self.initial_delay_ms
+        };
+        let delay_ms = base_ms.saturating_add(jitter).min(self.max_delay_ms);
+        Duration::from_millis(delay_ms)
+    }
+}
 
 /// Per-request timeout applied by [`RpcClient`] unless overridden via
 /// [`RpcClient::with_timeout`].
@@ -22,15 +143,34 @@ pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// ([`DEFAULT_RPC_TIMEOUT`] unless [`RpcClient::with_timeout`] overrides
 /// it), so a slow or unreachable node cannot block the calling thread
 /// indefinitely.
+///
+/// Cloning is cheap: clones share the underlying HTTP agent (and its
+/// connection pool) and the JSON-RPC request-id counter, so requests issued
+/// through any clone still get unique ids. The SDK's `*_async` methods rely
+/// on this to hand a copy of the client to the worker thread that performs
+/// the blocking I/O.
+#[derive(Clone)]
 pub struct RpcClient {
     pub network_url: String,
     /// The effective per-request timeout. Kept alongside `agent` because
     /// `ureq`'s agent doesn't expose its configured timeout; readable via
     /// [`RpcClient::timeout`].
     timeout: Duration,
+    /// Largest response body this client will buffer or decode, in bytes.
+    /// A larger `Content-Length`, or more bytes on the wire, fails with
+    /// [`SdkError::ResponseTooLarge`] before the body is fully read. Also
+    /// bounds the `len` of every XDR decode of that body's contents.
+    max_response_bytes: usize,
     /// HTTP agent preconfigured with `timeout`; every request goes through
     /// it so none can bypass the bound.
+    #[cfg(not(target_arch = "wasm32"))]
     agent: Agent,
+    /// Monotonically-increasing JSON-RPC request ID.  Each request gets the
+    /// next value so concurrent callers can correlate responses. Shared
+    /// between clones so ids stay unique across them.
+    next_id: Arc<AtomicU32>,
+    /// Rate-limit retry policy. Defaults to [`RateLimitPolicy::default`].
+    rate_limit_policy: RateLimitPolicy,
 }
 
 impl RpcClient {
@@ -38,8 +178,45 @@ impl RpcClient {
         Self {
             network_url: network_url.into(),
             timeout: DEFAULT_RPC_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            #[cfg(not(target_arch = "wasm32"))]
             agent: rpc_agent(DEFAULT_RPC_TIMEOUT),
+            next_id: Arc::new(AtomicU32::new(1)),
+            rate_limit_policy: RateLimitPolicy::default(),
         }
+    }
+
+    /// Attaches a rate-limit retry policy. When set, 429 responses
+    /// are automatically retried with exponential backoff and jitter.
+    ///
+    /// ```no_run
+    /// use soroban_sas_sdk::rpc::{RpcClient, RateLimitPolicy};
+    ///
+    /// let client = RpcClient::new("https://soroban-testnet.stellar.org")
+    ///     .with_rate_limit_policy(RateLimitPolicy::new().with_max_retries(5));
+    /// ```
+    pub fn with_rate_limit_policy(mut self, policy: RateLimitPolicy) -> Self {
+        self.rate_limit_policy = policy;
+        self
+    }
+
+    /// Returns the active rate-limit retry policy.
+    pub fn rate_limit_policy(&self) -> &RateLimitPolicy {
+        &self.rate_limit_policy
+    }
+
+    /// Overrides the largest response body this client will accept
+    /// ([`crate::limits::DEFAULT_MAX_RESPONSE_BYTES`]
+    /// by default). Raise it for endpoints that legitimately return very
+    /// large `getLedgerEntries` / `simulateTransaction` payloads.
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    /// The largest response body, in bytes, this client will buffer or decode.
+    pub fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
     }
 
     /// Overrides this client's per-request timeout, returning the configured
@@ -56,7 +233,10 @@ impl RpcClient {
     /// ```
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self.agent = rpc_agent(timeout);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.agent = rpc_agent(timeout);
+        }
         self
     }
 
@@ -73,6 +253,7 @@ impl RpcClient {
         tx_envelope_xdr: &str,
     ) -> JsonRpcRequest<SendTransactionParams> {
         JsonRpcRequest::new(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
             "sendTransaction",
             SendTransactionParams {
                 transaction: tx_envelope_xdr.to_string(),
@@ -87,6 +268,7 @@ impl RpcClient {
         tx_hash: &str,
     ) -> JsonRpcRequest<GetTransactionParams> {
         JsonRpcRequest::new(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
             "getTransaction",
             GetTransactionParams {
                 hash: tx_hash.to_string(),
@@ -98,17 +280,19 @@ impl RpcClient {
     pub fn parse_send_transaction_response(
         &self,
         body: &str,
+        expected_id: u32,
     ) -> Result<SendTransactionResult, SdkError> {
-        parse_response(body)
+        parse_response(body, expected_id)
     }
 
     /// Parses a raw `getTransaction` JSON-RPC response body.
     pub fn parse_get_transaction_response(
         &self,
         body: &str,
+        expected_id: u32,
     ) -> Result<GetTransactionResult, SdkError> {
-        let result = parse_response(body)?;
-        validate_supported_transaction_envelope(&result)?;
+        let result = parse_response(body, expected_id)?;
+        validate_supported_transaction_envelope(&result, self.max_response_bytes)?;
         Ok(result)
     }
 
@@ -119,6 +303,7 @@ impl RpcClient {
         tx_envelope_xdr: &str,
     ) -> JsonRpcRequest<SimulateTransactionParams> {
         JsonRpcRequest::new(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
             "simulateTransaction",
             SimulateTransactionParams {
                 transaction: tx_envelope_xdr.to_string(),
@@ -130,8 +315,9 @@ impl RpcClient {
     pub fn parse_simulate_transaction_response(
         &self,
         body: &str,
+        expected_id: u32,
     ) -> Result<SimulateTransactionResult, SdkError> {
-        parse_response(body)
+        parse_response(body, expected_id)
     }
 
     /// Simulates invoking a contract via `tx_envelope_xdr` (built by
@@ -145,8 +331,9 @@ impl RpcClient {
         tx_envelope_xdr: &str,
     ) -> Result<SimulateTransactionResult, SdkError> {
         let request = self.build_simulate_transaction_request(tx_envelope_xdr);
+        let id = request.id;
         let body = self.post(&request)?;
-        self.parse_simulate_transaction_response(&body)
+        self.parse_simulate_transaction_response(&body, id)
     }
 
     /// Submits `tx_envelope_xdr` to this RPC endpoint's `sendTransaction`
@@ -156,16 +343,18 @@ impl RpcClient {
         tx_envelope_xdr: &str,
     ) -> Result<SendTransactionResult, SdkError> {
         let request = self.build_send_transaction_request(tx_envelope_xdr);
+        let id = request.id;
         let body = self.post(&request)?;
-        self.parse_send_transaction_response(&body)
+        self.parse_send_transaction_response(&body, id)
     }
 
     /// Fetches the current status of `tx_hash` via this RPC endpoint's
     /// `getTransaction` method and parses the response.
     pub fn get_transaction(&self, tx_hash: &str) -> Result<GetTransactionResult, SdkError> {
         let request = self.build_get_transaction_request(tx_hash);
+        let id = request.id;
         let body = self.post(&request)?;
-        self.parse_get_transaction_response(&body)
+        self.parse_get_transaction_response(&body, id)
     }
 
     /// Builds the JSON-RPC request body for Soroban's `getLedgerEntries`.
@@ -174,15 +363,20 @@ impl RpcClient {
         &self,
         keys: Vec<String>,
     ) -> JsonRpcRequest<GetLedgerEntriesParams> {
-        JsonRpcRequest::new("getLedgerEntries", GetLedgerEntriesParams { keys })
+        JsonRpcRequest::new(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            "getLedgerEntries",
+            GetLedgerEntriesParams { keys },
+        )
     }
 
     /// Parses a raw `getLedgerEntries` JSON-RPC response body.
     pub fn parse_get_ledger_entries_response(
         &self,
         body: &str,
+        expected_id: u32,
     ) -> Result<GetLedgerEntriesResult, SdkError> {
-        parse_response(body)
+        parse_response(body, expected_id)
     }
 
     /// Fetches the ledger entries for `keys` (base64-encoded `LedgerKey`
@@ -192,48 +386,312 @@ impl RpcClient {
         keys: Vec<String>,
     ) -> Result<GetLedgerEntriesResult, SdkError> {
         let request = self.build_get_ledger_entries_request(keys);
+        let id = request.id;
         let body = self.post(&request)?;
-        self.parse_get_ledger_entries_response(&body)
+        self.parse_get_ledger_entries_response(&body, id)
+    }
+
+    /// Builds the JSON-RPC request body for Soroban's `getLatestLedger`.
+    pub fn build_get_latest_ledger_request(&self) -> JsonRpcRequest<serde_json::Value> {
+        JsonRpcRequest::new(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            "getLatestLedger",
+            serde_json::Value::Null,
+        )
+    }
+
+    /// Parses a raw `getLatestLedger` JSON-RPC response body.
+    pub fn parse_get_latest_ledger_response(
+        &self,
+        body: &str,
+        expected_id: u32,
+    ) -> Result<GetLatestLedgerResult, SdkError> {
+        parse_response(body, expected_id)
+    }
+
+    /// Fetches the RPC's view of the latest closed ledger via
+    /// `getLatestLedger`.
+    pub fn get_latest_ledger(&self) -> Result<GetLatestLedgerResult, SdkError> {
+        let request = self.build_get_latest_ledger_request();
+        let id = request.id;
+        let body = self.post(&request)?;
+        self.parse_get_latest_ledger_response(&body, id)
+    }
+
+    /// Builds the JSON-RPC request body for Soroban's `getLedgers`, starting
+    /// at `start_ledger` with a pagination limit of 1 — just enough to read
+    /// that one ledger's close time.
+    pub fn build_get_ledgers_request(&self, start_ledger: u32) -> JsonRpcRequest<GetLedgersParams> {
+        JsonRpcRequest::new(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            "getLedgers",
+            GetLedgersParams {
+                start_ledger,
+                pagination: LedgersPagination { limit: 1 },
+            },
+        )
+    }
+
+    /// Parses a raw `getLedgers` JSON-RPC response body.
+    pub fn parse_get_ledgers_response(
+        &self,
+        body: &str,
+        expected_id: u32,
+    ) -> Result<GetLedgersResult, SdkError> {
+        parse_response(body, expected_id)
+    }
+
+    /// Returns the authoritative network wall-clock: the close time (unix
+    /// seconds) of the RPC's latest ledger, plus that ledger's sequence.
+    ///
+    /// Uses `getLatestLedger` for the current sequence, then `getLedgers` for
+    /// that ledger's close time. The per-request timeout on this client
+    /// bounds both calls, so an unreachable node fails fast rather than
+    /// hanging the caller (#172).
+    pub fn get_latest_ledger_clock(&self) -> Result<LedgerClock, SdkError> {
+        let latest = self.get_latest_ledger()?;
+        let request = self.build_get_ledgers_request(latest.sequence);
+        let id = request.id;
+        let body = self.post(&request)?;
+        let result = self.parse_get_ledgers_response(&body, id)?;
+        let close_time_str = result
+            .ledgers
+            .first()
+            .map(|l| l.ledger_close_time.clone())
+            .unwrap_or(result.latest_ledger_close_time);
+        let close_time: u64 = close_time_str.parse().map_err(|_| {
+            SdkError::RpcError(format!("invalid ledger close time: {close_time_str}"))
+        })?;
+        Ok(LedgerClock {
+            sequence: latest.sequence,
+            close_time,
+        })
+    }
+
+    /// Convenience wrapper around [`RpcClient::get_latest_ledger_clock`] for
+    /// callers that only need the close time, not the sequence.
+    pub fn fetch_current_ledger_time(&self) -> Result<u64, SdkError> {
+        Ok(self.get_latest_ledger_clock()?.close_time)
     }
 
     /// POSTs a JSON-RPC request body to this client's `network_url` and
-    /// returns the raw response body.
+    /// returns the raw response body, refusing anything larger than
+    /// [`RpcClient::max_response_bytes`] before it is fully buffered.
+    ///
+    /// HTTP 429 responses trigger automatic retries with exponential backoff
+    /// per the configured [`RateLimitPolicy`]. Respects `Retry-After` headers
+    /// when present. Returns [`SdkError::RateLimited`] when retries are exhausted.
+    ///
+    /// On `wasm32` the synchronous transport does not exist: edge runtimes have
+    /// no blocking sockets. The synchronous methods return
+    /// [`SdkError::TransportError`] and the `*_async` methods use the
+    /// `web-sys` fetch transport instead (#553).
+    #[cfg(not(target_arch = "wasm32"))]
     fn post<P: Serialize>(&self, request: &JsonRpcRequest<P>) -> Result<String, SdkError> {
-        self.agent
-            .post(&self.network_url)
-            .send_json(request)
-            .map_err(|err| SdkError::TransportError(err.to_string()))?
-            .into_string()
-            .map_err(|err| SdkError::TransportError(err.to_string()))
+        let mut attempt = 0;
+        loop {
+            let response = self.agent.post(&self.network_url).send_json(request);
+
+            match response {
+                Ok(resp) => return read_body_bounded(resp, self.max_response_bytes),
+                Err(ureq::Error::Status(429, resp)) => {
+                    let retry_after_dur = resp
+                        .header("Retry-After")
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map(Duration::from_secs);
+
+                    if attempt < self.rate_limit_policy.max_retries {
+                        let delay = retry_after_dur
+                            .unwrap_or_else(|| self.rate_limit_policy.backoff_for_attempt(attempt));
+                        std::thread::sleep(delay);
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(SdkError::RateLimited { retries: attempt });
+                }
+                Err(err) => return Err(SdkError::TransportError(err.to_string())),
+            }
+        }
     }
+
+    /// Synchronous RPC transport is unavailable on `wasm32` (#553).
+    #[cfg(target_arch = "wasm32")]
+    fn post<P: Serialize>(&self, _request: &JsonRpcRequest<P>) -> Result<String, SdkError> {
+        Err(SdkError::TransportError(
+            "synchronous RPC calls are not available on wasm32; use the *_async methods"
+                .to_string(),
+        ))
+    }
+
+    /// POSTs a JSON-RPC request body using the `web-sys` fetch transport and
+    /// returns the raw response body.
+    ///
+    /// Only used on `wasm32` with the `wasm` feature enabled, where the
+    /// transport is already asynchronous (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    async fn post_async<P: Serialize>(
+        &self,
+        request: &JsonRpcRequest<P>,
+    ) -> Result<String, SdkError> {
+        let body = serde_json::to_string(request).map_err(|err| {
+            SdkError::RpcError(format!("failed to encode JSON-RPC request: {err}"))
+        })?;
+        crate::wasm_http::post(&self.network_url, &body, self.max_response_bytes).await
+    }
+}
+
+impl RpcBackend for RpcClient {
+    /// Posts a raw JSON-RPC body.
+    ///
+    /// On `wasm32` the synchronous transport does not exist, so this returns
+    /// [`SdkError::TransportError`] and callers must use the `*_async`
+    /// methods (#553).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn post_json(&self, body: &str) -> Result<String, SdkError> {
+        let request: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| SdkError::RpcError(format!("invalid JSON request: {e}")))?;
+
+        let mut attempt = 0;
+        loop {
+            let response = self.agent.post(&self.network_url).send_json(&request);
+
+            match response {
+                Ok(resp) => return read_body_bounded(resp, self.max_response_bytes),
+                Err(ureq::Error::Status(429, resp)) => {
+                    let retry_after_dur = resp
+                        .header("Retry-After")
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map(Duration::from_secs);
+
+                    if attempt < self.rate_limit_policy.max_retries {
+                        let delay = retry_after_dur
+                            .unwrap_or_else(|| self.rate_limit_policy.backoff_for_attempt(attempt));
+                        std::thread::sleep(delay);
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(SdkError::RateLimited { retries: attempt });
+                }
+                Err(err) => return Err(SdkError::TransportError(err.to_string())),
+            }
+        }
+    }
+
+    /// Synchronous RPC transport is unavailable on `wasm32` (#553).
+    #[cfg(target_arch = "wasm32")]
+    fn post_json(&self, _body: &str) -> Result<String, SdkError> {
+        Err(SdkError::TransportError(
+            "synchronous RPC calls are not available on wasm32; use the *_async methods"
+                .to_string(),
+        ))
+    }
+
+    fn network_url(&self) -> &str {
+        &self.network_url
+    }
+}
+
+/// Reads a `ureq` response body into a `String`, rejecting it with
+/// [`SdkError::ResponseTooLarge`] if the announced `Content-Length` exceeds
+/// `limit` or if the body turns out to be longer than `limit` on the wire
+/// (covering chunked responses with no declared length).
+#[cfg(not(target_arch = "wasm32"))]
+fn read_body_bounded(response: ureq::Response, limit: usize) -> Result<String, SdkError> {
+    if let Some(len) = response
+        .header("Content-Length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        if len > limit {
+            return Err(SdkError::ResponseTooLarge {
+                limit,
+                observed: Some(len),
+            });
+        }
+    }
+
+    // Read at most `limit + 1` bytes: the extra byte tells us the body was
+    // over the limit without ever holding more than `limit + 1` in memory.
+    let mut buf = Vec::new();
+    let read = response
+        .into_reader()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|err| SdkError::TransportError(err.to_string()))?;
+    if read > limit {
+        return Err(SdkError::ResponseTooLarge {
+            limit,
+            observed: None,
+        });
+    }
+    String::from_utf8(buf).map_err(|err| SdkError::TransportError(err.to_string()))
 }
 
 /// Builds the `ureq` agent used for every [`RpcClient`] request, with
 /// `timeout` bounding each request end-to-end (connect + send + read).
+#[cfg(not(target_arch = "wasm32"))]
 fn rpc_agent(timeout: Duration) -> Agent {
     AgentBuilder::new().timeout(timeout).build()
 }
 
 /// Decodes a JSON-RPC response envelope and unwraps either its `result`
 /// or turns a JSON-RPC-level `error` (or malformed body) into an [`SdkError`].
-fn parse_response<T: DeserializeOwned>(body: &str) -> Result<T, SdkError> {
+///
+/// Validates that the response declares `jsonrpc == "2.0"` and carries the
+/// expected request `id` before decoding the result payload.
+fn parse_response<T: DeserializeOwned>(body: &str, expected_id: u32) -> Result<T, SdkError> {
     let response: JsonRpcResponse<T> =
         serde_json::from_str(body).map_err(|err| SdkError::RpcError(err.to_string()))?;
     match response {
-        JsonRpcResponse::Result { result, .. } => Ok(result),
-        JsonRpcResponse::Error { error, .. } => Err(SdkError::RpcError(format!(
-            "{}: {}",
-            error.code, error.message
-        ))),
+        JsonRpcResponse::Result {
+            jsonrpc,
+            id,
+            result,
+        } => {
+            if jsonrpc != "2.0" {
+                return Err(SdkError::RpcError(format!(
+                    "unsupported JSON-RPC version: expected \"2.0\", got \"{jsonrpc}\""
+                )));
+            }
+            if id != expected_id {
+                return Err(SdkError::RpcError(format!(
+                    "response id mismatch: expected {expected_id}, got {id}"
+                )));
+            }
+            Ok(result)
+        }
+        JsonRpcResponse::Error { jsonrpc, id, error } => {
+            if jsonrpc != "2.0" {
+                return Err(SdkError::RpcError(format!(
+                    "unsupported JSON-RPC version: expected \"2.0\", got \"{jsonrpc}\""
+                )));
+            }
+            if id != expected_id {
+                return Err(SdkError::RpcError(format!(
+                    "response id mismatch: expected {expected_id}, got {id}"
+                )));
+            }
+            Err(SdkError::RpcError(format!(
+                "{}: {}",
+                error.code, error.message
+            )))
+        }
     }
 }
 
-fn validate_supported_transaction_envelope(result: &GetTransactionResult) -> Result<(), SdkError> {
+fn validate_supported_transaction_envelope(
+    result: &GetTransactionResult,
+    max_body_bytes: usize,
+) -> Result<(), SdkError> {
     let Some(envelope_xdr) = &result.envelope_xdr else {
         return Ok(());
     };
-    let envelope = TransactionEnvelope::from_xdr_base64(envelope_xdr, Limits::none())
-        .map_err(|err| SdkError::DecodingError(format!("failed to decode envelopeXdr: {err:?}")))?;
+    let envelope =
+        TransactionEnvelope::from_xdr_base64(envelope_xdr, rpc_response_limits(max_body_bytes))
+            .map_err(|err| {
+                SdkError::DecodingError(format!("failed to decode envelopeXdr: {err:?}"))
+            })?;
     match envelope {
         TransactionEnvelope::Tx(_) => Ok(()),
         other => Err(SdkError::DecodingError(format!(
@@ -291,9 +749,15 @@ pub struct GetTransactionResult {
     pub envelope_xdr: Option<String>,
     #[serde(rename = "resultXdr")]
     pub result_xdr: Option<String>,
+    /// The transaction hash. Absent in a raw `getTransaction` reply (which
+    /// is queried *by* hash); the SDK fills it in from the preceding
+    /// `sendTransaction` so callers — especially asynchronous ones — always
+    /// have the hash to poll or record.
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct JsonRpcRequest<P: Serialize> {
     pub jsonrpc: &'static str,
     pub id: u32,
@@ -302,27 +766,27 @@ pub struct JsonRpcRequest<P: Serialize> {
 }
 
 impl<P: Serialize> JsonRpcRequest<P> {
-    fn new(method: &'static str, params: P) -> Self {
+    fn new(id: u32, method: &'static str, params: P) -> Self {
         Self {
             jsonrpc: "2.0",
-            id: 1,
+            id,
             method,
             params,
         }
     }
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SendTransactionParams {
     pub transaction: String,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GetTransactionParams {
     pub hash: String,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SimulateTransactionParams {
     pub transaction: String,
 }
@@ -379,9 +843,11 @@ pub struct RestorePreamble {
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct SimulateHostFunctionResult {
     pub xdr: String,
+    #[serde(default)]
+    pub auth: Vec<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GetLedgerEntriesParams {
     pub keys: Vec<String>,
 }
@@ -395,6 +861,10 @@ pub struct GetLedgerEntriesResult {
     #[serde(rename = "latestLedger")]
     pub latest_ledger: u32,
 }
+
+/// `getLatestLedger` takes no parameters; serializes as `{}`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GetLatestLedgerParams {}
 
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct LedgerEntryResult {
@@ -410,20 +880,119 @@ pub struct LedgerEntryResult {
     pub live_until_ledger_seq: Option<u32>,
 }
 
+/// The `result` payload of a Soroban `getLatestLedger` response.
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct GetLatestLedgerResult {
+    pub id: String,
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: u32,
+    pub sequence: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GetLedgersParams {
+    #[serde(rename = "startLedger")]
+    pub start_ledger: u32,
+    pub pagination: LedgersPagination,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LedgersPagination {
+    pub limit: u32,
+}
+
+/// The subset of a Soroban `getLedgers` response the SDK needs to read a
+/// ledger close time. Close times are transmitted as decimal strings of unix
+/// seconds.
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct GetLedgersResult {
+    #[serde(rename = "latestLedger")]
+    pub latest_ledger: u32,
+    #[serde(rename = "latestLedgerCloseTime")]
+    pub latest_ledger_close_time: String,
+    #[serde(default)]
+    pub ledgers: Vec<LedgerInfo>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct LedgerInfo {
+    pub sequence: u32,
+    #[serde(rename = "ledgerCloseTime")]
+    pub ledger_close_time: String,
+}
+
+/// A network ledger's sequence and close time (unix seconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerClock {
+    pub sequence: u32,
+    pub close_time: u64,
+}
+
+/// Why the network ledger time could not be used as-is for issuance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssuanceTimeError {
+    /// The ledger close time is more than `max_skew_secs` behind the local
+    /// clock — the RPC node is lagging, or the local clock jumped forward.
+    LedgerStale {
+        close_time: u64,
+        local_time: u64,
+        max_skew_secs: u64,
+    },
+    /// The ledger close time is more than `max_skew_secs` ahead of the local
+    /// clock.
+    LedgerInFuture {
+        close_time: u64,
+        local_time: u64,
+        max_skew_secs: u64,
+    },
+}
+
+/// Deterministic issuance-time policy (#172): use the network ledger close
+/// time, but refuse it when it disagrees with `local_time` by more than
+/// `max_skew_secs` in either direction. A stale RPC and a forward-skewed
+/// local clock both surface as an error the caller must handle (retry, pick a
+/// different RPC, or explicitly opt into the local clock) rather than issuing
+/// a timestamp that ledger-time validation may reject.
+///
+/// `local_time` is passed in rather than read from `SystemTime` here so tests
+/// can inject a local/ledger disagreement deterministically.
+pub fn resolve_issuance_time(
+    ledger: &LedgerClock,
+    local_time: u64,
+    max_skew_secs: u64,
+) -> Result<u64, IssuanceTimeError> {
+    if ledger.close_time > local_time.saturating_add(max_skew_secs) {
+        return Err(IssuanceTimeError::LedgerInFuture {
+            close_time: ledger.close_time,
+            local_time,
+            max_skew_secs,
+        });
+    }
+    if local_time.saturating_sub(ledger.close_time) > max_skew_secs {
+        return Err(IssuanceTimeError::LedgerStale {
+            close_time: ledger.close_time,
+            local_time,
+            max_skew_secs,
+        });
+    }
+    Ok(ledger.close_time)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::xdr::{
         FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
-        FeeBumpTransactionInnerTx, Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction,
-        TransactionExt, TransactionV0, TransactionV0Envelope, TransactionV0Ext,
+        FeeBumpTransactionInnerTx, Limits, Memo, MuxedAccount, Preconditions, SequenceNumber,
+        Transaction, TransactionExt, TransactionV0, TransactionV0Envelope, TransactionV0Ext,
         TransactionV1Envelope, Uint256, VecM, WriteXdr,
     };
     use std::time::Instant;
 
-    /// A minimal, well-formed `Transaction` body used to assemble the envelope
-    /// fixtures below. Its contents don't matter — the tests only care which
-    /// `TransactionEnvelope` variant it is wrapped in.
+    /// A minimal, well-formed `Transaction` body used to assemble the
+    /// envelope fixtures below. Its contents don't matter — the tests only
+    /// care which `TransactionEnvelope` variant it is wrapped in.
     fn sample_transaction() -> Transaction {
         Transaction {
             source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
@@ -447,8 +1016,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Base64 XDR for a legacy V0 (`TransactionEnvelope::TxV0`) envelope, which
-    /// the SDK must reject without panicking.
+    /// Base64 XDR for a legacy V0 (`TransactionEnvelope::TxV0`) envelope,
+    /// which the SDK must reject without panicking.
     fn v0_envelope_xdr() -> String {
         let tx = TransactionV0 {
             source_account_ed25519: Uint256([0u8; 32]),
@@ -493,10 +1062,11 @@ mod tests {
         let client = RpcClient::new("https://soroban-testnet.stellar.org");
         let request = client.build_send_transaction_request("AAAAAgAAAAA=");
 
-        let value = serde_json::to_value(request).unwrap();
+        let value = serde_json::to_value(request.clone()).unwrap();
         assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["method"], "sendTransaction");
         assert_eq!(value["params"]["transaction"], "AAAAAgAAAAA=");
+        assert!(request.id >= 1);
     }
 
     #[test]
@@ -504,9 +1074,10 @@ mod tests {
         let client = RpcClient::new("https://soroban-testnet.stellar.org");
         let request = client.build_get_transaction_request("deadbeef");
 
-        let value = serde_json::to_value(request).unwrap();
+        let value = serde_json::to_value(request.clone()).unwrap();
         assert_eq!(value["method"], "getTransaction");
         assert_eq!(value["params"]["hash"], "deadbeef");
+        assert!(request.id >= 1);
     }
 
     #[test]
@@ -523,7 +1094,7 @@ mod tests {
             }
         }"#;
 
-        let result = client.parse_send_transaction_response(body).unwrap();
+        let result = client.parse_send_transaction_response(body, 1).unwrap();
         assert_eq!(result.status, "PENDING");
         assert_eq!(result.hash, "abcd1234");
         assert_eq!(result.latest_ledger, 12345);
@@ -548,7 +1119,7 @@ mod tests {
             envelope_xdr = serde_json::to_string(&envelope_xdr).unwrap()
         );
 
-        let result = client.parse_get_transaction_response(&body).unwrap();
+        let result = client.parse_get_transaction_response(&body, 1).unwrap();
         assert_eq!(result.status, "SUCCESS");
         assert_eq!(result.envelope_xdr.as_deref(), Some(envelope_xdr.as_str()));
     }
@@ -569,7 +1140,7 @@ mod tests {
             v0_envelope_xdr = serde_json::to_string(&v0_envelope_xdr()).unwrap()
         );
 
-        let err = client.parse_get_transaction_response(&body).unwrap_err();
+        let err = client.parse_get_transaction_response(&body, 1).unwrap_err();
         match err {
             SdkError::DecodingError(msg) => {
                 assert!(msg.contains("unsupported transaction envelope variant: TxV0"));
@@ -594,7 +1165,7 @@ mod tests {
             fee_bump_envelope_xdr = serde_json::to_string(&fee_bump_envelope_xdr()).unwrap()
         );
 
-        let err = client.parse_get_transaction_response(&body).unwrap_err();
+        let err = client.parse_get_transaction_response(&body, 1).unwrap_err();
         match err {
             SdkError::DecodingError(msg) => {
                 assert!(msg.contains("unsupported transaction envelope variant: TxFeeBump"));
@@ -612,7 +1183,7 @@ mod tests {
             "error": { "code": -32602, "message": "Invalid params" }
         }"#;
 
-        let err = client.parse_send_transaction_response(body).unwrap_err();
+        let err = client.parse_send_transaction_response(body, 1).unwrap_err();
         match err {
             SdkError::RpcError(msg) => assert!(msg.contains("Invalid params")),
             other => panic!("expected RpcError, got {other:?}"),
@@ -624,9 +1195,10 @@ mod tests {
         let client = RpcClient::new("https://soroban-testnet.stellar.org");
         let request = client.build_simulate_transaction_request("AAAAAgAAAAA=");
 
-        let value = serde_json::to_value(request).unwrap();
+        let value = serde_json::to_value(request.clone()).unwrap();
         assert_eq!(value["method"], "simulateTransaction");
         assert_eq!(value["params"]["transaction"], "AAAAAgAAAAA=");
+        assert!(request.id >= 1);
     }
 
     #[test]
@@ -643,7 +1215,7 @@ mod tests {
             }
         }"#;
 
-        let result = client.parse_simulate_transaction_response(body).unwrap();
+        let result = client.parse_simulate_transaction_response(body, 1).unwrap();
         assert_eq!(result.latest_ledger, 3993006);
         assert_eq!(result.error, None);
         assert_eq!(result.results.len(), 1);
@@ -668,7 +1240,7 @@ mod tests {
             }
         }"#;
 
-        let result = client.parse_simulate_transaction_response(body).unwrap();
+        let result = client.parse_simulate_transaction_response(body, 1).unwrap();
         assert_eq!(result.latest_ledger, 3993006);
         assert!(result.error.unwrap().contains("MissingValue"));
         assert!(result.results.is_empty());
@@ -679,9 +1251,10 @@ mod tests {
         let client = RpcClient::new("https://soroban-testnet.stellar.org");
         let request = client.build_get_ledger_entries_request(vec!["AAAAAA==".to_string()]);
 
-        let value = serde_json::to_value(request).unwrap();
+        let value = serde_json::to_value(request.clone()).unwrap();
         assert_eq!(value["method"], "getLedgerEntries");
         assert_eq!(value["params"]["keys"][0], "AAAAAA==");
+        assert!(request.id >= 1);
     }
 
     #[test]
@@ -698,7 +1271,7 @@ mod tests {
             }
         }"#;
 
-        let result = client.parse_get_ledger_entries_response(body).unwrap();
+        let result = client.parse_get_ledger_entries_response(body, 1).unwrap();
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].xdr, "AAAAAA==");
         assert_eq!(result.entries[0].last_modified_ledger_seq, 3993006);
@@ -708,7 +1281,7 @@ mod tests {
     fn maps_malformed_body_to_sdk_error() {
         let client = RpcClient::new("https://soroban-testnet.stellar.org");
         let err = client
-            .parse_get_transaction_response("not json")
+            .parse_get_transaction_response("not json", 1)
             .unwrap_err();
         assert!(matches!(err, SdkError::RpcError(_)));
     }
@@ -793,6 +1366,160 @@ mod tests {
         );
     }
 
+    // --- Issue #136: response bodies are bounded before JSON / XDR decode ---
+
+    /// Serves one HTTP/1.1 response built from `status_line_extra_headers`
+    /// (everything between the status line and the blank line, `\r\n`
+    /// terminated) plus `body`. Lets a test forge a `Content-Length` or ship
+    /// an over-large body.
+    fn spawn_raw_http_server(headers: String, body: Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                // Fully drain the request (headers + body) first: closing a
+                // socket with unread bytes sends an RST that can wipe the
+                // response mid-flight.
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let read = reader.read_line(&mut line).unwrap_or(0);
+                    if read == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut req_body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut req_body);
+
+                let mut stream = stream;
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n").as_bytes(),
+                );
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn default_max_response_bytes_matches_the_documented_limit() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        assert_eq!(
+            client.max_response_bytes(),
+            crate::limits::DEFAULT_MAX_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn with_max_response_bytes_overrides_the_default() {
+        let client =
+            RpcClient::new("https://soroban-testnet.stellar.org").with_max_response_bytes(1024);
+        assert_eq!(client.max_response_bytes(), 1024);
+    }
+
+    #[test]
+    fn oversized_content_length_is_rejected_before_the_body_is_read() {
+        // Announce a gigabyte but send almost nothing: a client that trusts
+        // Content-Length would try to allocate 1 GiB.
+        let url = spawn_raw_http_server(
+            "Content-Type: application/json\r\nContent-Length: 1073741824\r\n".to_string(),
+            b"{}".to_vec(),
+        );
+        let client = RpcClient::new(url).with_max_response_bytes(64 * 1024);
+        let err = client.get_transaction("deadbeef").unwrap_err();
+        match err {
+            SdkError::ResponseTooLarge { limit, observed } => {
+                assert_eq!(limit, 64 * 1024);
+                assert_eq!(observed, Some(1_073_741_824));
+            }
+            other => panic!("expected ResponseTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_body_without_content_length_is_cut_off_at_the_limit() {
+        let big = vec![b'a'; 200 * 1024];
+        // Chunked-style: no Content-Length header at all.
+        let url = spawn_raw_http_server("Content-Type: application/json\r\n".to_string(), big);
+        let client = RpcClient::new(url).with_max_response_bytes(64 * 1024);
+        let err = client.get_transaction("deadbeef").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SdkError::ResponseTooLarge {
+                    limit: 65536,
+                    observed: None
+                }
+            ),
+            "expected ResponseTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_within_the_limit_still_parses_normally() {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"SUCCESS","latestLedger":7,"envelopeXdr":{}}}}}"#,
+            serde_json::to_string(&v1_envelope_xdr()).unwrap()
+        )
+        .into_bytes();
+        let url = spawn_raw_http_server(
+            format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body.len()
+            ),
+            body,
+        );
+        let client = RpcClient::new(url).with_max_response_bytes(64 * 1024);
+        let result = client.get_transaction("deadbeef").unwrap();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
+    #[test]
+    fn nested_xdr_past_the_configured_depth_is_rejected_not_recursed() {
+        use soroban_sdk::xdr::{Limits as XdrLimits, ScVal, ScVec};
+
+        // A modestly nested `ScVal::Vec` (shallow enough that *encoding* it
+        // here doesn't overflow this test thread's own stack).
+        let mut nested = ScVal::Vec(Some(ScVec(VecM::default())));
+        for _ in 0..24 {
+            nested = ScVal::Vec(Some(ScVec(vec![nested].try_into().unwrap())));
+        }
+        let deep_b64 = nested.to_xdr_base64(XdrLimits::none()).unwrap();
+
+        // Unbounded / generous depth accepts it...
+        assert!(ScVal::from_xdr_base64(&deep_b64, XdrLimits::none()).is_ok());
+        assert!(ScVal::from_xdr_base64(&deep_b64, rpc_response_limits(1 << 20)).is_ok());
+        // ...but a decoder whose depth ceiling sits below the nesting bails
+        // with an error instead of recursing without bound.
+        let shallow = XdrLimits {
+            depth: 8,
+            len: 1 << 20,
+        };
+        assert!(ScVal::from_xdr_base64(&deep_b64, shallow).is_err());
+    }
+
+    #[test]
+    fn oversized_base64_xdr_is_rejected_by_the_finite_byte_limit() {
+        use soroban_sdk::xdr::{Limits as XdrLimits, ScVal};
+
+        // A big `ScVal::Bytes` blob: legal XDR, but larger than a tight
+        // `len` ceiling, so the bounded decoder refuses it up front.
+        let blob = ScVal::Bytes(vec![7u8; 200 * 1024].try_into().unwrap());
+        let b64 = blob.to_xdr_base64(XdrLimits::none()).unwrap();
+        assert!(ScVal::from_xdr_base64(&b64, XdrLimits::none()).is_ok());
+        let tight = XdrLimits {
+            depth: crate::limits::DEFAULT_XDR_DEPTH,
+            len: 64 * 1024,
+        };
+        assert!(ScVal::from_xdr_base64(&b64, tight).is_err());
+    }
+
     /// Happy-path guard: with the timeout-wired agent in place, ordinary
     /// requests against the public testnet still round-trip. Ignored by
     /// default so the suite stays offline; run with
@@ -812,5 +1539,570 @@ mod tests {
             Err(SdkError::RpcError(_)) => {}
             Err(err) => panic!("unexpected error kind from live testnet: {err:?}"),
         }
+    }
+
+    // --- Issue #135: JSON-RPC version and response ID validation tests ---
+
+    #[test]
+    fn rejects_non_2_0_jsonrpc_version() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let body = r#"{
+            "jsonrpc": "1.0",
+            "id": 1,
+            "result": {
+                "status": "PENDING",
+                "hash": "abcd1234",
+                "latestLedger": 12345,
+                "latestLedgerCloseTime": "1234567890"
+            }
+        }"#;
+
+        let err = client.parse_send_transaction_response(body, 1).unwrap_err();
+        match err {
+            SdkError::RpcError(msg) => {
+                assert!(msg.contains("unsupported JSON-RPC version"));
+                assert!(msg.contains("1.0"));
+            }
+            other => panic!("expected RpcError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_response_with_wrong_id() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let body = r#"{
+            "jsonrpc": "2.0",
+            "id": 99,
+            "result": {
+                "status": "PENDING",
+                "hash": "abcd1234",
+                "latestLedger": 12345,
+                "latestLedgerCloseTime": "1234567890"
+            }
+        }"#;
+
+        let err = client.parse_send_transaction_response(body, 1).unwrap_err();
+        match err {
+            SdkError::RpcError(msg) => {
+                assert!(msg.contains("response id mismatch"));
+                assert!(msg.contains("99"));
+            }
+            other => panic!("expected RpcError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_error_response_with_wrong_id() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let body = r#"{
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": { "code": -32602, "message": "Invalid params" }
+        }"#;
+
+        let err = client.parse_send_transaction_response(body, 1).unwrap_err();
+        match err {
+            SdkError::RpcError(msg) => {
+                assert!(msg.contains("response id mismatch"));
+            }
+            other => panic!("expected RpcError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_error_response_with_wrong_jsonrpc_version() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let body = r#"{
+            "jsonrpc": "1.0",
+            "id": 1,
+            "error": { "code": -32602, "message": "Invalid params" }
+        }"#;
+
+        let err = client.parse_send_transaction_response(body, 1).unwrap_err();
+        match err {
+            SdkError::RpcError(msg) => {
+                assert!(msg.contains("unsupported JSON-RPC version"));
+            }
+            other => panic!("expected RpcError, got {other:?}"),
+        }
+    }
+
+    // --- Issue #173: fetching current ledger time for client-side TTL checks ---
+
+    #[test]
+    fn builds_get_latest_ledger_request() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let request = client.build_get_latest_ledger_request();
+        let value = serde_json::to_value(request.clone()).unwrap();
+        assert_eq!(value["method"], "getLatestLedger");
+        assert!(request.id >= 1);
+    }
+
+    #[test]
+    fn parses_get_latest_ledger_response() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"id":"abcd","protocolVersion":21,"sequence":12345}}"#;
+        let result = client.parse_get_latest_ledger_response(body, 1).unwrap();
+        assert_eq!(result.sequence, 12345);
+        assert_eq!(result.protocol_version, 21);
+    }
+
+    #[test]
+    fn builds_get_ledgers_request_with_a_single_ledger_pagination_limit() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let request = client.build_get_ledgers_request(12345);
+        let value = serde_json::to_value(request.clone()).unwrap();
+        assert_eq!(value["method"], "getLedgers");
+        assert_eq!(value["params"]["startLedger"], 12345);
+        assert_eq!(value["params"]["pagination"]["limit"], 1);
+    }
+
+    #[test]
+    fn parses_get_ledgers_response() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ledgers":[{"sequence":12345,"ledgerCloseTime":"1700000000"}],"latestLedger":12345,"latestLedgerCloseTime":"1700000000"}}"#;
+        let result = client.parse_get_ledgers_response(body, 1).unwrap();
+        assert_eq!(result.ledgers.len(), 1);
+        assert_eq!(result.ledgers[0].ledger_close_time, "1700000000");
+    }
+
+    /// Spawns a background thread that serially answers up to `responses.len()`
+    /// HTTP requests, matching each incoming request's JSON-RPC `method` field
+    /// (a plain substring search — good enough for a test double) against
+    /// `responses` in order and replying with the paired body. Returns the
+    /// URL an `RpcClient` should target.
+    fn spawn_multi_call_mock_rpc_server(responses: Vec<(&'static str, String)>) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (expected_method, response_body) in responses {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let read = reader.read_line(&mut line).unwrap_or(0);
+                    if read == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let request_body = String::from_utf8_lossy(&body);
+                assert!(
+                    request_body.contains(expected_method),
+                    "expected request for {expected_method:?}, got: {request_body}"
+                );
+
+                let mut stream = stream;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn fetch_current_ledger_time_combines_get_latest_ledger_and_get_ledgers() {
+        let url = spawn_multi_call_mock_rpc_server(vec![
+            (
+                "getLatestLedger",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"id":"abcd","protocolVersion":21,"sequence":555}}"#
+                    .to_string(),
+            ),
+            (
+                "getLedgers",
+                r#"{"jsonrpc":"2.0","id":2,"result":{"ledgers":[{"sequence":555,"ledgerCloseTime":"1700000042"}],"latestLedger":555,"latestLedgerCloseTime":"1700000042"}}"#
+                    .to_string(),
+            ),
+        ]);
+        let client = RpcClient::new(url);
+        let time = client.fetch_current_ledger_time().unwrap();
+        assert_eq!(time, 1_700_000_042);
+    }
+
+    #[test]
+    fn fetch_current_ledger_time_errors_when_getledgers_returns_no_header() {
+        let url = spawn_multi_call_mock_rpc_server(vec![
+            (
+                "getLatestLedger",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"id":"abcd","protocolVersion":21,"sequence":555}}"#
+                    .to_string(),
+            ),
+            (
+                "getLedgers",
+                r#"{"jsonrpc":"2.0","id":2,"result":{"ledgers":[],"latestLedger":555}}"#
+                    .to_string(),
+            ),
+        ]);
+        let client = RpcClient::new(url);
+        let err = client.fetch_current_ledger_time().unwrap_err();
+        assert!(matches!(err, SdkError::RpcError(_)));
+    }
+
+    fn spawn_rate_limited_mock_server(responses: Vec<(u16, Option<u64>, String)>) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (status, retry_after, body) in responses {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let read = reader.read_line(&mut line).unwrap_or(0);
+                    if read == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut req_body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut req_body);
+
+                let mut stream = stream;
+                let (status_line, retry_hdr) = if status == 429 {
+                    let rh = retry_after
+                        .map(|s| format!("Retry-After: {s}\r\n"))
+                        .unwrap_or_default();
+                    ("HTTP/1.1 429 Too Many Requests", rh)
+                } else {
+                    ("HTTP/1.1 200 OK", String::new())
+                };
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{retry_hdr}Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn rate_limit_policy_backoff_calculation() {
+        let policy = RateLimitPolicy::default();
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.initial_delay_ms, 500);
+        assert_eq!(policy.max_delay_ms, 30_000);
+
+        let d0 = policy.backoff_for_attempt(0);
+        assert!(d0 >= Duration::from_millis(500) && d0 <= Duration::from_millis(1000));
+
+        let d1 = policy.backoff_for_attempt(1);
+        assert!(d1 >= Duration::from_millis(1000) && d1 <= Duration::from_millis(1500));
+
+        let d_large = policy.backoff_for_attempt(20);
+        assert_eq!(d_large, Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn rate_limit_policy_default_applied() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        assert_eq!(client.rate_limit_policy().max_retries, 3);
+        assert_eq!(client.rate_limit_policy().initial_delay_ms, 500);
+        assert_eq!(client.rate_limit_policy().max_delay_ms, 30_000);
+    }
+
+    #[test]
+    fn rate_limit_retries_on_429_and_succeeds() {
+        let ok_body = r#"{"jsonrpc":"2.0","id":1,"result":{"id":"test","protocolVersion":21,"sequence":100}}"#.to_string();
+        let error_body = r#"{"error":"too many requests"}"#.to_string();
+        let url = spawn_rate_limited_mock_server(vec![
+            (429, None, error_body.clone()),
+            (429, None, error_body),
+            (200, None, ok_body),
+        ]);
+        let client = RpcClient::new(url).with_rate_limit_policy(
+            RateLimitPolicy::new()
+                .with_max_retries(3)
+                .with_initial_delay_ms(1)
+                .with_max_delay_ms(10),
+        );
+        let res = client.get_latest_ledger().unwrap();
+        assert_eq!(res.sequence, 100);
+    }
+
+    #[test]
+    fn rate_limit_respects_retry_after_header() {
+        let ok_body = r#"{"jsonrpc":"2.0","id":1,"result":{"id":"test","protocolVersion":21,"sequence":100}}"#.to_string();
+        let error_body = r#"{"error":"too many requests"}"#.to_string();
+        let url =
+            spawn_rate_limited_mock_server(vec![(429, Some(0), error_body), (200, None, ok_body)]);
+        let client = RpcClient::new(url).with_rate_limit_policy(
+            RateLimitPolicy::new()
+                .with_max_retries(3)
+                .with_initial_delay_ms(1)
+                .with_max_delay_ms(10),
+        );
+        let res = client.get_latest_ledger().unwrap();
+        assert_eq!(res.sequence, 100);
+    }
+
+    #[test]
+    fn rate_limit_exhausted_returns_rate_limited_error() {
+        let error_body = r#"{"error":"too many requests"}"#.to_string();
+        let url = spawn_rate_limited_mock_server(vec![
+            (429, None, error_body.clone()),
+            (429, None, error_body.clone()),
+            (429, None, error_body),
+        ]);
+        let client = RpcClient::new(url).with_rate_limit_policy(
+            RateLimitPolicy::new()
+                .with_max_retries(2)
+                .with_initial_delay_ms(1)
+                .with_max_delay_ms(10),
+        );
+        let err = client.get_latest_ledger().unwrap_err();
+        match err {
+            SdkError::RateLimited { retries } => assert_eq!(retries, 2),
+            other => panic!("expected SdkError::RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_ids_are_distinct_for_concurrent_calls() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org");
+        let r1 = client.build_send_transaction_request("AAAAAgAAAAA=");
+        let r2 = client.build_send_transaction_request("AAAAAgAAAAA=");
+        let r3 = client.build_send_transaction_request("AAAAAgAAAAA=");
+        assert_ne!(r1.id, r2.id);
+        assert_ne!(r2.id, r3.id);
+    }
+}
+
+#[cfg(test)]
+mod issuance_time_tests {
+    use super::{resolve_issuance_time, IssuanceTimeError, LedgerClock};
+
+    fn clock(close_time: u64) -> LedgerClock {
+        LedgerClock {
+            sequence: 100,
+            close_time,
+        }
+    }
+
+    #[test]
+    fn uses_ledger_time_when_clocks_agree() {
+        assert_eq!(resolve_issuance_time(&clock(1_000), 1_000, 300), Ok(1_000));
+        // Small disagreement inside the skew budget is fine; ledger wins.
+        assert_eq!(resolve_issuance_time(&clock(1_000), 1_200, 300), Ok(1_000));
+        assert_eq!(resolve_issuance_time(&clock(1_000), 800, 300), Ok(1_000));
+    }
+
+    #[test]
+    fn rejects_a_stale_rpc_ledger() {
+        assert_eq!(
+            resolve_issuance_time(&clock(1_000), 2_000, 300),
+            Err(IssuanceTimeError::LedgerStale {
+                close_time: 1_000,
+                local_time: 2_000,
+                max_skew_secs: 300,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_ledger_from_the_future() {
+        assert_eq!(
+            resolve_issuance_time(&clock(5_000), 1_000, 300),
+            Err(IssuanceTimeError::LedgerInFuture {
+                close_time: 5_000,
+                local_time: 1_000,
+                max_skew_secs: 300,
+            })
+        );
+    }
+
+    #[test]
+    fn saturating_math_does_not_panic_at_the_extremes() {
+        assert!(resolve_issuance_time(&clock(0), u64::MAX, 300).is_err());
+        assert!(resolve_issuance_time(&clock(u64::MAX), 0, 300).is_err());
+    }
+}
+
+impl RpcClient {
+    /// Submits `transaction_xdr` for simulation.
+    ///
+    /// On native targets the blocking call is offloaded to a worker thread.
+    /// On `wasm32` the call is awaited on the runtime's event loop through the
+    /// `web-sys` fetch transport (#553).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn simulate_transaction_async(
+        &self,
+        transaction_xdr: &str,
+    ) -> Result<SimulateTransactionResult, SdkError> {
+        let client = self.clone();
+        let xdr = transaction_xdr.to_string();
+        tokio::task::spawn_blocking(move || client.simulate_transaction(&xdr))
+            .await
+            .map_err(|e| SdkError::RpcError(format!("async task panicked: {}", e)))?
+    }
+
+    /// Simulates `transaction_xdr` over the wasm fetch transport (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    pub async fn simulate_transaction_async(
+        &self,
+        transaction_xdr: &str,
+    ) -> Result<SimulateTransactionResult, SdkError> {
+        let request = self.build_simulate_transaction_request(transaction_xdr);
+        let id = request.id;
+        let body = self.post_async(&request).await?;
+        self.parse_simulate_transaction_response(&body, id)
+    }
+
+    /// Submits `transaction_xdr` to the network.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn send_transaction_async(
+        &self,
+        transaction_xdr: &str,
+    ) -> Result<SendTransactionResult, SdkError> {
+        let client = self.clone();
+        let xdr = transaction_xdr.to_string();
+        tokio::task::spawn_blocking(move || client.send_transaction(&xdr))
+            .await
+            .map_err(|e| SdkError::RpcError(format!("async task panicked: {}", e)))?
+    }
+
+    /// Submits `transaction_xdr` over the wasm fetch transport (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    pub async fn send_transaction_async(
+        &self,
+        transaction_xdr: &str,
+    ) -> Result<SendTransactionResult, SdkError> {
+        let request = self.build_send_transaction_request(transaction_xdr);
+        let id = request.id;
+        let body = self.post_async(&request).await?;
+        self.parse_send_transaction_response(&body, id)
+    }
+
+    /// Fetches the status of `tx_hash`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn get_transaction_async(
+        &self,
+        tx_hash: &str,
+    ) -> Result<GetTransactionResult, SdkError> {
+        let client = self.clone();
+        let hash = tx_hash.to_string();
+        tokio::task::spawn_blocking(move || client.get_transaction(&hash))
+            .await
+            .map_err(|e| SdkError::RpcError(format!("async task panicked: {}", e)))?
+    }
+
+    /// Fetches the status of `tx_hash` over the wasm fetch transport (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    pub async fn get_transaction_async(
+        &self,
+        tx_hash: &str,
+    ) -> Result<GetTransactionResult, SdkError> {
+        let request = self.build_get_transaction_request(tx_hash);
+        let id = request.id;
+        let body = self.post_async(&request).await?;
+        self.parse_get_transaction_response(&body, id)
+    }
+
+    /// Fetches the ledger entries for `keys`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn get_ledger_entries_async(
+        &self,
+        keys: Vec<String>,
+    ) -> Result<GetLedgerEntriesResult, SdkError> {
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || client.get_ledger_entries(keys))
+            .await
+            .map_err(|e| SdkError::RpcError(format!("async task panicked: {}", e)))?
+    }
+
+    /// Fetches the ledger entries for `keys` over the wasm fetch transport (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    pub async fn get_ledger_entries_async(
+        &self,
+        keys: Vec<String>,
+    ) -> Result<GetLedgerEntriesResult, SdkError> {
+        let request = self.build_get_ledger_entries_request(keys);
+        let id = request.id;
+        let body = self.post_async(&request).await?;
+        self.parse_get_ledger_entries_response(&body, id)
+    }
+
+    /// Fetches the RPC's view of the latest closed ledger.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn get_latest_ledger_async(&self) -> Result<GetLatestLedgerResult, SdkError> {
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || client.get_latest_ledger())
+            .await
+            .map_err(|e| SdkError::RpcError(format!("async task panicked: {}", e)))?
+    }
+
+    /// Fetches the latest closed ledger over the wasm fetch transport (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    pub async fn get_latest_ledger_async(&self) -> Result<GetLatestLedgerResult, SdkError> {
+        let request = self.build_get_latest_ledger_request();
+        let id = request.id;
+        let body = self.post_async(&request).await?;
+        self.parse_get_latest_ledger_response(&body, id)
+    }
+
+    /// Fetches the network wall-clock (latest ledger close time and sequence).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn get_latest_ledger_clock_async(&self) -> Result<LedgerClock, SdkError> {
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || client.get_latest_ledger_clock())
+            .await
+            .map_err(|e| SdkError::RpcError(format!("async task panicked: {}", e)))?
+    }
+
+    /// Fetches the network wall-clock over the wasm fetch transport (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    pub async fn get_latest_ledger_clock_async(&self) -> Result<LedgerClock, SdkError> {
+        let latest = self.get_latest_ledger_async().await?;
+        let request = self.build_get_ledgers_request(latest.sequence);
+        let id = request.id;
+        let body = self.post_async(&request).await?;
+        let result = self.parse_get_ledgers_response(&body, id)?;
+        let close_time_str = result
+            .ledgers
+            .first()
+            .map(|l| l.ledger_close_time.clone())
+            .unwrap_or(result.latest_ledger_close_time);
+        let close_time: u64 = close_time_str.parse().map_err(|_| {
+            SdkError::RpcError(format!("invalid ledger close time: {close_time_str}"))
+        })?;
+        Ok(LedgerClock {
+            sequence: latest.sequence,
+            close_time,
+        })
+    }
+
+    /// Returns the network wall-clock close time in unix seconds.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn fetch_current_ledger_time_async(&self) -> Result<u64, SdkError> {
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || client.fetch_current_ledger_time())
+            .await
+            .map_err(|e| SdkError::RpcError(format!("async task panicked: {}", e)))?
+    }
+
+    /// Returns the network wall-clock close time over the wasm fetch transport (#553).
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    pub async fn fetch_current_ledger_time_async(&self) -> Result<u64, SdkError> {
+        Ok(self.get_latest_ledger_clock_async().await?.close_time)
     }
 }

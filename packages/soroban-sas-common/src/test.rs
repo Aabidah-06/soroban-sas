@@ -11,6 +11,62 @@ fn test_uid_deterministic() {
     assert_ne!(uid1, uid3);
 }
 
+#[test]
+fn test_attestation_uid_is_deterministic_and_content_addressed() {
+    let env = soroban_sdk::Env::default();
+    let schema_uid = UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32]));
+    let other_schema_uid = UID(soroban_sdk::BytesN::from_array(&env, &[3u8; 32]));
+    let recipient = account_address(&env, &[3u8; 32]);
+    let other_recipient = account_address(&env, &[4u8; 32]);
+    let attester = account_address(&env, &[5u8; 32]);
+    let other_attester = account_address(&env, &[6u8; 32]);
+    let data = soroban_sdk::Bytes::from_slice(&env, &[1, 2, 3]);
+    let other_data = soroban_sdk::Bytes::from_slice(&env, &[4, 5, 6]);
+
+    let uid = crate::attestation_uid(&env, &schema_uid, &recipient, &attester, &data);
+    let uid_again = crate::attestation_uid(&env, &schema_uid, &recipient, &attester, &data);
+    assert_eq!(uid, uid_again, "identical inputs must produce the same UID");
+
+    assert_ne!(
+        uid,
+        crate::attestation_uid(&env, &other_schema_uid, &recipient, &attester, &data),
+        "a different schema_uid must produce a different UID"
+    );
+    assert_ne!(
+        uid,
+        crate::attestation_uid(&env, &schema_uid, &other_recipient, &attester, &data),
+        "a different recipient must produce a different UID"
+    );
+    assert_ne!(
+        uid,
+        crate::attestation_uid(&env, &schema_uid, &recipient, &other_attester, &data),
+        "a different attester must produce a different UID"
+    );
+    assert_ne!(
+        uid,
+        crate::attestation_uid(&env, &schema_uid, &recipient, &attester, &other_data),
+        "a different data must produce a different UID"
+    );
+}
+
+/// `schema_uid` is documented (docs/schemas.md, "Schema ID Collision
+/// Resistance") as hashing the revocability flag together with the schema
+/// string and resolver, so a revocable and a non-revocable schema that are
+/// otherwise identical must never share a UID.
+#[test]
+fn test_schema_uid_is_sensitive_to_the_revocable_flag() {
+    let env = Env::default();
+    let resolver = Address::generate(&env);
+    let schema = SorobanString::from_str(&env, "score U32");
+
+    let revocable = crate::schema_uid(&env, &schema, &resolver, true);
+    let irrevocable = crate::schema_uid(&env, &schema, &resolver, false);
+
+    assert_ne!(revocable, irrevocable);
+    assert_eq!(revocable, crate::schema_uid(&env, &schema, &resolver, true));
+}
+
+use crate::validation::check_revocable;
 use crate::validation::validate_recipient;
 use crate::validation::validate_schema_syntax;
 use crate::validation::validate_ttl;
@@ -29,6 +85,22 @@ fn test_validate_ttl() {
     assert!(validate_ttl(&env, 100, 100).is_err()); // expired exactly at current time
 }
 
+/// `check_revocable` is the single place the schema-level revocability
+/// ceiling is enforced, shared by every issuance path. Pin its full truth
+/// table: only `(non-revocable schema, revocable attestation)` is rejected.
+#[test]
+fn test_check_revocable_truth_table() {
+    let env = Env::default();
+
+    assert!(check_revocable(&env, false, false).is_ok());
+    assert!(check_revocable(&env, true, true).is_ok());
+    assert!(check_revocable(&env, true, false).is_ok());
+    assert_eq!(
+        check_revocable(&env, false, true),
+        Err(crate::errors::SASError::NotRevocable)
+    );
+}
+
 #[test]
 fn test_validate_schema_syntax_rejects_malformed_strings() {
     let env = Env::default();
@@ -37,12 +109,205 @@ fn test_validate_schema_syntax_rejects_malformed_strings() {
         let schema = soroban_sdk::String::from_str(&env, schema);
         assert_eq!(
             validate_schema_syntax(&env, &schema),
-            Err(crate::errors::SASError::InvalidSchema)
+            Err(crate::errors::SASError::InvalidSchemaDefinition)
         );
     }
 
     let schema = soroban_sdk::String::from_str(&env, "first_name String, last_name String");
     assert!(validate_schema_syntax(&env, &schema).is_ok());
+}
+
+/// Replays the shared golden vectors in `test_vectors/schema_syntax.tsv`.
+/// The schema explorer's TypeScript validator replays the same file, so a
+/// rule change here that is not mirrored there (or vice versa) fails CI.
+#[test]
+fn test_validate_schema_syntax_matches_shared_vectors() {
+    extern crate std;
+    use std::string::String as StdString;
+
+    fn decode_hex(hex: &str) -> std::vec::Vec<u8> {
+        assert!(hex.len() % 2 == 0, "odd-length hex in schema vector");
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("invalid hex in schema vector"))
+            .collect()
+    }
+
+    let env = Env::default();
+    let vectors = include_str!("../test_vectors/schema_syntax.tsv");
+    let mut checked = 0;
+    for line in vectors.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut columns = line.split('\t');
+        let expected = columns.next().expect("missing expected column");
+        let bytes = decode_hex(columns.next().expect("missing schema column"));
+        let text = StdString::from_utf8(bytes).expect("schema vector is not UTF-8");
+        let schema = soroban_sdk::String::from_str(&env, &text);
+
+        let expected = match expected {
+            "ok" => Ok(()),
+            "InvalidSchema" | "InvalidSchemaDefinition" => {
+                Err(crate::errors::SASError::InvalidSchemaDefinition)
+            }
+            "EmptySchema" => Err(crate::errors::SASError::EmptySchema),
+            other => panic!("unknown expected result {other:?} in schema vector"),
+        };
+        assert_eq!(
+            validate_schema_syntax(&env, &schema),
+            expected,
+            "schema vector {text:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no schema vectors were checked");
+}
+
+#[test]
+fn test_validate_schema_syntax_enforces_max_field_count() {
+    extern crate std;
+    let env = Env::default();
+
+    // Exactly MAX_SCHEMA_FIELDS fields is accepted.
+    let at_limit = (0..crate::validation::MAX_SCHEMA_FIELDS)
+        .map(|i| std::format!("f{i} B"))
+        .collect::<std::vec::Vec<_>>()
+        .join(",");
+    let schema = soroban_sdk::String::from_str(&env, &at_limit);
+    assert!(
+        validate_schema_syntax(&env, &schema).is_ok(),
+        "a schema with exactly MAX_SCHEMA_FIELDS fields must be accepted"
+    );
+
+    // MAX_SCHEMA_FIELDS + 1 fields is rejected, even though it still fits
+    // within MAX_SCHEMA_LENGTH bytes.
+    let over_limit = (0..=crate::validation::MAX_SCHEMA_FIELDS)
+        .map(|i| std::format!("f{i} B"))
+        .collect::<std::vec::Vec<_>>()
+        .join(",");
+    assert!(
+        over_limit.len() <= 1024,
+        "fixture must stay within MAX_SCHEMA_LENGTH to isolate the field-count check"
+    );
+    let schema = soroban_sdk::String::from_str(&env, &over_limit);
+    assert_eq!(
+        validate_schema_syntax(&env, &schema),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+}
+
+#[test]
+fn test_strict_lexical_validation_rejects_adversarial_inputs() {
+    let env = Env::default();
+
+    // Tabs
+    let schema_tab = soroban_sdk::String::from_str(&env, "name\tString");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_tab),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Newlines and carriage returns
+    let schema_nl = soroban_sdk::String::from_str(&env, "name String\n");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_nl),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Null bytes
+    let schema_null = soroban_sdk::String::from_str(&env, "name\0String");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_null),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Control characters (ASCII < 32)
+    let schema_ctrl = soroban_sdk::String::from_str(&env, "name\x07String");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_ctrl),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Non-breaking space (U+00A0: 0xC2 0xA0)
+    let schema_nbsp = soroban_sdk::String::from_str(&env, "name\u{00A0}String");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_nbsp),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Zero-width space (U+200B)
+    let schema_zwsp = soroban_sdk::String::from_str(&env, "name\u{200B} String");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_zwsp),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Non-canonical spacing: multiple spaces between identifier and type
+    let schema_multi_space = soroban_sdk::String::from_str(&env, "name   String");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_multi_space),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Malformed separators: space before comma
+    let schema_space_comma =
+        soroban_sdk::String::from_str(&env, "first_name String , last_name String");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_space_comma),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Malformed separators: trailing delimiter
+    let schema_trailing_comma = soroban_sdk::String::from_str(&env, "first_name String,");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_trailing_comma),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+
+    // Malformed separators: consecutive commas
+    let schema_double_comma =
+        soroban_sdk::String::from_str(&env, "first_name String,,last_name String");
+    assert_eq!(
+        validate_schema_syntax(&env, &schema_double_comma),
+        Err(crate::errors::SASError::InvalidSchemaDefinition)
+    );
+}
+
+#[test]
+fn test_check_policy_all_three_paths() {
+    use crate::validation::check_policy;
+    use crate::RevocationPolicy;
+
+    // IrrevocableOnly:
+    // - irrevocable attestation is allowed
+    assert!(check_policy(RevocationPolicy::IrrevocableOnly, false).is_ok());
+    // - revocable attestation reverts with NotRevocable
+    assert_eq!(
+        check_policy(RevocationPolicy::IrrevocableOnly, true),
+        Err(crate::errors::SASError::NotRevocable)
+    );
+
+    // RevocableOnly:
+    // - revocable attestation is allowed
+    assert!(check_policy(RevocationPolicy::RevocableOnly, true).is_ok());
+    // - irrevocable attestation reverts with InvalidRevocability
+    assert_eq!(
+        check_policy(RevocationPolicy::RevocableOnly, false),
+        Err(crate::errors::SASError::InvalidRevocability)
+    );
+
+    // Permissive:
+    // - allows attester to choose either flag
+    assert!(check_policy(RevocationPolicy::Permissive, true).is_ok());
+    assert!(check_policy(RevocationPolicy::Permissive, false).is_ok());
+
+    // From<bool> mappings:
+    assert_eq!(
+        RevocationPolicy::from(false),
+        RevocationPolicy::IrrevocableOnly
+    );
+    assert_eq!(RevocationPolicy::from(true), RevocationPolicy::Permissive);
 }
 
 #[test]
@@ -61,6 +326,55 @@ fn test_validate_recipient_rejects_zero_addresses() {
     );
     assert_eq!(
         validate_recipient(&env, &zero_contract),
+        Err(crate::errors::SASError::InvalidRecipient)
+    );
+}
+
+#[test]
+fn test_validate_attestation_parties_accepts_a_distinct_concrete_recipient() {
+    let env = Env::default();
+    let recipient = account_address(&env, &[3u8; 32]);
+    let attester = account_address(&env, &[4u8; 32]);
+    let contract_recipient = Address::from_string(&SorobanString::from_str(
+        &env,
+        &stellar_strkey::Contract([9u8; 32]).to_string(),
+    ));
+
+    assert_eq!(
+        crate::validation::validate_attestation_parties(&env, &recipient, &attester),
+        Ok(())
+    );
+    assert_eq!(
+        crate::validation::validate_attestation_parties(&env, &contract_recipient, &attester),
+        Ok(())
+    );
+}
+
+#[test]
+fn test_validate_attestation_parties_rejects_missing_and_self_recipients() {
+    let env = Env::default();
+    let attester = account_address(&env, &[4u8; 32]);
+    let zero_account = account_address(&env, &[0u8; 32]);
+    let zero_contract = Address::from_string(&SorobanString::from_str(
+        &env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    ));
+
+    // "No recipient" sentinels in either address space.
+    for missing in [&zero_account, &zero_contract] {
+        assert_eq!(
+            crate::validation::validate_attestation_parties(&env, missing, &attester),
+            Err(crate::errors::SASError::InvalidRecipient)
+        );
+    }
+    // A zero-sentinel attester is equally malformed.
+    assert_eq!(
+        crate::validation::validate_attestation_parties(&env, &attester, &zero_account),
+        Err(crate::errors::SASError::InvalidRecipient)
+    );
+    // Self-attestation is not a way to express "no recipient" either.
+    assert_eq!(
+        crate::validation::validate_attestation_parties(&env, &attester, &attester),
         Err(crate::errors::SASError::InvalidRecipient)
     );
 }
@@ -93,6 +407,7 @@ fn sample_attestation(env: &Env, attester: Address) -> Attestation {
         attester,
         revocable: true,
         data: Bytes::from_slice(env, &[0xde, 0xad, 0xbe, 0xef]),
+        valid_from: 0,
     }
 }
 
@@ -101,6 +416,56 @@ fn sample_domain(env: &Env, nonce: u64) -> AttestationDomain {
         network_id: BytesN::from_array(env, &[7u8; 32]),
         contract: Address::generate(env),
         nonce,
+    }
+}
+
+/// Golden vectors for `schema_uid`/`attestation_uid` (#248), pinning the
+/// exact digest produced by these functions for a fixed set of inputs so a
+/// cross-language implementation (the TypeScript SDK) can assert
+/// byte-identical output against the same inputs.
+mod uid_golden_vectors {
+    use super::account_address;
+    use crate::{attestation_uid, schema_uid, UID};
+    use soroban_sdk::{Bytes, BytesN, Env, String as SorobanString};
+
+    #[test]
+    fn golden_vector_schema_uid() {
+        let env = Env::default();
+        let schema = SorobanString::from_str(&env, "bool verified");
+        let resolver = account_address(&env, &[0x11u8; 32]);
+
+        let uid = schema_uid(&env, &schema, &resolver, true);
+
+        let expected: [u8; 32] = [
+            146, 100, 182, 216, 54, 242, 50, 235, 155, 202, 243, 176, 169, 46, 166, 119, 188, 40,
+            43, 56, 107, 202, 5, 219, 141, 246, 102, 45, 245, 237, 57, 121,
+        ];
+        assert_eq!(
+            uid.0.to_array(),
+            expected,
+            "golden schema_uid digest mismatch - cross-check TS hashing.ts before changing"
+        );
+    }
+
+    #[test]
+    fn golden_vector_attestation_uid() {
+        let env = Env::default();
+        let schema_uid_val = UID(BytesN::from_array(&env, &[0x02u8; 32]));
+        let recipient = account_address(&env, &[0x22u8; 32]);
+        let attester = account_address(&env, &[0x11u8; 32]);
+        let data = Bytes::from_slice(&env, b"golden vector data");
+
+        let uid = attestation_uid(&env, &schema_uid_val, &recipient, &attester, &data);
+
+        let expected: [u8; 32] = [
+            69, 223, 100, 152, 78, 106, 147, 32, 181, 3, 111, 219, 137, 53, 251, 12, 219, 222, 253,
+            33, 88, 253, 190, 86, 203, 201, 116, 113, 228, 193, 16, 142,
+        ];
+        assert_eq!(
+            uid.0.to_array(),
+            expected,
+            "golden attestation_uid digest mismatch - cross-check TS hashing.ts before changing"
+        );
     }
 }
 
@@ -281,6 +646,28 @@ fn test_revocation_policy_from_bool() {
 }
 
 #[test]
+fn test_delegation_nonce_key_xdr_smaller_than_tuple() {
+    use soroban_sdk::xdr::ToXdr;
+    let env = Env::default();
+    let attester = Address::generate(&env);
+
+    let typed_key = crate::DelegationNonceKey {
+        attester: attester.clone(),
+    };
+    let tuple_key = (soroban_sdk::Symbol::new(&env, "DELEGATION_NONCE"), attester);
+
+    let typed_xdr = typed_key.to_xdr(&env);
+    let tuple_xdr = tuple_key.to_xdr(&env);
+
+    assert!(
+        typed_xdr.len() < tuple_xdr.len(),
+        "Typed DelegationNonceKey XDR ({} bytes) must be smaller than raw tuple XDR ({} bytes)",
+        typed_xdr.len(),
+        tuple_xdr.len()
+    );
+}
+
+#[test]
 fn test_check_policy_truth_table() {
     use crate::validation::check_policy;
     use crate::RevocationPolicy;
@@ -415,4 +802,219 @@ fn test_validate_schema_lexical_fuzz_byte_injection() {
             );
         }
     }
+}
+
+#[test]
+fn recipient_consent_nonce_key_is_distinct_from_attester_nonce_key() {
+    use soroban_sdk::xdr::ToXdr;
+    let env = Env::default();
+    let address = Address::generate(&env);
+    let attester_key = crate::DelegationNonceKey {
+        attester: address.clone(),
+    };
+    let recipient_key = crate::RecipientConsentNonceKey {
+        scope: soroban_sdk::symbol_short!("RCONSENT"),
+        recipient: address,
+    };
+    assert_ne!(attester_key.to_xdr(&env), recipient_key.to_xdr(&env));
+}
+
+#[test]
+fn test_compact_attestation_pack_unpack_meta() {
+    let env = Env::default();
+    let time = 1_700_000_000u64;
+    let expiration_time = 1_750_000_000u64;
+    let revocation_time = 1_710_000_000u64;
+
+    // Test all flag permutations
+    for revocable in [true, false] {
+        for deprecated in [true, false] {
+            let meta = crate::CompactAttestation::pack_meta(
+                time,
+                expiration_time,
+                revocation_time,
+                revocable,
+                deprecated,
+            );
+            assert_eq!(meta.len(), 25);
+
+            let compact = crate::CompactAttestation {
+                schema_uid: UID(BytesN::from_array(&env, &[1u8; 32])),
+                ref_uid: UID(BytesN::from_array(&env, &[0u8; 32])),
+                recipient: Address::generate(&env),
+                attester: Address::generate(&env),
+                packed_meta: BytesN::from_array(&env, &meta),
+                data: soroban_sdk::Bytes::from_slice(&env, &[1, 2, 3]),
+            };
+
+            let (t, exp, rev, is_revocable, is_revoked, is_dep) = compact.unpack_meta();
+            assert_eq!(t, time);
+            assert_eq!(exp, expiration_time);
+            assert_eq!(rev, revocation_time);
+            assert_eq!(is_revocable, revocable);
+            assert!(is_revoked); // revocation_time > 0
+            assert_eq!(is_dep, deprecated);
+
+            assert_eq!(compact.time(), time);
+            assert_eq!(compact.expiration_time(), expiration_time);
+            assert_eq!(compact.revocation_time(), revocation_time);
+            assert_eq!(compact.is_revocable(), revocable);
+            assert!(compact.is_revoked());
+            assert_eq!(compact.is_deprecated(), deprecated);
+        }
+    }
+
+    // Zero revocation time => is_revoked == false
+    let meta_active = crate::CompactAttestation::pack_meta(time, expiration_time, 0, true, false);
+    let mut compact_active = crate::CompactAttestation {
+        schema_uid: UID(BytesN::from_array(&env, &[1u8; 32])),
+        ref_uid: UID(BytesN::from_array(&env, &[0u8; 32])),
+        recipient: Address::generate(&env),
+        attester: Address::generate(&env),
+        packed_meta: BytesN::from_array(&env, &meta_active),
+        data: soroban_sdk::Bytes::new(&env),
+    };
+    assert!(!compact_active.is_revoked());
+    assert_eq!(compact_active.revocation_time(), 0);
+
+    // Test setters
+    compact_active.set_revocation_time(&env, 1_720_000_000);
+    assert_eq!(compact_active.revocation_time(), 1_720_000_000);
+    assert!(compact_active.is_revoked());
+
+    compact_active.set_time(&env, 1_800_000_000);
+    assert_eq!(compact_active.time(), 1_800_000_000);
+
+    compact_active.set_deprecated(&env, true);
+    assert!(compact_active.is_deprecated());
+}
+
+#[test]
+fn test_compact_attestation_roundtrip() {
+    let env = Env::default();
+    let uid = UID(BytesN::from_array(&env, &[42u8; 32]));
+    let schema_uid = UID(BytesN::from_array(&env, &[7u8; 32]));
+    let ref_uid = UID(BytesN::from_array(&env, &[9u8; 32]));
+    let recipient = Address::generate(&env);
+    let attester = Address::generate(&env);
+    let data = soroban_sdk::Bytes::from_slice(&env, &[10, 20, 30, 40]);
+
+    let original = crate::Attestation {
+        uid: uid.clone(),
+        schema_uid: schema_uid.clone(),
+        time: 1_680_000_000,
+        expiration_time: 1_720_000_000,
+        revocation_time: 0,
+        ref_uid: ref_uid.clone(),
+        recipient: recipient.clone(),
+        attester: attester.clone(),
+        revocable: true,
+        data: data.clone(),
+        valid_from: 0,
+    };
+
+    let compact = crate::CompactAttestation::from_attestation(&env, &original);
+    let reconstructed = compact.to_attestation(&env, &uid);
+
+    assert_eq!(reconstructed.uid, original.uid);
+    assert_eq!(reconstructed.schema_uid, original.schema_uid);
+    assert_eq!(reconstructed.time, original.time);
+    assert_eq!(reconstructed.expiration_time, original.expiration_time);
+    assert_eq!(reconstructed.revocation_time, original.revocation_time);
+    assert_eq!(reconstructed.ref_uid, original.ref_uid);
+    assert_eq!(reconstructed.recipient, original.recipient);
+    assert_eq!(reconstructed.attester, original.attester);
+    assert_eq!(reconstructed.revocable, original.revocable);
+    assert_eq!(reconstructed.data, original.data);
+    assert_eq!(reconstructed, original);
+}
+
+#[test]
+fn test_compact_attestation_storage_footprint_reduction_exceeds_15_percent() {
+    use soroban_sdk::xdr::ToXdr;
+    let env = Env::default();
+    let uid = UID(BytesN::from_array(&env, &[1u8; 32]));
+    let schema_uid = UID(BytesN::from_array(&env, &[2u8; 32]));
+    let ref_uid = UID(BytesN::from_array(&env, &[0u8; 32]));
+    let recipient = Address::generate(&env);
+    let attester = Address::generate(&env);
+    let data = soroban_sdk::Bytes::from_slice(&env, &[0xAA; 32]);
+
+    let original = crate::Attestation {
+        uid: uid.clone(),
+        schema_uid: schema_uid.clone(),
+        time: 1_700_000_000,
+        expiration_time: 1_800_000_000,
+        revocation_time: 0,
+        ref_uid: ref_uid.clone(),
+        recipient: recipient.clone(),
+        attester: attester.clone(),
+        revocable: true,
+        data: data.clone(),
+        valid_from: 0,
+    };
+
+    let compact = crate::CompactAttestation::from_attestation(&env, &original);
+
+    let original_xdr = original.to_xdr(&env);
+    let compact_xdr = compact.to_xdr(&env);
+
+    let original_len = original_xdr.len();
+    let compact_len = compact_xdr.len();
+
+    let saved_bytes = original_len.saturating_sub(compact_len);
+    let reduction_percentage = (saved_bytes as f64 / original_len as f64) * 100.0;
+
+    assert!(
+        reduction_percentage >= 15.0,
+        "Storage footprint reduction must be at least 15%, achieved: {:.2}% ({} bytes -> {} bytes)",
+        reduction_percentage,
+        original_len,
+        compact_len
+    );
+}
+
+#[test]
+fn test_validate_frost_group_accepts_only_consistent_groups() {
+    use crate::{validate_frost_group, FrostGroup, SASError, MAX_FROST_SIGNERS};
+
+    let env = soroban_sdk::Env::default();
+    let key = soroban_sdk::BytesN::from_array(&env, &[3u8; 32]);
+
+    let valid = FrostGroup {
+        group_public_key: key.clone(),
+        threshold: 2,
+        max_signers: 3,
+    };
+    assert!(validate_frost_group(&valid).is_ok());
+
+    for (threshold, max_signers) in [(1, 3), (0, 3), (4, 3), (2, 0)] {
+        let group = FrostGroup {
+            group_public_key: key.clone(),
+            threshold,
+            max_signers,
+        };
+        assert_eq!(
+            validate_frost_group(&group),
+            Err(SASError::InvalidValue),
+            "threshold {threshold} of {max_signers} must be rejected"
+        );
+    }
+
+    let oversized = FrostGroup {
+        group_public_key: key.clone(),
+        threshold: 2,
+        max_signers: MAX_FROST_SIGNERS + 1,
+    };
+    assert_eq!(
+        validate_frost_group(&oversized),
+        Err(SASError::LimitExceeded)
+    );
+
+    let zero_key = FrostGroup {
+        group_public_key: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        threshold: 2,
+        max_signers: 3,
+    };
+    assert_eq!(validate_frost_group(&zero_key), Err(SASError::InvalidValue));
 }

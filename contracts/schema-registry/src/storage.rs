@@ -8,21 +8,84 @@ pub const DEPRECATED: Symbol = symbol_short!("DEPRECATE");
 /// Maps a schema UID to the address that registered it. Kept separately from
 /// `SchemaRecord` so the record's serialized contract type remains stable.
 pub const SCHEMA_CREATOR: Symbol = symbol_short!("CREATOR");
+/// Configurable maximum expiration window limit (in seconds) per schema (#441).
+/// Stored under `(SCHEMA_MAX_TTL, uid) -> u64`. `0` or absent means no limit.
+pub const SCHEMA_MAX_TTL: Symbol = symbol_short!("MAXTTL");
+/// The WASM hash currently installed for this contract. Soroban does not
+/// expose a way to read a contract's own installed hash from within its
+/// own execution, so `commit_upgrade` tracks it here itself, letting
+/// `ContractUpgradedEvent` report the hash being replaced. A missing entry
+/// means "unknown" (the first upgrade on a legacy/genesis deployment) and is
+/// reported as an all-zero hash.
+pub const CURRENT_WASM_HASH: Symbol = symbol_short!("WASMHASH");
 /// Monotonically increasing registry version. Used to gate upgrades and
 /// drive storage-migration checks. v1 is the genesis deployment.
 pub const REGISTRY_VERSION: Symbol = symbol_short!("VERSION");
-/// Persisted allow-list gate for tested WASM hashes could be added here.
+/// First topic of the versioned registry `UPGRADE` event, published with
+/// topics `(UPGRADE, old_version, new_version)` and data
+/// `(old_version, new_version, wasm_hash)` on every successful upgrade.
+/// `commit_upgrade` publishes this alongside the standardized
+/// `ContractUpgraded` event (`soroban_sas_common::events::CONTRACT_UPGRADED`),
+/// so consumers can follow activations either by version or by WASM hash.
 /// For v2 the validation is `new_version == old_version + 1` and the hash
-/// must be non-zero and not the current WASM's hash; unknown future
-/// versions are rejected.
+/// must be non-zero; unknown future versions are rejected.
 pub const UPGRADE_EVENT: Symbol = symbol_short!("UPGRADE");
-/// Maps a schema UID to its tri-state `RevocationPolicy` (#448). Stored only
-/// when a policy is set explicitly via `register_with_policy`; absent entries
-/// fall back to `RevocationPolicy::from(record.revocable)` so legacy boolean
-/// schemas keep their behaviour.
-/// Keyed as `(SCHEMA_POLICY, uid) -> RevocationPolicy`.
+/// Storage key for schema delegate allow-lists.
+/// Stored under `(AUTHORIZED_DELEGATES, schema_uid, delegate_address) -> bool`.
+pub const AUTHORIZED_DELEGATES: Symbol = symbol_short!("DELEGATES");
+
+/// Storage key for a schema's multi-signature owner set (#288).
+/// Stored under `(SCHEMA_OWNERS, schema_uid) -> OwnerSet`.
+pub const SCHEMA_OWNERS: Symbol = symbol_short!("OWNERS");
+
+/// Storage key for the in-flight two-step schema ownership transfer (#446).
+/// Stored under `(PENDING_SCHEMA_OWNER, schema_uid) -> Address`.
+pub const PENDING_SCHEMA_OWNER: Symbol = symbol_short!("PEND_OWN");
+
+/// Storage key for the schema revocation policy (#448).
+/// Stored under `(SCHEMA_POLICY, schema_uid) -> RevocationPolicy`.
 pub const SCHEMA_POLICY: Symbol = symbol_short!("POLICY");
-/// Maps a schema UID to the address proposed as its next owner during a
-/// two-step ownership transfer (#446). Keyed as `(PENDING_OWNER, uid) ->
-/// Address`; removed once the transfer is claimed or cancelled.
-pub const PENDING_OWNER: Symbol = symbol_short!("PENDOWN");
+/// Creator royalty in basis points (#538). `(SCHEMA_ROYALTY, uid) -> u32`.
+/// Absent means 0: the whole attestation fee goes to the protocol treasury.
+pub const SCHEMA_ROYALTY: Symbol = symbol_short!("ROYALTY");
+/// Quarantine flag (#539). `(SCHEMA_QUARANTINE, uid) -> bool`.
+pub const SCHEMA_QUARANTINE: Symbol = symbol_short!("QUAR");
+/// Explanation URI recorded with the latest quarantine toggle (#539).
+pub const SCHEMA_QUARANTINE_URI: Symbol = symbol_short!("QUARURI");
+
+/// Storage key for a schema's required FROST threshold signing group (#534).
+/// Stored under `(FROST_GROUP, schema_uid) -> FrostGroup`. Kept beside the
+/// schema record rather than inside it so `SchemaRecord`'s XDR layout remains
+/// byte-stable for existing deployments.
+pub const FROST_GROUP: Symbol = symbol_short!("FROSTGRP");
+
+/// Storage key for the in-flight multi-signature ownership transfer.
+/// Stored under `(PENDING_OWNERSHIP, schema_uid) -> PendingOwnershipTransfer`
+/// and removed as soon as the transfer is executed, cancelled, or invalidated
+/// by a reconfiguration of the owner set.
+pub const PENDING_OWNERSHIP: Symbol = symbol_short!("PENDOWN");
+
+/// First topic of the `(SCHEMA_OWNER_SET_UPDATED, uid)` event published when a
+/// schema's multi-signature owner set is configured or replaced. Data is
+/// `(authorizer, OwnerSet)`.
+pub const SCHEMA_OWNER_SET_UPDATED: Symbol = symbol_short!("OWNSETUP");
+
+/// First topic of the `(SCHEMA_OWNER_PROPOSED, uid)` event published when a
+/// multi-signature ownership transfer collects its first approval. Data is
+/// `(proposer, PendingOwnershipTransfer)`.
+pub const SCHEMA_OWNER_PROPOSED: Symbol = symbol_short!("OWNPROP");
+
+/// First topic of the `(SCHEMA_OWNER_APPROVED, uid)` event published for every
+/// additional approval collected on an in-flight transfer. Data is
+/// `(approver, approval_count)`.
+pub const SCHEMA_OWNER_APPROVED: Symbol = symbol_short!("OWNAPPR");
+
+/// First topic of the `(SCHEMA_OWNER_TRANSFER_CANCELLED, uid)` event published
+/// when an in-flight multi-signature ownership transfer is abandoned. Data is
+/// the cancelling owner.
+pub const SCHEMA_OWNER_TRANSFER_CANCELLED: Symbol = symbol_short!("OWNCANC");
+
+/// Hard ceiling on the size of a single multi-signature owner set. Bounds the
+/// cost of every approval scan so a hostile configuration cannot make owner
+/// checks unbounded.
+pub const MAX_OWNER_SET: u32 = 10;

@@ -12,13 +12,15 @@ pub enum SASError {
 
     /// Schema validation errors
     InvalidSchema = 101,
-    SchemaAlreadyExists = 102,
-    SchemaNotFound = 103,
+    InvalidSchemaFormat = 104,
+    EmptySchema = 105,
     /// A schema definition string violated strict lexical rules: it contained
     /// control characters, invalid/invisible unicode whitespace, or malformed
     /// separators (trailing/leading delimiters, non-canonical spacing). See
     /// `validate_schema_lexical`.
-    InvalidSchemaDefinition = 104,
+    InvalidSchemaDefinition = 106,
+    SchemaAlreadyExists = 102,
+    SchemaNotFound = 103,
 
     /// Attestation lifecycle errors
     AttestationNotFound = 201,
@@ -46,4 +48,56 @@ pub enum SASError {
     IncompatibleDependency = 404,
     /// The requested attestation batch exceeds the protocol limit.
     BatchTooLarge = 405,
+    /// `register_attester_key` was called while a non-revoked key is
+    /// already registered for the attester; use `rotate_attester_key`.
+    AttesterKeyAlreadyRegistered = 406,
+    /// A rotate/revoke operation was attempted with no registered key on
+    /// file for the attester.
+    AttesterKeyNotFound = 407,
+    /// The registered key for this attester has already been revoked.
+    AttesterKeyRevoked = 408,
+    /// The schema's resolver rejected, trapped on, or does not implement the
+    /// callback for this operation. Resolvers are authoritative: this aborts
+    /// the whole call. See docs/schemas.md's "Resolver Failure Semantics".
+    ResolverRejected = 409,
+    /// `attest_with_value` was called with a token or amount that does not
+    /// match the fee required by authenticated on-chain configuration (#164).
+    FeeMismatch = 410,
+    /// A bound Indexer could not be invoked and the contract is configured to
+    /// fail closed on indexing errors (#161).
+    IndexerUnavailable = 411,
+    /// The count metadata expired while schema records still exist.
+    CountMetadataExpired = 412,
+    /// `ref_uid` self-references the attestation being issued, or points at
+    /// a UID that was never issued (#159).
+    InvalidRefUid = 413,
+    /// The attestation's `data` payload exceeds `MAX_ATTESTATION_DATA_BYTES`
+    /// (#157).
+    PayloadTooLarge = 414,
+    /// `register_with_value` was called while a registration fee is
+    /// configured but no treasury address has been set to receive it (#1).
+    TreasuryNotSet = 415,
+    /// An attestation's `uid` does not match the content-addressed hash of
+    /// its `schema_uid`, `recipient`, `attester`, and `data` fields (#215).
+    InvalidUID = 416,
+    /// Maximum queries per block limit exceeded.
+    LimitExceeded = 417,
+    /// Invalid time range: valid_from >= expiration_time > 0 (#439).
+    InvalidTimeRange = 418,
+    /// Expiration time exceeds schema's max_ttl or perpetual attestation under capped schema (#441).
+    InvalidExpirationTime = 419,
+    /// A new attestation was attempted under a schema the protocol admin has quarantined (#539).
+    SchemaQuarantined = 420,
+    /// A time-window resolver rejected an attestation because the recipient's
+    /// cooldown period has not elapsed yet (#549).
+    CooldownActive = 421,
+
+    /// Circuit breaker errors
+    /// The contract is paused and write operations are not permitted (#255).
+    ContractPaused = 501,
+
+    /// Reentrancy errors
+    /// A callback (resolver or indexer) re-entered `multi_attest` while the
+    /// outer batch was still executing (#296).
+    Reentrancy = 502,
 }

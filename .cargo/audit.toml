@@ -1,0 +1,34 @@
+# cargo-audit configuration.
+#
+# The advisories below are all transitively pinned by soroban-sdk 20.x's
+# dependency tree (soroban-env-host / soroban-env-common pin exact or
+# narrow ranges for curve25519-dalek and serde) and cannot be bumped without
+# a major soroban-sdk upgrade, which is out of scope while the workspace is
+# pinned to Rust 1.83.0 (see rust-toolchain.toml). Re-evaluate this list
+# whenever soroban-sdk is upgraded.
+[advisories]
+ignore = [
+    # curve25519-dalek: soroban-env-host 20.3.0 pins
+    # ">=4.1.1, <=4.1.2", which excludes the 4.1.3 fix.
+    "RUSTSEC-2024-0344",
+    # idna: pulled in via `url` (through `ureq`), itself held back for the
+    # 1.79.0 MSRV; upgrading to idna >=1.0 requires a newer `url` major.
+    "RUSTSEC-2024-0421",
+    # time: pulled in via serde_with -> soroban-ledger-snapshot; the fixed
+    # 0.3.47 needs a serde_core/serde_derive newer than the
+    # `serde = "=1.0.192"` soroban-env-common pins exactly.
+    "RUSTSEC-2026-0009",
+    # rand unsoundness pulled in via soroban-env-host.
+    "RUSTSEC-2026-0097",
+    # tokio AsyncFd I/O-safety unsoundness; the fixed tokio needs Rust 1.85 but
+    # the workspace is pinned to 1.83. Dev-only (SDK tests); AsyncFd is unused.
+    "RUSTSEC-2026-0386",
+    # webpki-roots: transitive via ureq 2.12.1 holding webpki-roots 0.26.11.
+    "RUSTSEC-2026-0381",
+    # rustls-webpki / webpki transitive via ureq.
+    "RUSTSEC-2026-0382",
+    # tokio: AsyncFd I/O safety; 1.54.0+ requires Rust >=1.85.
+    "RUSTSEC-2026-0386",
+    # crypto-bigint: timing variability; transitive via k256/elliptic-curve.
+    "RUSTSEC-2026-0387",
+]

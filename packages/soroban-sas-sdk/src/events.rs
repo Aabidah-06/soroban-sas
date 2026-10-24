@@ -8,12 +8,19 @@
 
 use soroban_sdk::xdr::{ContractEvent, ContractEventBody, ScAddress, ScMap, ScVal};
 
+/// A contract's 32-byte identifier, as carried on `ContractEvent::contract_id`.
+pub type ContractId = [u8; 32];
+
 /// First topic of a `SchemaRegistered` event.
 pub const TOPIC_SCHEMA_REGISTERED: &[u8] = b"REGISTER";
 /// First topic of an `AttestationIssued` event.
 pub const TOPIC_ATTESTATION_ISSUED: &[u8] = b"ATTESTED";
 /// First topic of an `AttestationRevoked` event.
 pub const TOPIC_ATTESTATION_REVOKED: &[u8] = b"REVOKED";
+/// First topic of a `BatchAttested` event.
+pub const TOPIC_BATCH_ATTESTED: &[u8] = b"BATCHATT";
+/// First topic of a `BatchRevoked` event.
+pub const TOPIC_BATCH_REVOKED: &[u8] = b"BATCHREV";
 
 /// Decoded `SchemaRegistered` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,16 +45,62 @@ pub struct AttestationRevoked {
     pub timestamp: u64,
 }
 
+/// Decoded `BatchAttested` event: the summary marker published as the last
+/// event of a successful `multi_attest` call (#213).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAttested {
+    pub count: u32,
+    pub attester_count: u32,
+}
+
+/// Decoded `BatchRevoked` event: the summary marker published as the last
+/// event of a successful `multi_revoke` call (#213).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRevoked {
+    pub count: u32,
+    pub attester_count: u32,
+}
+
+/// First topic of a SAS fee configuration change.
+pub const TOPIC_FEE_CONFIG_UPDATED: &[u8] = b"FEECFGUPD";
+/// First topic of an `IndexerStrictUpdated` event.
+pub const TOPIC_INDEXER_STRICT_UPDATED: &[u8] = b"IDXSTRUP";
+
+/// Decoded SAS fee policy change. `None` denotes no configured fee.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfigUpdated {
+    pub old_token: Option<ScAddress>,
+    pub old_amount: Option<i128>,
+    pub new_token: Option<ScAddress>,
+    pub new_amount: Option<i128>,
+    pub authorizer: ScAddress,
+}
+
+/// Decoded `IndexerStrictUpdated` event (#251).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexerStrictUpdated {
+    pub old_strict: bool,
+    pub new_strict: bool,
+    pub admin: ScAddress,
+}
+
 /// Any standardized event emitted by the SAS contracts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SasEvent {
     SchemaRegistered(SchemaRegistered),
     AttestationIssued(AttestationIssued),
     AttestationRevoked(AttestationRevoked),
+    BatchAttested(BatchAttested),
+    BatchRevoked(BatchRevoked),
+    FeeConfigUpdated(FeeConfigUpdated),
+    IndexerStrictUpdated(IndexerStrictUpdated),
 }
 
+use serde::Serialize;
+
 /// Why an event could not be decoded as a SAS event.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventParseError {
     /// The event's first topic is not one of the SAS topics.
     NotSasEvent,
@@ -72,31 +125,131 @@ pub fn parse_event(topics: &[ScVal], data: &ScVal) -> Result<SasEvent, EventPars
         _ => return Err(EventParseError::NotSasEvent),
     };
     match name {
-        n if n == TOPIC_SCHEMA_REGISTERED => {
+        n if n == TOPIC_FEE_CONFIG_UPDATED => {
             let map = expect_map(data)?;
+            let authorizer = decode_address(map_get(map, b"authorizer")?)?;
+            if topics.len() != 2 || decode_address(&topics[1]) != Ok(authorizer.clone()) {
+                return Err(EventParseError::MalformedPayload(
+                    "authorizer topic does not match payload",
+                ));
+            }
+            Ok(SasEvent::FeeConfigUpdated(FeeConfigUpdated {
+                old_token: decode_optional_address(map_get(map, b"old_token")?)?,
+                old_amount: decode_optional_amount(map_get(map, b"old_amount")?)?,
+                new_token: decode_optional_address(map_get(map, b"new_token")?)?,
+                new_amount: decode_optional_amount(map_get(map, b"new_amount")?)?,
+                authorizer,
+            }))
+        }
+        n if n == TOPIC_INDEXER_STRICT_UPDATED => {
+            // Topics: `(INDEXER_STRICT_UPDATED, admin)`.
+            let map = expect_map(data)?;
+            let admin = decode_address(map_get(map, b"admin")?)?;
+            if topics.len() != 2 || decode_address(&topics[1]) != Ok(admin.clone()) {
+                return Err(EventParseError::MalformedPayload(
+                    "admin topic does not match payload",
+                ));
+            }
+            Ok(SasEvent::IndexerStrictUpdated(IndexerStrictUpdated {
+                old_strict: decode_bool(map_get(map, b"old_strict")?)?,
+                new_strict: decode_bool(map_get(map, b"new_strict")?)?,
+                admin,
+            }))
+        }
+        n if n == TOPIC_SCHEMA_REGISTERED => {
+            // Topics: `(REGISTERED, schema_uid)`. `schema_uid` topics/payload
+            // fields use the same encoding as any other `UID` value, so reuse
+            // `decode_uid` rather than assuming a `Symbol` shape.
+            let map = expect_map(data)?;
+            let schema_uid_from_payload = decode_uid(map_get(map, b"schema_uid")?)?;
+            let schema_uid_from_topic = topics
+                .get(1)
+                .ok_or(EventParseError::MalformedPayload(
+                    "missing topic schema_uid",
+                ))
+                .and_then(decode_uid);
+            if schema_uid_from_topic != Ok(schema_uid_from_payload) {
+                return Err(EventParseError::MalformedPayload(
+                    "schema_uid topic does not match payload",
+                ));
+            }
             Ok(SasEvent::SchemaRegistered(SchemaRegistered {
-                schema_uid: decode_uid(map_get(map, b"schema_uid")?)?,
+                schema_uid: schema_uid_from_payload,
                 owner: decode_address(map_get(map, b"owner")?)?,
             }))
         }
         n if n == TOPIC_ATTESTATION_ISSUED => {
+            // Topics: `(ATTESTED, schema_uid, attester)` — see
+            // `contracts/sas/src/events.rs::publish_attested`. `uid` is not a
+            // topic, only a payload field.
             let map = expect_map(data)?;
+            let uid_from_payload = decode_uid(map_get(map, b"uid")?)?;
+            let schema_uid_from_payload = decode_uid(map_get(map, b"schema_uid")?)?;
+            let attester_from_payload = decode_address(map_get(map, b"attester")?)?;
+            let schema_uid_from_topic = topics
+                .get(1)
+                .ok_or(EventParseError::MalformedPayload(
+                    "missing topic schema_uid",
+                ))
+                .and_then(decode_uid);
+            let attester_from_topic = topics
+                .get(2)
+                .ok_or(EventParseError::MalformedPayload("missing topic attester"))
+                .and_then(decode_address);
+            if schema_uid_from_topic != Ok(schema_uid_from_payload) {
+                return Err(EventParseError::MalformedPayload(
+                    "schema_uid topic does not match payload",
+                ));
+            }
+            if attester_from_topic != Ok(attester_from_payload.clone()) {
+                return Err(EventParseError::MalformedPayload(
+                    "attester topic does not match payload",
+                ));
+            }
             Ok(SasEvent::AttestationIssued(AttestationIssued {
-                uid: decode_uid(map_get(map, b"uid")?)?,
-                schema_uid: decode_uid(map_get(map, b"schema_uid")?)?,
-                attester: decode_address(map_get(map, b"attester")?)?,
+                uid: uid_from_payload,
+                schema_uid: schema_uid_from_payload,
+                attester: attester_from_payload,
                 recipient: decode_address(map_get(map, b"recipient")?)?,
             }))
         }
         n if n == TOPIC_ATTESTATION_REVOKED => {
+            // Topics: `(REVOKED, uid)`.
             let map = expect_map(data)?;
+            let uid_from_payload = decode_uid(map_get(map, b"uid")?)?;
             let timestamp = match map_get(map, b"timestamp")? {
                 ScVal::U64(ts) => *ts,
                 _ => return Err(EventParseError::MalformedPayload("timestamp is not a u64")),
             };
+            let uid_from_topic = topics
+                .get(1)
+                .ok_or(EventParseError::MalformedPayload("missing topic uid"))
+                .and_then(decode_uid);
+            if uid_from_topic != Ok(uid_from_payload) {
+                return Err(EventParseError::MalformedPayload(
+                    "uid topic does not match payload",
+                ));
+            }
             Ok(SasEvent::AttestationRevoked(AttestationRevoked {
-                uid: decode_uid(map_get(map, b"uid")?)?,
+                uid: uid_from_payload,
                 timestamp,
+            }))
+        }
+        n if n == TOPIC_BATCH_ATTESTED => {
+            // Topics: `(BATCH_ATTESTED,)` — no data-repeating topics to
+            // cross-check, unlike the per-item events above.
+            let map = expect_map(data)?;
+            Ok(SasEvent::BatchAttested(BatchAttested {
+                count: decode_u32(map_get(map, b"count")?)?,
+                attester_count: decode_u32(map_get(map, b"attester_count")?)?,
+            }))
+        }
+        n if n == TOPIC_BATCH_REVOKED => {
+            // Topics: `(BATCH_REVOKED,)`.
+            let map = expect_map(data)?;
+            Ok(SasEvent::BatchRevoked(BatchRevoked {
+                count: decode_u32(map_get(map, b"count")?)?,
+                attester_count: decode_u32(map_get(map, b"attester_count")?)?,
             }))
         }
         _ => Err(EventParseError::NotSasEvent),
@@ -105,10 +258,136 @@ pub fn parse_event(topics: &[ScVal], data: &ScVal) -> Result<SasEvent, EventPars
 
 /// Parses every SAS event from a batch of contract events, silently skipping
 /// events emitted by other contracts or with unknown topics.
+///
+/// This does **not** check the emitting contract ID. Downstream code that
+/// treats parsed events as genuine protocol state should use
+/// [`parse_events_verified`] / [`parse_trusted_events`] with a
+/// [`TrustedContracts`] allowlist instead — any contract can emit
+/// SAS-shaped events (#169).
 pub fn parse_events(events: &[ContractEvent]) -> Vec<SasEvent> {
     events
         .iter()
         .filter_map(|event| parse_contract_event(event).ok())
+        .collect()
+}
+
+/// Allowlist of the contract IDs each SAS protocol role is expected to emit
+/// events from. An unset role means "no trusted source known", so every event
+/// bound to that role is reported [`EventTrust::Untrusted`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrustedContracts {
+    /// The SAS core contract — emits `AttestationIssued` and
+    /// `AttestationRevoked`.
+    pub sas: Option<ContractId>,
+    /// The Schema Registry contract — emits `SchemaRegistered`.
+    pub schema_registry: Option<ContractId>,
+    /// The Indexer contract. Reserved: the Indexer emits no standardized SAS
+    /// event today, but callers can still record its ID in the allowlist.
+    pub indexer: Option<ContractId>,
+}
+
+impl TrustedContracts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_sas(mut self, id: ContractId) -> Self {
+        self.sas = Some(id);
+        self
+    }
+    pub fn with_schema_registry(mut self, id: ContractId) -> Self {
+        self.schema_registry = Some(id);
+        self
+    }
+    pub fn with_indexer(mut self, id: ContractId) -> Self {
+        self.indexer = Some(id);
+        self
+    }
+
+    /// The `(role_name, expected_contract_id)` an event of this kind must come
+    /// from.
+    fn expected_source(&self, event: &SasEvent) -> (&'static str, Option<ContractId>) {
+        match event {
+            SasEvent::SchemaRegistered(_) => ("schema_registry", self.schema_registry),
+            SasEvent::AttestationIssued(_)
+            | SasEvent::AttestationRevoked(_)
+            | SasEvent::BatchAttested(_)
+            | SasEvent::FeeConfigUpdated(_)
+            | SasEvent::IndexerStrictUpdated(_)
+            | SasEvent::BatchRevoked(_) => ("sas", self.sas),
+        }
+    }
+}
+
+/// Whether a decoded event actually came from the contract bound to its
+/// protocol role.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventTrust {
+    /// The emitting contract ID matches the allowlisted ID for this event's
+    /// role.
+    Trusted,
+    /// The topics/payload decoded as a SAS event, but the emitting contract is
+    /// not the one bound to `expected_role` (or no ID was recorded for that
+    /// role, or the event carried no contract ID).
+    Untrusted {
+        expected_role: &'static str,
+        contract_id: Option<ContractId>,
+    },
+}
+
+/// A decoded SAS event paired with its source-verification result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedSasEvent {
+    pub event: SasEvent,
+    pub trust: EventTrust,
+}
+
+/// Like [`parse_contract_event`], but also verifies the emitting contract ID
+/// against `trusted`. The event is still decoded, but a mismatch is reported
+/// as [`EventTrust::Untrusted`] rather than silently accepted, so a spoofed
+/// event can never be mistaken for a genuine attestation or schema change
+/// (#169).
+pub fn parse_contract_event_verified(
+    event: &ContractEvent,
+    trusted: &TrustedContracts,
+) -> Result<VerifiedSasEvent, EventParseError> {
+    let ContractEventBody::V0(body) = &event.body;
+    let parsed = parse_event(body.topics.as_slice(), &body.data)?;
+    let source: Option<ContractId> = event.contract_id.as_ref().map(|h| h.0);
+    let (role, expected) = trusted.expected_source(&parsed);
+    let trust = match (expected, source) {
+        (Some(want), Some(got)) if want == got => EventTrust::Trusted,
+        _ => EventTrust::Untrusted {
+            expected_role: role,
+            contract_id: source,
+        },
+    };
+    Ok(VerifiedSasEvent {
+        event: parsed,
+        trust,
+    })
+}
+
+/// Batch variant of [`parse_contract_event_verified`]. Every returned element
+/// carries its own [`EventTrust`], so trusted and spoofed events in the same
+/// batch cannot be silently mixed — the caller sees the tag on each one.
+pub fn parse_events_verified(
+    events: &[ContractEvent],
+    trusted: &TrustedContracts,
+) -> Vec<VerifiedSasEvent> {
+    events
+        .iter()
+        .filter_map(|event| parse_contract_event_verified(event, trusted).ok())
+        .collect()
+}
+
+/// Convenience over [`parse_events_verified`]: only the events proven to come
+/// from an allowlisted source.
+pub fn parse_trusted_events(events: &[ContractEvent], trusted: &TrustedContracts) -> Vec<SasEvent> {
+    parse_events_verified(events, trusted)
+        .into_iter()
+        .filter(|v| v.trust == EventTrust::Trusted)
+        .map(|v| v.event)
         .collect()
 }
 
@@ -152,11 +431,52 @@ fn decode_address(val: &ScVal) -> Result<ScAddress, EventParseError> {
     }
 }
 
+// PreviousAddress is a contract enum: ["None"] or ["Some", Address].
+fn decode_optional_address(val: &ScVal) -> Result<Option<ScAddress>, EventParseError> {
+    if let ScVal::Vec(Some(values)) = val {
+        match values.as_slice() {
+            [ScVal::Symbol(tag)] if tag.0.as_slice() == b"None" => return Ok(None),
+            [ScVal::Symbol(tag), address] if tag.0.as_slice() == b"Some" => {
+                return decode_address(address).map(Some);
+            }
+            _ => {}
+        }
+    }
+    Err(EventParseError::MalformedPayload(
+        "field is not an optional address",
+    ))
+}
+
+fn decode_optional_amount(val: &ScVal) -> Result<Option<i128>, EventParseError> {
+    match val {
+        ScVal::Void => Ok(None),
+        ScVal::I128(parts) => Ok(Some(((parts.hi as i128) << 64) | parts.lo as i128)),
+        _ => Err(EventParseError::MalformedPayload(
+            "field is not an optional i128",
+        )),
+    }
+}
+
+fn decode_u32(val: &ScVal) -> Result<u32, EventParseError> {
+    match val {
+        ScVal::U32(n) => Ok(*n),
+        _ => Err(EventParseError::MalformedPayload("field is not a u32")),
+    }
+}
+
+fn decode_bool(val: &ScVal) -> Result<bool, EventParseError> {
+    match val {
+        ScVal::Bool(b) => Ok(*b),
+        _ => Err(EventParseError::MalformedPayload("field is not a bool")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sas_common::{
-        AttestationIssuedEvent, AttestationRevokedEvent, SchemaRegisteredEvent, UID,
+        AttestationIssuedEvent, AttestationRevokedEvent, BatchAttestedEvent, BatchRevokedEvent,
+        SchemaRegisteredEvent, UID,
     };
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, BytesN, Env, IntoVal, TryFromVal, Val};
@@ -257,6 +577,167 @@ mod tests {
     }
 
     #[test]
+    fn parses_batch_attested() {
+        let env = Env::default();
+        let payload = BatchAttestedEvent {
+            count: 5,
+            attester_count: 3,
+        };
+        let topics = [to_scval(
+            &env,
+            soroban_sas_common::events::BATCH_ATTESTED.into_val(&env),
+        )];
+        let data = to_scval(&env, payload.into_val(&env));
+
+        let parsed = parse_event(&topics, &data).unwrap();
+        assert_eq!(
+            parsed,
+            SasEvent::BatchAttested(BatchAttested {
+                count: 5,
+                attester_count: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_batch_revoked() {
+        let env = Env::default();
+        let payload = BatchRevokedEvent {
+            count: 4,
+            attester_count: 1,
+        };
+        let topics = [to_scval(
+            &env,
+            soroban_sas_common::events::BATCH_REVOKED.into_val(&env),
+        )];
+        let data = to_scval(&env, payload.into_val(&env));
+
+        let parsed = parse_event(&topics, &data).unwrap();
+        assert_eq!(
+            parsed,
+            SasEvent::BatchRevoked(BatchRevoked {
+                count: 4,
+                attester_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_indexer_strict_updated() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let expected_admin = to_scaddress(&env, &admin);
+        let payload = soroban_sas_common::IndexerStrictUpdatedEvent {
+            old_strict: false,
+            new_strict: true,
+            admin: admin.clone(),
+        };
+        let topics = [
+            to_scval(
+                &env,
+                soroban_sas_common::events::INDEXER_STRICT_UPDATED.into_val(&env),
+            ),
+            to_scval(&env, admin.into_val(&env)),
+        ];
+        let data = to_scval(&env, payload.into_val(&env));
+
+        let parsed = parse_event(&topics, &data).unwrap();
+        assert_eq!(
+            parsed,
+            SasEvent::IndexerStrictUpdated(IndexerStrictUpdated {
+                old_strict: false,
+                new_strict: true,
+                admin: expected_admin,
+            })
+        );
+    }
+
+    fn contract_event(contract_id: [u8; 32], topics: Vec<ScVal>, data: ScVal) -> ContractEvent {
+        use soroban_sdk::xdr::{ContractEventType, ContractEventV0, ExtensionPoint, Hash};
+        ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: Some(Hash(contract_id)),
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: topics.try_into().unwrap(),
+                data,
+            }),
+        }
+    }
+
+    fn revoked_event(env: &Env, seed: u8) -> (Vec<ScVal>, ScVal) {
+        let uid = UID(BytesN::from_array(env, &[seed; 32]));
+        let payload = AttestationRevokedEvent {
+            uid: uid.clone(),
+            timestamp: 7,
+        };
+        (
+            vec![
+                to_scval(env, soroban_sas_common::events::REVOKED.into_val(env)),
+                to_scval(env, uid.into_val(env)),
+            ],
+            to_scval(env, payload.into_val(env)),
+        )
+    }
+
+    #[test]
+    fn verified_parse_accepts_events_from_the_trusted_sas_contract() {
+        let env = Env::default();
+        let (topics, data) = revoked_event(&env, 1);
+        let sas_id = [9u8; 32];
+        let trusted = TrustedContracts::new().with_sas(sas_id);
+
+        let verified =
+            parse_contract_event_verified(&contract_event(sas_id, topics, data), &trusted).unwrap();
+        assert_eq!(verified.trust, EventTrust::Trusted);
+        assert!(matches!(verified.event, SasEvent::AttestationRevoked(_)));
+    }
+
+    #[test]
+    fn verified_parse_flags_the_same_payload_from_an_attacker_contract() {
+        let env = Env::default();
+        let trusted = TrustedContracts::new().with_sas([9u8; 32]);
+
+        let (t1, d1) = revoked_event(&env, 2);
+        let honest =
+            parse_contract_event_verified(&contract_event([9u8; 32], t1, d1), &trusted).unwrap();
+        let (t2, d2) = revoked_event(&env, 2);
+        let spoofed =
+            parse_contract_event_verified(&contract_event([0xAAu8; 32], t2, d2), &trusted).unwrap();
+
+        assert_eq!(honest.event, spoofed.event);
+        assert_eq!(honest.trust, EventTrust::Trusted);
+        assert_eq!(
+            spoofed.trust,
+            EventTrust::Untrusted {
+                expected_role: "sas",
+                contract_id: Some([0xAAu8; 32]),
+            }
+        );
+    }
+
+    #[test]
+    fn batch_parse_tags_each_event_and_trusted_filter_drops_spoofed() {
+        let env = Env::default();
+        let trusted = TrustedContracts::new().with_sas([9u8; 32]);
+        let (t1, d1) = revoked_event(&env, 3);
+        let (t2, d2) = revoked_event(&env, 4);
+        let events = [
+            contract_event([9u8; 32], t1, d1),
+            contract_event([1u8; 32], t2, d2),
+        ];
+
+        let verified = parse_events_verified(&events, &trusted);
+        assert_eq!(verified.len(), 2);
+        assert_eq!(verified[0].trust, EventTrust::Trusted);
+        assert!(matches!(verified[1].trust, EventTrust::Untrusted { .. }));
+
+        let trusted_only = parse_trusted_events(&events, &trusted);
+        assert_eq!(trusted_only.len(), 1);
+    }
+
+    #[test]
     fn rejects_unknown_and_malformed_events() {
         let env = Env::default();
 
@@ -282,5 +763,338 @@ mod tests {
             parse_event(&sas_topic, &ScVal::Void),
             Err(EventParseError::MalformedPayload("payload is not a map"))
         );
+    }
+
+    // ─── Issue #99: Adversarial event parsing resilience tests ──────────────
+
+    #[test]
+    fn malformed_known_event_with_wrong_payload_type_returns_error() {
+        let env = Env::default();
+
+        // REVOKED topic with non-map payload
+        let topics = [to_scval(
+            &env,
+            soroban_sas_common::events::REVOKED.into_val(&env),
+        )];
+
+        assert_eq!(
+            parse_event(&topics, &ScVal::Bool(true)),
+            Err(EventParseError::MalformedPayload("payload is not a map"))
+        );
+
+        assert_eq!(
+            parse_event(&topics, &ScVal::U32(123)),
+            Err(EventParseError::MalformedPayload("payload is not a map"))
+        );
+    }
+
+    #[test]
+    fn malformed_known_event_with_missing_required_field_returns_error() {
+        let env = Env::default();
+
+        let topics = [to_scval(
+            &env,
+            soroban_sas_common::events::REVOKED.into_val(&env),
+        )];
+
+        // Empty map - missing uid and timestamp
+        let empty_map = ScVal::Map(Some(ScMap(vec![].try_into().unwrap())));
+        assert_eq!(
+            parse_event(&topics, &empty_map),
+            Err(EventParseError::MalformedPayload("missing payload field"))
+        );
+    }
+
+    #[test]
+    fn malformed_known_event_with_wrong_field_type_returns_error() {
+        let env = Env::default();
+
+        let topics = [to_scval(
+            &env,
+            soroban_sas_common::events::REVOKED.into_val(&env),
+        )];
+
+        // Map with uid as string instead of bytes
+        use soroban_sdk::xdr::{ScMapEntry, ScString, ScSymbol, StringM};
+        let bad_uid_entry = ScMapEntry {
+            key: ScVal::Symbol(ScSymbol(StringM::try_from(b"uid".to_vec()).unwrap())),
+            val: ScVal::String(ScString(StringM::try_from(b"not-bytes".to_vec()).unwrap())),
+        };
+        let bad_timestamp_entry = ScMapEntry {
+            key: ScVal::Symbol(ScSymbol(StringM::try_from(b"timestamp".to_vec()).unwrap())),
+            val: ScVal::U64(100),
+        };
+        let bad_map = ScVal::Map(Some(ScMap(
+            vec![bad_uid_entry, bad_timestamp_entry].try_into().unwrap(),
+        )));
+
+        assert_eq!(
+            parse_event(&topics, &bad_map),
+            Err(EventParseError::MalformedPayload(
+                "uid is not a bytes value"
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_known_event_with_wrong_uid_length_returns_error() {
+        let env = Env::default();
+
+        let topics = [to_scval(
+            &env,
+            soroban_sas_common::events::ATTESTED.into_val(&env),
+        )];
+
+        // UID with wrong byte length (not 32 bytes)
+        use soroban_sdk::xdr::{ScBytes, ScMapEntry, ScSymbol, StringM};
+        let bad_uid = ScVal::Vec(Some(
+            vec![ScVal::Bytes(ScBytes(vec![1, 2, 3].try_into().unwrap()))]
+                .try_into()
+                .unwrap(),
+        ));
+        let entries = vec![ScMapEntry {
+            key: ScVal::Symbol(ScSymbol(StringM::try_from(b"uid".to_vec()).unwrap())),
+            val: bad_uid,
+        }];
+        let bad_map = ScVal::Map(Some(ScMap(entries.try_into().unwrap())));
+
+        assert_eq!(
+            parse_event(&topics, &bad_map),
+            Err(EventParseError::MalformedPayload("uid is not 32 bytes"))
+        );
+    }
+
+    #[test]
+    fn malformed_known_event_with_non_address_field_returns_error() {
+        let env = Env::default();
+        let uid = UID(BytesN::from_array(&env, &[1u8; 32]));
+        let schema_uid = UID(BytesN::from_array(&env, &[2u8; 32]));
+
+        let topics = [
+            to_scval(&env, soroban_sas_common::events::ATTESTED.into_val(&env)),
+            to_scval(&env, schema_uid.into_val(&env)),
+        ];
+
+        // Build payload with uid and schema_uid correct, but attester as U32 instead of Address
+        use soroban_sdk::xdr::{ScMapEntry, ScSymbol, StringM};
+        let entries = vec![
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol(StringM::try_from(b"uid".to_vec()).unwrap())),
+                val: to_scval(&env, uid.into_val(&env)),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol(StringM::try_from(b"schema_uid".to_vec()).unwrap())),
+                val: to_scval(&env, schema_uid.into_val(&env)),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol(StringM::try_from(b"attester".to_vec()).unwrap())),
+                val: ScVal::U32(999), // Wrong type - should be Address
+            },
+        ];
+        let bad_map = ScVal::Map(Some(ScMap(entries.try_into().unwrap())));
+
+        assert_eq!(
+            parse_event(&topics, &bad_map),
+            Err(EventParseError::MalformedPayload("field is not an address"))
+        );
+    }
+
+    #[test]
+    fn unknown_event_types_are_skipped_without_losing_valid_events() {
+        let env = Env::default();
+
+        // Create three events: valid, unknown, valid
+        let (topics1, data1) = revoked_event(&env, 1);
+        let event1 = contract_event([9u8; 32], topics1, data1);
+
+        let unknown_topics = vec![to_scval(
+            &env,
+            soroban_sdk::symbol_short!("TRANSFER").into_val(&env),
+        )];
+        let event2 = contract_event([9u8; 32], unknown_topics, ScVal::Void);
+
+        let (topics3, data3) = revoked_event(&env, 2);
+        let event3 = contract_event([9u8; 32], topics3, data3);
+
+        let events = [event1, event2, event3];
+        let parsed = parse_events(&events);
+
+        // Should get exactly 2 valid events (the unknown one is skipped)
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(parsed[0], SasEvent::AttestationRevoked(_)));
+        assert!(matches!(parsed[1], SasEvent::AttestationRevoked(_)));
+    }
+
+    #[test]
+    fn malformed_known_event_is_skipped_in_batch_without_panicking() {
+        let env = Env::default();
+
+        // Create three events: valid, malformed (but recognized topic), valid
+        let (topics1, data1) = revoked_event(&env, 3);
+        let event1 = contract_event([9u8; 32], topics1, data1);
+
+        let malformed_topics = vec![to_scval(
+            &env,
+            soroban_sas_common::events::REVOKED.into_val(&env),
+        )];
+        let event2 = contract_event([9u8; 32], malformed_topics, ScVal::U32(999)); // Wrong payload type
+
+        let (topics3, data3) = revoked_event(&env, 4);
+        let event3 = contract_event([9u8; 32], topics3, data3);
+
+        let events = [event1, event2, event3];
+        let parsed = parse_events(&events);
+
+        // Should get exactly 2 valid events (the malformed one is skipped)
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(parsed[0], SasEvent::AttestationRevoked(_)));
+        assert!(matches!(parsed[1], SasEvent::AttestationRevoked(_)));
+    }
+
+    #[test]
+    fn non_symbol_first_topic_returns_not_sas_event() {
+        // First topic is U32 instead of Symbol
+        let topics = [ScVal::U32(123)];
+        assert_eq!(
+            parse_event(&topics, &ScVal::Void),
+            Err(EventParseError::NotSasEvent)
+        );
+
+        // First topic is Bytes instead of Symbol
+        use soroban_sdk::xdr::ScBytes;
+        let topics = [ScVal::Bytes(ScBytes(vec![1, 2, 3].try_into().unwrap()))];
+        assert_eq!(
+            parse_event(&topics, &ScVal::Void),
+            Err(EventParseError::NotSasEvent)
+        );
+    }
+
+    #[test]
+    fn timestamp_field_with_wrong_type_returns_error() {
+        let env = Env::default();
+        let uid = UID(BytesN::from_array(&env, &[5u8; 32]));
+
+        let topics = [
+            to_scval(&env, soroban_sas_common::events::REVOKED.into_val(&env)),
+            to_scval(&env, uid.clone().into_val(&env)),
+        ];
+
+        // Build payload with timestamp as String instead of U64
+        use soroban_sdk::xdr::{ScMapEntry, ScString, ScSymbol, StringM};
+        let entries = vec![
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol(StringM::try_from(b"uid".to_vec()).unwrap())),
+                val: to_scval(&env, uid.into_val(&env)),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol(StringM::try_from(b"timestamp".to_vec()).unwrap())),
+                val: ScVal::String(ScString(
+                    StringM::try_from(b"not-a-number".to_vec()).unwrap(),
+                )),
+            },
+        ];
+        let bad_map = ScVal::Map(Some(ScMap(entries.try_into().unwrap())));
+
+        assert_eq!(
+            parse_event(&topics, &bad_map),
+            Err(EventParseError::MalformedPayload("timestamp is not a u64"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod fee_config_tests {
+    use super::*;
+    use soroban_sas_common::{FeeConfigUpdatedEvent, PreviousAddress, FEECFG_UPDATED};
+    use soroban_sdk::xdr::{ContractEventType, ContractEventV0, ExtensionPoint, Hash};
+    use soroban_sdk::{testutils::Address as _, Address, Env, IntoVal, TryFromVal, Val};
+
+    fn scval(env: &Env, value: Val) -> ScVal {
+        ScVal::try_from_val(env, &value).unwrap()
+    }
+
+    #[test]
+    fn parses_fee_lifecycle_and_checks_emitting_contract() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let other = Address::generate(&env);
+        for (old, new) in [
+            (None, Some((token.clone(), 25))),
+            (Some((token.clone(), 25)), Some((other.clone(), i128::MAX))),
+            (Some((other.clone(), i128::MAX)), None),
+            (None, None),
+        ] {
+            let payload = FeeConfigUpdatedEvent {
+                old_token: old.as_ref().map(|(a, _)| a.clone()).into(),
+                old_amount: old.as_ref().map(|(_, n)| *n),
+                new_token: new.as_ref().map(|(a, _)| a.clone()).into(),
+                new_amount: new.as_ref().map(|(_, n)| *n),
+                authorizer: admin.clone(),
+            };
+            let mut event = ContractEvent {
+                ext: ExtensionPoint::V0,
+                contract_id: Some(Hash([9; 32])),
+                type_: ContractEventType::Contract,
+                body: ContractEventBody::V0(ContractEventV0 {
+                    topics: vec![
+                        scval(&env, FEECFG_UPDATED.into_val(&env)),
+                        scval(&env, admin.into_val(&env)),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                    data: scval(&env, payload.into_val(&env)),
+                }),
+            };
+            let address = |a: &Address| decode_address(&scval(&env, a.into_val(&env))).unwrap();
+            assert_eq!(
+                parse_contract_event(&event).unwrap(),
+                SasEvent::FeeConfigUpdated(FeeConfigUpdated {
+                    old_token: old.as_ref().map(|(a, _)| address(a)),
+                    old_amount: old.map(|(_, n)| n),
+                    new_token: new.as_ref().map(|(a, _)| address(a)),
+                    new_amount: new.map(|(_, n)| n),
+                    authorizer: address(&admin),
+                })
+            );
+            let trusted = TrustedContracts::new().with_sas([9; 32]);
+            assert_eq!(
+                parse_contract_event_verified(&event, &trusted)
+                    .unwrap()
+                    .trust,
+                EventTrust::Trusted
+            );
+            event.contract_id = Some(Hash([8; 32]));
+            assert!(matches!(
+                parse_contract_event_verified(&event, &trusted)
+                    .unwrap()
+                    .trust,
+                EventTrust::Untrusted {
+                    expected_role: "sas",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_optional_fields_and_authorizer_topic() {
+        let env = Env::default();
+        assert!(decode_optional_address(&ScVal::Void).is_err());
+        assert!(decode_optional_address(&ScVal::Vec(Some(vec![].try_into().unwrap()))).is_err());
+        assert!(decode_optional_amount(&ScVal::U64(1)).is_err());
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let payload = FeeConfigUpdatedEvent {
+            old_token: PreviousAddress::None,
+            old_amount: None,
+            new_token: PreviousAddress::None,
+            new_amount: None,
+            authorizer: admin,
+        };
+        let data = scval(&env, payload.into_val(&env));
+        let topic = scval(&env, FEECFG_UPDATED.into_val(&env));
+        assert!(parse_event(&[topic.clone()], &data).is_err());
+        assert!(parse_event(&[topic, scval(&env, other.into_val(&env))], &data).is_err());
     }
 }

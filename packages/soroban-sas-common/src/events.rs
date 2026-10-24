@@ -5,7 +5,7 @@
 //! attestation graph without reading contract storage.
 
 use crate::UID;
-use soroban_sdk::{contracttype, symbol_short, Address, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Symbol};
 
 /// First topic of every `AttestationIssued` event.
 pub const ATTESTED: Symbol = symbol_short!("ATTESTED");
@@ -13,14 +13,56 @@ pub const ATTESTED: Symbol = symbol_short!("ATTESTED");
 pub const REVOKED: Symbol = symbol_short!("REVOKED");
 /// First topic of every `SchemaRegistered` event.
 pub const REGISTERED: Symbol = symbol_short!("REGISTER");
+/// First topic of every `AttesterKeyRegistered` event.
+pub const ATTESTER_KEY_REGISTERED: Symbol = symbol_short!("ATTKREG");
+/// First topic of every `AttesterKeyRotated` event.
+pub const ATTESTER_KEY_ROTATED: Symbol = symbol_short!("ATTKROT");
+/// First topic of every `AttesterKeyRevoked` event.
+pub const ATTESTER_KEY_REVOKED: Symbol = symbol_short!("ATTKREV");
+/// First topic of every `IndexerUpdated` event.
+pub const INDEXER_UPDATED: Symbol = symbol_short!("IDXUPD");
+/// First topic of every `SchemaFeeUpdated` event.
+pub const SCHEMA_FEE_UPDATED: Symbol = symbol_short!("FEEUPD");
+/// First topic of every `TreasuryUpdated` event.
+pub const TREASURY_UPDATED: Symbol = symbol_short!("TRSUPD");
+/// First topic of every `ContractUpgraded` event.
+pub const CONTRACT_UPGRADED: Symbol = symbol_short!("UPGRADED");
+/// First topic of every `SchemaDelegateAdded` event.
+pub const SCHEMA_DELEGATE_ADDED: Symbol = symbol_short!("DELADD");
+/// First topic of every `SchemaDelegateRemoved` event.
+pub const SCHEMA_DELEGATE_REMOVED: Symbol = symbol_short!("DELREM");
+/// First topic of every `AdminTransferProposed` event.
+pub const ADMIN_TRANSFER_PROPOSED: Symbol = symbol_short!("ADMPROP");
+/// First topic of every `AdminTransferCompleted` event.
+pub const ADMIN_TRANSFER_COMPLETED: Symbol = symbol_short!("ADMCOMP");
+/// First topic of every `SchemaOwnershipTransferred` event.
+pub const SCHEMA_OWNERSHIP_TRANSFERRED: Symbol = symbol_short!("SCHOWN");
 /// First topic of every `SchemaOwnershipProposed` event (#446).
 pub const SCHEMA_OWNERSHIP_PROPOSED: Symbol = symbol_short!("SCHPROP");
-/// First topic of every `SchemaOwnershipTransferred` event (#446).
-pub const SCHEMA_OWNERSHIP_TRANSFERRED: Symbol = symbol_short!("SCHOWN");
 /// First topic of every `SchemaOwnershipTransferCancelled` event (#446).
 pub const SCHEMA_OWNERSHIP_CANCELLED: Symbol = symbol_short!("SCHCANC");
 /// First topic of every `NoncesInvalidated` event (#437).
 pub const NONCES_INVALIDATED: Symbol = symbol_short!("NONCEINV");
+/// First topic of every `BatchAttested` event.
+pub const BATCH_ATTESTED: Symbol = symbol_short!("BATCHATT");
+/// First topic of every `BatchRevoked` event.
+pub const BATCH_REVOKED: Symbol = symbol_short!("BATCHREV");
+/// First topic of every `IndexerStrictUpdated` event.
+pub const INDEXER_STRICT_UPDATED: Symbol = symbol_short!("IDXSTRUP");
+/// First topic of every `SchemaDeprecated` event.
+pub const SCHEMA_DEPRECATED: Symbol = symbol_short!("SCHDEP");
+/// First topic of every `SchemaFrostGroupUpdated` event (#534).
+pub const SCHEMA_FROST_GROUP_UPDATED: Symbol = symbol_short!("FROSTGRP");
+/// First topic of every `ContractPaused` event.
+pub const CONTRACT_PAUSED: Symbol = symbol_short!("PAUSED");
+/// First topic of every `ContractUnpaused` event.
+pub const CONTRACT_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
+/// First topic of every `AttestationRenewed` event.
+pub const ATTESTATION_RENEWED: Symbol = symbol_short!("ATSTRENEW");
+/// First topic of every `FeeDistributed` event (#538).
+pub const FEE_DISTRIBUTED: Symbol = symbol_short!("FEEDIST");
+/// First topic of every schema quarantine toggle (#539).
+pub const SCHEMA_QUARANTINED: Symbol = symbol_short!("SCHQUAR");
 
 /// Payload of the `SchemaRegistered` event.
 ///
@@ -45,42 +87,6 @@ pub struct AttestationIssuedEvent {
     pub recipient: Address,
 }
 
-/// Payload of the `SchemaOwnershipProposed` event (#446).
-///
-/// Published with topics `(SCHEMA_OWNERSHIP_PROPOSED, schema_uid)` when the
-/// current owner proposes a new owner in the two-step transfer.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchemaOwnershipProposedEvent {
-    pub schema_uid: UID,
-    pub current_owner: Address,
-    pub proposed_owner: Address,
-}
-
-/// Payload of the `SchemaOwnershipTransferred` event (#446).
-///
-/// Published with topics `(SCHEMA_OWNERSHIP_TRANSFERRED, schema_uid)` when the
-/// proposed owner claims ownership.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchemaOwnershipTransferredEvent {
-    pub schema_uid: UID,
-    pub old_owner: Address,
-    pub new_owner: Address,
-}
-
-/// Payload of the `NoncesInvalidated` event (#437).
-///
-/// Published with topics `(NONCES_INVALIDATED, attester)`. `min_nonce` and
-/// `max_nonce` describe the inclusive range of delegation nonces cancelled by
-/// advancing the attester's high-water mark.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NoncesInvalidatedEvent {
-    pub attester: Address,
-    pub min_nonce: u64,
-    pub max_nonce: u64,
-}
 
 /// Payload of the `AttestationRevoked` event.
 ///
@@ -91,4 +97,372 @@ pub struct NoncesInvalidatedEvent {
 pub struct AttestationRevokedEvent {
     pub uid: UID,
     pub timestamp: u64,
+}
+
+/// Payload of the `AttesterKeyRegistered` event.
+///
+/// Published with topics `(ATTESTER_KEY_REGISTERED, attester)` the first
+/// time a delegated-verification key is registered for `attester`, and
+/// again if a key is re-registered after a prior one was revoked.
+/// `version` starts at `1` and increases by one on every subsequent
+/// registration or rotation for the same attester, so off-chain consumers
+/// can order key changes without relying on ledger sequence alone.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttesterKeyRegisteredEvent {
+    pub attester: Address,
+    pub public_key: BytesN<32>,
+    pub version: u32,
+}
+
+/// Payload of the `AttesterKeyRotated` event.
+///
+/// Published with topics `(ATTESTER_KEY_ROTATED, attester)` when an
+/// already-registered, non-revoked key is replaced with a new one.
+/// `old_public_key` and `new_public_key` let an off-chain monitor
+/// reconstruct the full key history; `new_version` is the incremented
+/// version now in effect.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttesterKeyRotatedEvent {
+    pub attester: Address,
+    pub old_public_key: BytesN<32>,
+    pub new_public_key: BytesN<32>,
+    pub new_version: u32,
+}
+
+/// Payload of the `AttesterKeyRevoked` event.
+///
+/// Published with topics `(ATTESTER_KEY_REVOKED, attester)`. Once revoked,
+/// `public_key` no longer validates any delegated operation for
+/// `attester`, even though the record is retained (rather than deleted)
+/// so `version` continues to increase on any future re-registration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttesterKeyRevokedEvent {
+    pub attester: Address,
+    pub public_key: BytesN<32>,
+    pub version: u32,
+}
+/// `Option<Address>`-equivalent for contract event payloads.
+///
+/// `#[contracttype]`'s generated `Option<T>` conversion requires a
+/// host-independent `From<T> for ScVal`, which `Address` does not provide
+/// (unlike primitives such as `i128`) — at this pinned SDK version that
+/// surfaces as a compile error specifically under the `testutils` cfg
+/// (`cargo test`, `cargo clippy --all-targets`). A plain enum sidesteps it:
+/// enum-with-data conversions go through a different, unaffected codegen
+/// path.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreviousAddress {
+    None,
+    Some(Address),
+}
+
+impl From<Option<Address>> for PreviousAddress {
+    fn from(value: Option<Address>) -> Self {
+        match value {
+            Some(address) => PreviousAddress::Some(address),
+            None => PreviousAddress::None,
+        }
+    }
+}
+
+/// Payload of the `IndexerUpdated` event.
+///
+/// Published with topics `(INDEXER_UPDATED, authorizer)` on a successful
+/// `SAS::set_indexer`. `old_indexer` is `PreviousAddress::None` the first
+/// time an indexer is bound. `authorizer` is the address that authorized the
+/// change (SAS's admin), included directly in the payload — not just implied
+/// by `require_auth` — so an off-chain monitor can attribute the change
+/// without cross-referencing a separate admin-lookup call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexerUpdatedEvent {
+    pub old_indexer: PreviousAddress,
+    pub new_indexer: Address,
+    pub authorizer: Address,
+}
+
+/// Payload of the `SchemaFeeUpdated` event.
+///
+/// Published with topics `(SCHEMA_FEE_UPDATED, authorizer)` on a
+/// successful `SchemaRegistry::set_fee`. `old_fee_token`/`old_fee_amount`
+/// are `PreviousAddress::None`/`None` the first time a fee is set. The
+/// token and amount are split into separate fields (rather than an
+/// `Option<(Address, i128)>` pair) because `Option<Address>` fails to
+/// compile under `testutils` — see [`PreviousAddress`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaFeeUpdatedEvent {
+    pub old_fee_token: PreviousAddress,
+    pub old_fee_amount: Option<i128>,
+    pub new_fee_token: Address,
+    pub new_fee_amount: i128,
+    pub authorizer: Address,
+}
+
+/// Payload of the `TreasuryUpdated` event.
+///
+/// Published with topics `(TREASURY_UPDATED, authorizer)` on a successful
+/// `SchemaRegistry::set_treasury`. `old_treasury` is `PreviousAddress::None`
+/// the first time a treasury address is set.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryUpdatedEvent {
+    pub old_treasury: PreviousAddress,
+    pub new_treasury: Address,
+    pub authorizer: Address,
+}
+
+/// Payload of the `ContractUpgraded` event.
+///
+/// Published with topics `(CONTRACT_UPGRADED, authorizer)` on a successful
+/// contract upgrade immediately before the WASM swap is requested. Soroban
+/// does not let a running contract read its installed WASM hash. Producers
+/// therefore document how the first upgrade represents an unavailable legacy
+/// hash and track successful target hashes for subsequent events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgradedEvent {
+    pub old_wasm_hash: BytesN<32>,
+    pub new_wasm_hash: BytesN<32>,
+    pub authorizer: Address,
+}
+
+/// Payload of the `SchemaDelegateAdded` event.
+///
+/// Published with topics `(SCHEMA_DELEGATE_ADDED, schema_uid)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaDelegateAddedEvent {
+    pub schema_uid: UID,
+    pub delegate: Address,
+    pub authorizer: Address,
+}
+
+/// Payload of the `SchemaDelegateRemoved` event.
+///
+/// Published with topics `(SCHEMA_DELEGATE_REMOVED, schema_uid)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaDelegateRemovedEvent {
+    pub schema_uid: UID,
+    pub delegate: Address,
+    pub authorizer: Address,
+}
+
+/// Payload of the `AdminTransferProposed` event.
+///
+/// Published with topics `(ADMIN_TRANSFER_PROPOSED, current_admin)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposedEvent {
+    pub current_admin: Address,
+    pub proposed_admin: Address,
+}
+pub type AdminTransferProposed = AdminTransferProposedEvent;
+
+/// Payload of the `AdminTransferCompleted` event.
+///
+/// Published with topics `(ADMIN_TRANSFER_COMPLETED, old_admin)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCompletedEvent {
+    pub old_admin: Address,
+    pub new_admin: Address,
+}
+pub type AdminTransferCompleted = AdminTransferCompletedEvent;
+
+/// Payload of the `SchemaOwnershipTransferred` event.
+///
+/// Published with topics `(SCHEMA_OWNERSHIP_TRANSFERRED, schema_uid)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaOwnershipTransferredEvent {
+    pub schema_uid: UID,
+    pub old_owner: Address,
+    pub new_owner: Address,
+}
+pub type SchemaOwnershipTransferred = SchemaOwnershipTransferredEvent;
+
+/// Payload of the `SchemaOwnershipProposed` event (#446).
+///
+/// Published with topics `(SCHEMA_OWNERSHIP_PROPOSED, schema_uid)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaOwnershipProposedEvent {
+    pub schema_uid: UID,
+    pub current_owner: Address,
+    pub proposed_owner: Address,
+}
+pub type SchemaOwnershipProposed = SchemaOwnershipProposedEvent;
+
+/// Payload of the `NoncesInvalidated` event (#437).
+///
+/// Published with topics `(NONCES_INVALIDATED, attester)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoncesInvalidatedEvent {
+    pub attester: Address,
+    pub min_nonce: u64,
+    pub max_nonce: u64,
+}
+pub type NoncesInvalidated = NoncesInvalidatedEvent;
+
+/// Payload of the `BatchAttested` event.
+///
+/// Published with topics `(BATCH_ATTESTED,)` as the **last** event of a
+/// successful `SAS::multi_attest` call — after every per-item
+/// `AttestationIssued` event, so consumers see the batch's members before
+/// its summary. Not emitted at all if the batch call reverts (#213): a
+/// summary always describes a batch that was fully committed, never a
+/// partial one.
+///
+/// `count` is the number of attestations issued by the call;
+/// `attester_count` is the number of *distinct* attester addresses among
+/// them (an attester issuing three attestations in one batch counts once).
+/// This distinguishes one batch call from several independent calls when an
+/// indexer restarts from an earlier ledger, and avoids the need to
+/// heuristically group sequential per-item events by schema/attester to
+/// answer "how many attestations did this transaction issue".
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAttestedEvent {
+    pub count: u32,
+    pub attester_count: u32,
+}
+
+/// Payload of the `SchemaDeprecated` event.
+///
+/// Published with topics `(SCHEMA_DEPRECATED, schema_uid)` when
+/// `SchemaRegistry::deprecate` transitions a schema from active to
+/// deprecated. Not republished on an idempotent repeat call, so consumers
+/// can treat this event as the single, authoritative deprecation moment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaDeprecatedEvent {
+    pub schema_uid: UID,
+    pub deprecated_by: Address,
+}
+
+/// Payload of the `BatchRevoked` event.
+///
+/// Published with topics `(BATCH_REVOKED,)` as the **last** event of a
+/// successful `SAS::multi_revoke` call, after every per-item
+/// `AttestationRevoked` event — the revocation counterpart to
+/// `BatchAttestedEvent`; see its doc comment for the field semantics and
+/// ordering/failure guarantees, which are identical here.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRevokedEvent {
+    pub count: u32,
+    pub attester_count: u32,
+}
+
+/// Payload of the `ContractPaused` event.
+///
+/// Published with topics `(CONTRACT_PAUSED, authorizer)` when
+/// a contract is paused.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractPausedEvent {
+    pub authorizer: Address,
+}
+
+/// Payload of the `ContractUnpaused` event.
+///
+/// Published with topics `(CONTRACT_UNPAUSED, authorizer)` when
+/// a contract is unpaused.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUnpausedEvent {
+    pub authorizer: Address,
+}
+
+/// Payload of the `AttestationRenewed` event.
+///
+/// Published with topics `(ATTESTATION_RENEWED, uid, attester)` when
+/// `SAS::renew_attestation` extends an attestation's expiration time.
+/// `new_expiration_time` is the new expiration time (0 = perpetual).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationRenewedEvent {
+    pub uid: UID,
+    pub attester: Address,
+    pub new_expiration_time: u64,
+}
+
+/// First topic of a SAS `FeeConfigUpdated` event.
+pub const FEECFG_UPDATED: Symbol = symbol_short!("FEECFGUPD");
+
+/// Fee policy after an authorized `set_fee` or `clear_fee` storage write.
+/// Published with topics `(FEECFG_UPDATED, authorizer)`.
+/// Optional addresses use the SDK 20-compatible encoding described by
+/// [`PreviousAddress`]; amounts use native `Option<i128>`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfigUpdatedEvent {
+    pub old_token: PreviousAddress,
+    pub old_amount: Option<i128>,
+    pub new_token: PreviousAddress,
+    pub new_amount: Option<i128>,
+    pub authorizer: Address,
+}
+
+/// Payload of the `IndexerStrictUpdated` event.
+///
+/// Published with topics `(INDEXER_STRICT_UPDATED, admin)` on a successful
+/// `SAS::set_indexer_strict` (#251). `old_strict`/`new_strict` are `false`
+/// for fail-open (the default) and `true` for fail-closed, so an off-chain
+/// monitor can detect a toggle of the Indexer availability policy without
+/// polling `get_indexer_strict`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexerStrictUpdatedEvent {
+    pub old_strict: bool,
+    pub new_strict: bool,
+    pub admin: Address,
+}
+
+pub const REINDEXED: Symbol = symbol_short!("REINDEXED");
+
+/// First topic of every indexer progress event (issue #315).
+pub const INDEXING_PROGRESS: Symbol = symbol_short!("IDXPROG");
+
+/// Payload of the `IndexingProgress` event.
+///
+/// Published with topics `(INDEXING_PROGRESS, recipient)` after a UID is
+/// recorded for the first time. Idempotent retries do not emit it. The three
+/// totals are the lengths of the recipient, schema, and attester indexes
+/// after the write, so an off-chain consumer can follow indexing progress
+/// without reading contract storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexingProgressEvent {
+    pub uid: UID,
+    pub recipient_total: u32,
+    pub schema_total: u32,
+    pub attester_total: u32,
+}
+
+/// Payload of the `SchemaFrostGroupUpdated` event (#534).
+///
+/// Published with topics `(SCHEMA_FROST_GROUP_UPDATED, schema_uid)` whenever a
+/// schema owner sets, rotates, or clears the FROST group that governs
+/// delegated signatures for that schema. The fields are flattened instead of
+/// carrying an `Option<FrostGroup>` because optional nested contract types are
+/// not encodable here (the same constraint documented on [`PreviousAddress`]).
+/// `enabled == false` means the requirement was cleared; the key is then the
+/// all-zero sentinel and both counters are `0`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaFrostGroupUpdatedEvent {
+    pub schema_uid: UID,
+    pub authorizer: Address,
+    pub enabled: bool,
+    pub group_public_key: BytesN<32>,
+    pub threshold: u32,
+    pub max_signers: u32,
 }

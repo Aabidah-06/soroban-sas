@@ -2,8 +2,9 @@
 //! `SASClient::attest`.
 
 use crate::errors::SdkError;
+use crate::strkey::{parse_address, AddressKind};
 use soroban_sas_common::{Attestation, UID};
-use soroban_sdk::{xdr::ToXdr, Address, Bytes, BytesN, Env, String as SorobanString};
+use soroban_sdk::{Bytes, BytesN, Env};
 
 /// Fluent builder for SDK callers that need to construct an `Attestation`
 /// value before handing it to `SASClient::attest`.
@@ -35,6 +36,8 @@ pub struct AttestationRequestBuilder {
     /// Attester address as a strkey (`G...`); must be the account whose
     /// secret seed signs the submission (see `SASClient::attest`).
     attester: Option<std::string::String>,
+    /// Activation timestamp in Unix seconds; `0` means valid immediately upon issuance (#439).
+    valid_from: u64,
 }
 
 impl AttestationRequestBuilder {
@@ -59,6 +62,12 @@ impl AttestationRequestBuilder {
     pub fn with_data(mut self, data: Bytes) -> Self {
         self.data = Some(data);
         self
+    }
+
+    /// Sets the attestation payload using a typed schema struct generated via
+    /// `schema_to_struct!`.
+    pub fn with_schema_data<T: crate::schema_macro::SchemaType>(self, env: &Env, data: &T) -> Self {
+        self.with_data(data.to_bytes(env))
     }
 
     /// Sets the expiration time in Unix seconds. `0` (the default) means
@@ -91,23 +100,20 @@ impl AttestationRequestBuilder {
         self
     }
 
+    /// Sets the activation timestamp in Unix seconds (#439). `0` (the default)
+    /// means the attestation becomes valid immediately upon issuance.
+    pub fn with_valid_from(mut self, ts: u64) -> Self {
+        self.valid_from = ts;
+        self
+    }
+
     /// Validates that every required field is set and returns the resulting
-    /// `Attestation`, deriving its UID as:
-    ///
-    /// ```text
-    /// uid = sha256(
-    ///     schema_uid       # 32 bytes
-    ///     || ref_uid       # 32 bytes, zero UID when unset
-    ///     || recipient     # ScVal XDR of the address
-    ///     || sha256(data)  # 32 bytes
-    /// )
-    /// ```
-    ///
-    /// The preimage follows the byte layout the rest of the codebase uses
-    /// when hashing attestation content (addresses as ScVal XDR, UIDs as raw
-    /// 32 bytes, `data` folded in through its own SHA-256), so the UID is
-    /// deterministic: identical builder inputs always produce the same UID,
-    /// and changing any content field produces a different one.
+    /// `Attestation`, deriving its UID via
+    /// [`soroban_sas_common::attestation_uid`] — the same content-addressing
+    /// scheme `SAS::attest_internal` validates against
+    /// (`sha256(xdr(schema_uid) || xdr(recipient) || xdr(attester) ||
+    /// xdr(data))`) — so a builder-produced attestation is always accepted
+    /// (#215).
     pub fn build(self, env: &Env) -> Result<Attestation, SdkError> {
         let recipient = self.recipient.ok_or_else(|| {
             SdkError::RpcError("attestation recipient address is required".to_string())
@@ -122,23 +128,32 @@ impl AttestationRequestBuilder {
             .data
             .ok_or_else(|| SdkError::RpcError("attestation data is required".to_string()))?;
 
-        let recipient = Address::from_string(&SorobanString::from_str(env, &recipient));
-        let attester = Address::from_string(&SorobanString::from_str(env, &attester));
+        // Validate off-host before conversion: a raw `Address::from_string`
+        // on a malformed or empty strkey traps the host and panics the
+        // caller instead of returning an error (#171, #304).
+        let recipient = parse_address(env, &recipient, AddressKind::Either, "recipient")?;
+        let attester = parse_address(env, &attester, AddressKind::Either, "attester")?;
+        // Same rule `SAS::attest_internal` enforces, checked before any
+        // RPC round-trip: the zero-address "no recipient" sentinel and
+        // self-attestation are rejected on-chain with `InvalidRecipient`.
+        soroban_sas_common::validate_attestation_parties(env, &recipient, &attester).map_err(
+            |err| {
+                SdkError::InvalidInput(format!(
+                    "attestation recipient must be a concrete address distinct from the \
+                     attester; the zero-address \"no recipient\" sentinel is not accepted \
+                     by SAS ({err:?}, code {})",
+                    err as u32
+                ))
+            },
+        )?;
+        let schema_uid = UID(BytesN::from_array(env, &schema_uid));
 
-        let mut payload = Bytes::new(env);
-        payload.append(&Bytes::from_slice(env, &schema_uid));
-        payload.append(&Bytes::from_slice(env, &self.ref_uid));
-        payload.append(&recipient.clone().to_xdr(env));
-        let data_hash = env.crypto().sha256(&data);
-        payload.append(&Bytes::from_slice(env, &data_hash.to_array()));
-        let uid = UID(BytesN::from_array(
-            env,
-            &env.crypto().sha256(&payload).to_array(),
-        ));
+        let uid =
+            soroban_sas_common::attestation_uid(env, &schema_uid, &recipient, &attester, &data);
 
         Ok(Attestation {
             uid,
-            schema_uid: UID(BytesN::from_array(env, &schema_uid)),
+            schema_uid,
             time: env.ledger().timestamp(),
             expiration_time: self.expiration_time,
             revocation_time: 0,
@@ -147,6 +162,7 @@ impl AttestationRequestBuilder {
             attester,
             revocable: self.revocable,
             data,
+            valid_from: self.valid_from,
         })
     }
 }

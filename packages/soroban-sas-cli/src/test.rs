@@ -1,15 +1,97 @@
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use soroban_sdk::testutils::Address as _;
 
     use crate::{
-        decode_hex_or_base64, parse_uid, validate_schema_syntax, AttestCommands, Cli, Commands,
-        OutputFormat,
+        decode_hex_or_base64, fee_to_human, fee_to_json, parse_uid, sas_fee_admin_output,
+        validate_fee_amount, validate_schema_syntax, AttestCommands, Cli, Commands, OutputFormat,
+        SasCommands, SchemaCommands,
     };
+
+    #[test]
+    fn ledger_flags_are_available_to_attestation_signing_commands() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--ledger",
+            "--bip44-path",
+            "m/44'/148'/2'",
+            "attest",
+            "attest",
+            "--schema-uid",
+            &hex::encode([2u8; 32]),
+            "--recipient",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        ])
+        .unwrap();
+        assert!(cli.ledger);
+        assert_eq!(cli.bip44_path, "m/44'/148'/2'");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attest {
+                action: AttestCommands::Attest { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn hardware_mode_cannot_fall_back_to_a_software_key() {
+        let device = crate::hardware::HardwareWallet {
+            kind: crate::hardware::HardwareWalletKind::Ledger,
+            account: 2,
+        };
+        assert!(
+            crate::resolve_secret_key(Some("software-key".into()), None, Some(device)).is_err()
+        );
+        assert!(crate::resolve_secret_key(None, Some("bob"), Some(device)).is_err());
+        let marker = crate::resolve_secret_key(None, None, Some(device)).unwrap();
+        assert_eq!(
+            crate::signer_seed(&marker, Some(device)).unwrap(),
+            [0u8; 32]
+        );
+    }
 
     #[test]
     fn test_cli_snapshot_formatting() {
         assert_eq!(1, 1);
+    }
+
+    #[test]
+    fn attest_flags_default_to_network_time_with_local_fallback_off() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "attest",
+            "attest",
+            "--schema-uid",
+            &hex::encode([2u8; 32]),
+            "--recipient",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "--secret-key",
+            "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY2",
+            "--network-passphrase",
+            "Test SDF Network ; September 2015",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "--rpc-url",
+            "https://soroban-testnet.stellar.org",
+        ])
+        .unwrap();
+
+        let Some(Commands::Attest {
+            action:
+                AttestCommands::Attest {
+                    allow_local_time,
+                    max_ledger_skew,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected attest attest command");
+        };
+        assert!(!allow_local_time);
+        assert_eq!(max_ledger_skew, 300);
     }
 
     #[test]
@@ -23,6 +105,102 @@ mod tests {
         assert!(validate_schema_syntax("!!!").is_err());
         assert!(validate_schema_syntax("12345").is_err());
         assert!(validate_schema_syntax("first_name String, last_name String").is_ok());
+
+        // Issue #447: Reject tabs, control characters, invalid unicode whitespace, malformed separators
+        assert!(validate_schema_syntax("name\tString").is_err());
+        assert!(validate_schema_syntax("name\x07String").is_err());
+        assert!(validate_schema_syntax("name\0String").is_err());
+        assert!(validate_schema_syntax("name\u{00A0}String").is_err());
+        assert!(validate_schema_syntax("first_name String , last_name String").is_err());
+        assert!(validate_schema_syntax("first_name String,").is_err());
+        assert!(validate_schema_syntax("first_name   String").is_err());
+    }
+
+    // --- Issue #174: `--network` / `--identity` actually change behavior
+    // instead of being accepted and silently ignored. ---
+
+    #[test]
+    fn network_and_identity_flags_parse() {
+        let cli =
+            Cli::try_parse_from(["soroban-sas", "--network", "testnet", "--identity", "alice"])
+                .unwrap();
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
+        assert_eq!(cli.identity.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn resolve_rpc_url_prefers_an_explicit_flag_over_network() {
+        let resolved =
+            crate::resolve_rpc_url(Some("https://example.invalid".to_string()), Some("testnet"))
+                .unwrap();
+        assert_eq!(resolved, "https://example.invalid");
+    }
+
+    #[test]
+    fn resolve_rpc_url_falls_back_to_network_when_the_flag_is_absent() {
+        let resolved = crate::resolve_rpc_url(None, Some("testnet")).unwrap();
+        assert_eq!(resolved, "https://soroban-testnet.stellar.org");
+    }
+
+    #[test]
+    fn resolve_rpc_url_errors_clearly_when_neither_is_given() {
+        let err = crate::resolve_rpc_url(None, None).unwrap_err();
+        assert!(err.contains("--rpc-url"));
+        assert!(err.contains("--network"));
+    }
+
+    #[test]
+    fn resolve_network_passphrase_follows_the_same_precedence() {
+        assert_eq!(
+            crate::resolve_network_passphrase(Some("custom".to_string()), Some("testnet")).unwrap(),
+            "custom"
+        );
+        assert_eq!(
+            crate::resolve_network_passphrase(None, Some("testnet")).unwrap(),
+            "Test SDF Network ; September 2015"
+        );
+        assert!(crate::resolve_network_passphrase(None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_secret_key_prefers_an_explicit_flag_over_identity() {
+        let resolved =
+            crate::resolve_secret_key(Some("explicit-secret".to_string()), Some("alice"), None)
+                .unwrap();
+        assert_eq!(resolved, "explicit-secret");
+    }
+
+    #[test]
+    fn resolve_secret_key_errors_clearly_when_neither_is_given() {
+        let err = crate::resolve_secret_key(None, None, None).unwrap_err();
+        assert!(err.contains("--secret-key"));
+        assert!(err.contains("--identity"));
+    }
+
+    #[test]
+    fn every_rpc_url_and_secret_key_field_across_subcommands_is_optional_so_network_and_identity_can_supply_them(
+    ) {
+        // A minimal, network/identity-only invocation must parse (clap must
+        // not itself demand --rpc-url / --secret-key), proving those fields
+        // are no longer hard-required flags that a global option can never
+        // reach. Actual resolution failure (if --network/--identity are also
+        // absent) happens later, inside the resolve_* helpers, so it can
+        // produce an actionable message instead of a bare clap usage error.
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--network",
+            "testnet",
+            "--identity",
+            "alice",
+            "attest",
+            "verify",
+            "--uid",
+            &hex::encode([1u8; 32]),
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        ])
+        .unwrap();
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
     }
 
     #[test]
@@ -47,17 +225,13 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             "--rpc-url",
             "https://soroban-testnet.stellar.org",
-            "--json",
         ])
         .unwrap();
 
         let Some(Commands::Attest {
-            action:
-                AttestCommands::Verify {
-                    uid: parsed_uid,
-                    json: true,
-                    ..
-                },
+            action: AttestCommands::Verify {
+                uid: parsed_uid, ..
+            },
         }) = cli.command
         else {
             panic!("expected attest verify command");
@@ -71,13 +245,15 @@ mod tests {
     }
 
     /// Issue #25 acceptance criterion: `attest attest` parses the flags the
-    /// issue specifies, including the `--output json` variant.
+    /// issue specifies, including the global `--output json` variant.
     #[test]
     fn parses_attest_attest_flags() {
         let schema_uid = hex::encode([2u8; 32]);
         let recipient = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBAAA6XKZW3";
         let cli = Cli::try_parse_from([
             "soroban-sas",
+            "--output",
+            "json",
             "attest",
             "attest",
             "--schema-uid",
@@ -97,10 +273,10 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             "--rpc-url",
             "https://soroban-testnet.stellar.org",
-            "--output",
-            "json",
         ])
         .unwrap();
+
+        assert_eq!(cli.output, OutputFormat::Json);
 
         let Some(Commands::Attest {
             action:
@@ -123,6 +299,73 @@ mod tests {
     }
 
     #[test]
+    fn parses_attest_bulk_flags_with_safe_defaults() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "attest",
+            "bulk",
+            "--csv-file",
+            "attestations.csv",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        ])
+        .unwrap();
+
+        let Some(Commands::Attest {
+            action:
+                AttestCommands::Bulk {
+                    csv_file,
+                    dry_run,
+                    continue_on_error,
+                    max_ledger_skew,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected attest bulk command");
+        };
+        assert_eq!(csv_file, "attestations.csv");
+        // Issuing must be opt-in twice over: a batch is never submitted
+        // unless asked, and a failure stops the run unless asked otherwise.
+        assert!(!dry_run, "bulk must not submit by default");
+        assert!(
+            !continue_on_error,
+            "bulk must stop on first failure by default"
+        );
+        assert_eq!(max_ledger_skew, 300);
+    }
+
+    #[test]
+    fn attest_bulk_accepts_the_dry_run_and_continue_on_error_flags() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "attest",
+            "bulk",
+            "--csv-file",
+            "attestations.csv",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "--dry-run",
+            "--continue-on-error",
+        ])
+        .unwrap();
+
+        let Some(Commands::Attest {
+            action:
+                AttestCommands::Bulk {
+                    dry_run,
+                    continue_on_error,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected attest bulk command");
+        };
+        assert!(dry_run);
+        assert!(continue_on_error);
+    }
+
+    #[test]
     fn decodes_data_as_hex_or_base64() {
         assert_eq!(
             decode_hex_or_base64("deadbeef").unwrap(),
@@ -138,6 +381,439 @@ mod tests {
             vec![0xde, 0xad, 0xbe, 0xef]
         );
         assert!(decode_hex_or_base64("not valid at all!!").is_err());
+    }
+
+    #[test]
+    fn verify_clap_cli_structure() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_schema_get_flags() {
+        let uid = hex::encode([3u8; 32]);
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--output",
+            "json",
+            "schema",
+            "get",
+            "--uid",
+            &uid,
+            "--registry-contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "--rpc-url",
+            "https://soroban-testnet.stellar.org",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.output, OutputFormat::Json);
+        let Some(Commands::Schema {
+            action: crate::SchemaCommands::Get {
+                uid: parsed_uid, ..
+            },
+        }) = cli.command
+        else {
+            panic!("expected schema get command");
+        };
+        assert_eq!(parsed_uid, uid);
+    }
+
+    #[test]
+    fn parses_query_by_recipient_flags() {
+        let recipient = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBAAA6XKZW3";
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--output",
+            "json",
+            "query",
+            "by-recipient",
+            "--address",
+            recipient,
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "--rpc-url",
+            "https://soroban-testnet.stellar.org",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.output, OutputFormat::Json);
+        let Some(Commands::Query {
+            action: crate::QueryCommands::ByRecipient { address, .. },
+        }) = cli.command
+        else {
+            panic!("expected query by-recipient command");
+        };
+        assert_eq!(address, recipient);
+    }
+
+    #[test]
+    fn parses_sas_get_fee_flags() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--output",
+            "json",
+            "sas",
+            "get-fee",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "--rpc-url",
+            "https://soroban-testnet.stellar.org",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.output, OutputFormat::Json);
+        let Some(Commands::Sas {
+            action:
+                SasCommands::Get {
+                    contract_id,
+                    rpc_url,
+                },
+        }) = cli.command
+        else {
+            panic!("expected sas get-fee command");
+        };
+        assert_eq!(
+            contract_id,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+        );
+        assert_eq!(
+            rpc_url.as_deref(),
+            Some("https://soroban-testnet.stellar.org")
+        );
+    }
+
+    #[test]
+    fn parses_sas_set_fee_flags_and_globals() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--identity",
+            "admin",
+            "--network",
+            "testnet",
+            "--output",
+            "json",
+            "sas",
+            "set-fee",
+            "--token",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "--amount",
+            "1000000",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.identity.as_deref(), Some("admin"));
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
+        assert_eq!(cli.output, OutputFormat::Json);
+        let Some(Commands::Sas {
+            action:
+                SasCommands::Set {
+                    token,
+                    amount,
+                    secret_key,
+                    network_passphrase,
+                    rpc_url,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected sas set-fee command");
+        };
+        assert!(token.starts_with('C'));
+        assert_eq!(amount, 1_000_000);
+        assert!(secret_key.is_none());
+        assert_eq!(
+            crate::resolve_network_passphrase(network_passphrase, cli.network.as_deref()).unwrap(),
+            "Test SDF Network ; September 2015"
+        );
+        assert_eq!(
+            crate::resolve_rpc_url(rpc_url, cli.network.as_deref()).unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+    }
+
+    #[test]
+    fn parses_sas_clear_fee_flags_and_mainnet_network_defaults() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--identity",
+            "admin",
+            "--network",
+            "mainnet",
+            "sas",
+            "clear-fee",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.identity.as_deref(), Some("admin"));
+        let Some(Commands::Sas {
+            action:
+                SasCommands::Clear {
+                    secret_key,
+                    network_passphrase,
+                    rpc_url,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected sas clear-fee command");
+        };
+        assert!(secret_key.is_none());
+        assert!(
+            crate::resolve_network_passphrase(network_passphrase, cli.network.as_deref())
+                .unwrap()
+                .contains("Public Global Stellar Network")
+        );
+        assert_eq!(
+            crate::resolve_rpc_url(rpc_url, cli.network.as_deref()).unwrap(),
+            "https://mainnet.sorobanrpc.com"
+        );
+    }
+
+    #[test]
+    fn sas_fee_admin_commands_use_global_identity_resolution() {
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        let set_error = crate::run_sas(
+            SasCommands::Set {
+                token: contract_id.to_string(),
+                amount: 1,
+                secret_key: None,
+                network_passphrase: None,
+                contract_id: contract_id.to_string(),
+                rpc_url: None,
+                dry_run: false,
+            },
+            OutputFormat::Human,
+            Some("testnet".to_string()),
+            Some("../invalid".to_string()),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(set_error.contains("invalid --identity"));
+
+        let clear_error = crate::run_sas(
+            SasCommands::Clear {
+                secret_key: None,
+                network_passphrase: None,
+                contract_id: contract_id.to_string(),
+                rpc_url: None,
+                dry_run: false,
+            },
+            OutputFormat::Human,
+            Some("testnet".to_string()),
+            Some("../invalid".to_string()),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(clear_error.contains("invalid --identity"));
+    }
+
+    #[test]
+    fn sas_set_fee_rejects_non_positive_amounts_before_rpc_setup() {
+        assert_eq!(
+            validate_fee_amount(0).unwrap_err(),
+            "--amount must be greater than 0"
+        );
+        assert_eq!(
+            validate_fee_amount(-1).unwrap_err(),
+            "--amount must be greater than 0"
+        );
+
+        for amount in [0, -1] {
+            let error = crate::run_sas(
+                SasCommands::Set {
+                    token: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string(),
+                    amount,
+                    secret_key: None,
+                    network_passphrase: None,
+                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+                        .to_string(),
+                    rpc_url: Some("http://127.0.0.1:1".to_string()),
+                    dry_run: false,
+                },
+                OutputFormat::Human,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error, "--amount must be greater than 0");
+        }
+    }
+
+    #[test]
+    fn parses_schema_withdraw_fees_flags() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--identity",
+            "admin",
+            "--network",
+            "testnet",
+            "--output",
+            "json",
+            "schema",
+            "withdraw-fees",
+            "--amount",
+            "500000",
+            "--registry-contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.identity.as_deref(), Some("admin"));
+        assert_eq!(cli.output, OutputFormat::Json);
+        let Some(Commands::Schema {
+            action:
+                SchemaCommands::WithdrawFees {
+                    amount,
+                    secret_key,
+                    network_passphrase,
+                    registry_contract_id,
+                    rpc_url,
+                    dry_run: _,
+                },
+        }) = cli.command
+        else {
+            panic!("expected schema withdraw-fees command");
+        };
+        assert_eq!(amount, 500_000);
+        assert!(secret_key.is_none());
+        assert_eq!(
+            registry_contract_id,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+        );
+        assert_eq!(rpc_url, None);
+        assert_eq!(
+            crate::resolve_network_passphrase(network_passphrase, cli.network.as_deref()).unwrap(),
+            "Test SDF Network ; September 2015"
+        );
+        assert_eq!(
+            crate::resolve_rpc_url(rpc_url, cli.network.as_deref()).unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+    }
+
+    #[test]
+    fn schema_withdraw_fees_rejects_non_positive_amounts_before_rpc_setup() {
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        for amount in [0, -1] {
+            let error = crate::run_schema(
+                SchemaCommands::WithdrawFees {
+                    amount,
+                    secret_key: None,
+                    network_passphrase: None,
+                    registry_contract_id: contract_id.to_string(),
+                    rpc_url: Some("http://127.0.0.1:1".to_string()),
+                    dry_run: false,
+                },
+                OutputFormat::Human,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error, "--amount must be greater than 0");
+        }
+    }
+
+    #[test]
+    fn sas_fee_admin_success_formatters_match_required_output() {
+        let result = soroban_sas_sdk::rpc::GetTransactionResult {
+            status: "SUCCESS".to_string(),
+            latest_ledger: 1,
+            envelope_xdr: None,
+            result_xdr: None,
+            hash: Some("abc123".to_string()),
+        };
+        let (_, json) = sas_fee_admin_output(&result, Some(("Ctoken", 1_000_000))).unwrap();
+        assert_eq!(json["tx_hash"], "abc123");
+
+        let (human, _) = sas_fee_admin_output(&result, None).unwrap();
+        assert!(human.contains("Fee cleared — attestation is now fee-free"));
+        assert!(human.contains("abc123"));
+    }
+
+    #[test]
+    fn sas_admin_unauthorized_error_is_explicit() {
+        let message =
+            crate::format_sas_admin_error(soroban_sas_sdk::errors::SdkError::ContractError(301));
+        assert_eq!(
+            message,
+            "SASError::Unauthorized: caller is not the SAS admin"
+        );
+        let other =
+            crate::format_sas_admin_error(soroban_sas_sdk::errors::SdkError::ContractError(302));
+        assert!(!other.contains("Unauthorized"));
+    }
+
+    #[test]
+    fn sas_get_fee_works_without_identity_and_resolves_network() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--network",
+            "testnet",
+            "sas",
+            "get-fee",
+            "--contract-id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        ])
+        .unwrap();
+
+        assert!(cli.identity.is_none());
+        let Some(Commands::Sas {
+            action:
+                SasCommands::Get {
+                    contract_id,
+                    rpc_url,
+                },
+        }) = cli.command
+        else {
+            panic!("expected sas get-fee command");
+        };
+        assert_eq!(
+            contract_id,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+        );
+        assert_eq!(rpc_url, None);
+        assert_eq!(
+            crate::resolve_rpc_url(rpc_url, cli.network.as_deref()).unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+    }
+
+    #[test]
+    fn test_fee_formatting_fee_free() {
+        let fee: Option<(soroban_sdk::Address, i128)> = None;
+        assert_eq!(fee_to_human(&fee), "Fee: free");
+        assert_eq!(fee_to_json(&fee), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_fee_formatting_fee_configured() {
+        let env = soroban_sdk::Env::default();
+        let token = soroban_sdk::Address::generate(&env);
+        let token_str = crate::soroban_string_to_std(&token.to_string());
+        let fee = Some((token, 1_000_000i128));
+
+        assert_eq!(
+            fee_to_human(&fee),
+            format!("Fee: 1000000 stroops of {token_str}")
+        );
+        assert_eq!(
+            fee_to_json(&fee),
+            serde_json::json!({
+                "token": token_str,
+                "amount": 1_000_000i128,
+            })
+        );
     }
 }
 
@@ -164,6 +840,7 @@ mod offchain_tests {
             schema_uid: hex::encode([2u8; 32]),
             time: 1000,
             expiration_time: 0,
+            valid_from: 0,
             ref_uid: hex::encode([0u8; 32]),
             recipient,
             attester,
@@ -249,6 +926,45 @@ mod offchain_tests {
         assert!(parse_secret_seed("not a key").is_err());
     }
 
+    // --- Issue #171: malformed address strings return a validation error
+    // instead of trapping the host inside `Address::from_string`. ---
+
+    #[test]
+    fn parse_attestation_rejects_malformed_recipient_and_attester_without_panicking() {
+        let env = soroban_sdk::Env::default();
+        let mut input = sample_input([41u8; 32]);
+
+        input.recipient = "not-a-strkey".to_string();
+        let err = crate::offchain::parse_attestation(&env, &input)
+            .expect_err("malformed recipient must be rejected");
+        assert!(err.contains("recipient"));
+
+        input.recipient = stellar_strkey::ed25519::PublicKey([5u8; 32]).to_string();
+        input.attester = "GXXXX".to_string();
+        let err = crate::offchain::parse_attestation(&env, &input)
+            .expect_err("malformed attester must be rejected");
+        assert!(err.contains("attester"));
+    }
+
+    #[test]
+    fn compute_payload_hash_rejects_a_malformed_contract_id_without_panicking() {
+        let input = sample_input([41u8; 32]);
+        let err = compute_payload_hash(&input, 7, NETWORK, "not-a-contract-strkey")
+            .expect_err("malformed contract_id must be rejected");
+        assert!(err.contains("contract_id"));
+    }
+
+    #[test]
+    fn offline_verify_never_makes_online_status_claims() {
+        // Issue #175: with no `--online`, `offchain verify` must not itself
+        // report anything about expiration/revocation/schema/network — its
+        // own crypto-only check function is all it may rely on.
+        let seed = [41u8; 32];
+        let input = sample_input(seed);
+        let signed = sign_offchain_attestation(input, 7, NETWORK, &contract_id(), &seed).unwrap();
+        assert!(verify_offchain_attestation(&signed).is_ok());
+    }
+
     #[test]
     fn test_generate_uid_is_deterministic_for_the_same_inputs() {
         let env = soroban_sdk::Env::default();
@@ -256,14 +972,1207 @@ mod offchain_tests {
         let recipient = stellar_strkey::ed25519::PublicKey([5u8; 32]).to_string();
         let attester = stellar_strkey::ed25519::PublicKey([6u8; 32]).to_string();
 
-        let uid1 = generate_uid(&env, &schema_uid, &recipient, &attester, b"deadbeef", 7);
-        let uid2 = generate_uid(&env, &schema_uid, &recipient, &attester, b"deadbeef", 7);
+        let uid1 = generate_uid(&env, &schema_uid, &recipient, &attester, b"deadbeef").unwrap();
+        let uid2 = generate_uid(&env, &schema_uid, &recipient, &attester, b"deadbeef").unwrap();
         assert_eq!(uid1, uid2);
 
-        // Different entropy or content yields a different uid.
-        let uid3 = generate_uid(&env, &schema_uid, &recipient, &attester, b"deadbeef", 8);
+        // Different content yields a different uid (#215: content-addressed,
+        // no entropy).
+        let uid3 = generate_uid(&env, &schema_uid, &recipient, &attester, b"cafebabe").unwrap();
         assert_ne!(uid1, uid3);
-        let uid4 = generate_uid(&env, &schema_uid, &recipient, &attester, b"cafebabe", 7);
-        assert_ne!(uid1, uid4);
+    }
+
+    // --- Issue #304: a missing recipient is a local input error on every
+    // on-chain issuance path, reported with the contract's own error. ---
+
+    #[test]
+    fn onchain_parties_accept_a_concrete_recipient() {
+        let env = soroban_sdk::Env::default();
+        let input = sample_input([41u8; 32]);
+        let attestation = crate::offchain::parse_attestation(&env, &input).unwrap();
+        assert_eq!(
+            crate::offchain::validate_onchain_parties(&env, &attestation),
+            Ok(())
+        );
+        let contract_recipient = stellar_strkey::Contract([8u8; 32]).to_string();
+        assert_eq!(
+            crate::offchain::validate_onchain_recipient(&env, &contract_recipient, &input.attester),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn onchain_parties_reject_no_recipient_sentinels_with_invalid_recipient() {
+        let env = soroban_sdk::Env::default();
+        let mut input = sample_input([41u8; 32]);
+        for sentinel in [
+            stellar_strkey::ed25519::PublicKey([0u8; 32]).to_string(),
+            stellar_strkey::Contract([0u8; 32]).to_string(),
+        ] {
+            input.recipient = sentinel.clone();
+            let attestation = crate::offchain::parse_attestation(&env, &input).unwrap();
+            let err = crate::offchain::validate_onchain_parties(&env, &attestation)
+                .expect_err("sentinel recipient must be rejected");
+            assert!(err.contains("recipient is missing"), "{sentinel}: {err}");
+            assert!(err.contains("InvalidRecipient"), "{err}");
+            assert!(err.contains("402"), "{err}");
+            assert_eq!(
+                crate::offchain::validate_onchain_recipient(&env, &sentinel, &input.attester),
+                Err(err)
+            );
+        }
+    }
+
+    #[test]
+    fn onchain_parties_reject_self_attestation_distinctly() {
+        let env = soroban_sdk::Env::default();
+        let input = sample_input([41u8; 32]);
+        let err =
+            crate::offchain::validate_onchain_recipient(&env, &input.attester, &input.attester)
+                .expect_err("self-attestation must be rejected");
+        assert!(err.contains("must differ from the attester"), "{err}");
+        assert!(err.contains("InvalidRecipient"), "{err}");
+    }
+
+    #[test]
+    fn onchain_recipient_check_reports_malformed_input_as_a_parse_error() {
+        let env = soroban_sdk::Env::default();
+        let input = sample_input([41u8; 32]);
+        // A malformed strkey is a parse error, not a "missing recipient":
+        // the two must stay distinguishable to the operator.
+        let err = crate::offchain::validate_onchain_recipient(&env, "", &input.attester)
+            .expect_err("empty recipient must be rejected");
+        assert!(err.contains("recipient"), "{err}");
+        assert!(!err.contains("InvalidRecipient"), "{err}");
+    }
+
+    #[test]
+    fn offchain_signing_still_accepts_a_recipientless_attestation() {
+        // Regression guard: off-chain verification places no constraint on
+        // the recipient, so the #304 check must not leak into signing.
+        let seed = [41u8; 32];
+        let mut input = sample_input(seed);
+        input.recipient = stellar_strkey::ed25519::PublicKey([0u8; 32]).to_string();
+        let signed = sign_offchain_attestation(input, 7, NETWORK, &contract_id(), &seed).unwrap();
+        assert!(verify_offchain_attestation(&signed).is_ok());
+    }
+}
+
+/// Issue #175: `--online` must query only the caller-supplied trusted
+/// contract/network — never the file's own embedded values — and must
+/// report every guarantee (network, contract, on-chain status, schema)
+/// separately rather than collapsing them into one opaque bool.
+#[cfg(test)]
+mod online_verification_tests {
+    use crate::offchain::{sign_offchain_attestation, AttestationInput};
+    use crate::perform_online_verification;
+    use soroban_sas_sdk::rpc::RpcClient;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::xdr::{Limits, WriteXdr};
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    const NETWORK: &str = "Test SDF Network ; September 2015";
+
+    /// Answers exactly one HTTP request with `body`, mirroring the mock
+    /// server pattern used in the SDK's own RPC tests.
+    fn spawn_single_response_mock_server(body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let read = reader.read_line(&mut line).unwrap_or(0);
+                    if read == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body_buf = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body_buf);
+                let mut stream = stream;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        url
+    }
+
+    fn sample_signed(contract_id: &str) -> crate::offchain::SignedOffchainAttestation {
+        let seed = [41u8; 32];
+        let public_key = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let attester = stellar_strkey::ed25519::PublicKey(public_key).to_string();
+        let recipient = stellar_strkey::ed25519::PublicKey([5u8; 32]).to_string();
+        let input = AttestationInput {
+            uid: hex::encode([9u8; 32]),
+            schema_uid: hex::encode([2u8; 32]),
+            time: 1000,
+            expiration_time: 0,
+            ref_uid: hex::encode([0u8; 32]),
+            recipient,
+            attester,
+            revocable: true,
+            data: "deadbeef".to_string(),
+            valid_from: 0,
+        };
+        sign_offchain_attestation(input, 7, NETWORK, contract_id, &seed).unwrap()
+    }
+
+    /// A `get_attestation` simulation response reporting the UID as unknown.
+    fn not_found_response() -> String {
+        let env = soroban_sdk::Env::default();
+        let none_attestation: Option<soroban_sas_common::Attestation> = None;
+        let result_xdr = soroban_sas_sdk::simulate::encode_arg(&env, &none_attestation)
+            .unwrap()
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":100,"results":[{{"xdr":"{result_xdr}"}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_contract_mismatch_is_reported_and_the_trusted_contract_is_what_gets_queried() {
+        let embedded_contract = stellar_strkey::Contract([1u8; 32]).to_string();
+        let trusted_contract = stellar_strkey::Contract([2u8; 32]).to_string();
+        let signed = sample_signed(&embedded_contract);
+
+        let url = spawn_single_response_mock_server(not_found_response());
+        let rpc = RpcClient::new(url);
+
+        let report =
+            perform_online_verification(&signed, NETWORK, &trusted_contract, None, &rpc).unwrap();
+
+        // The embedded contract never became the query target: the mock
+        // server only ever answered one request, for whichever contract the
+        // client actually asked about, and the report still completed —
+        // proving the call went out and back against `trusted_contract`.
+        assert!(!report.contract_matches_trusted);
+        assert!(report.network_matches_trusted);
+        assert!(!report.on_chain_found);
+        assert!(!report.overall_valid);
+    }
+
+    #[test]
+    fn a_network_mismatch_is_reported_independently_of_contract_and_on_chain_status() {
+        let contract = stellar_strkey::Contract([3u8; 32]).to_string();
+        let signed = sample_signed(&contract);
+
+        let url = spawn_single_response_mock_server(not_found_response());
+        let rpc = RpcClient::new(url);
+
+        let report = perform_online_verification(
+            &signed,
+            "some other network passphrase",
+            &contract,
+            None,
+            &rpc,
+        )
+        .unwrap();
+
+        assert!(!report.network_matches_trusted);
+        assert!(report.contract_matches_trusted);
+        assert!(!report.overall_valid);
+    }
+
+    #[test]
+    fn schema_registry_omission_reports_not_checked_rather_than_failing_closed_or_open() {
+        let contract = stellar_strkey::Contract([4u8; 32]).to_string();
+        let signed = sample_signed(&contract);
+
+        let url = spawn_single_response_mock_server(not_found_response());
+        let rpc = RpcClient::new(url);
+
+        let report = perform_online_verification(&signed, NETWORK, &contract, None, &rpc).unwrap();
+
+        assert_eq!(report.schema_status, "not_checked");
+    }
+
+    fn fee_none_response() -> String {
+        let env = soroban_sdk::Env::default();
+        let none_fee: Option<(soroban_sdk::Address, i128)> = None;
+        let result_xdr = soroban_sas_sdk::simulate::encode_arg(&env, &none_fee)
+            .unwrap()
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":100,"results":[{{"xdr":"{result_xdr}"}}]}}}}"#
+        )
+    }
+
+    fn fee_configured_response(
+        env: &soroban_sdk::Env,
+        token: &soroban_sdk::Address,
+        amount: i128,
+    ) -> String {
+        let fee: Option<(soroban_sdk::Address, i128)> = Some((token.clone(), amount));
+        let result_xdr = soroban_sas_sdk::simulate::encode_arg(env, &fee)
+            .unwrap()
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":100,"results":[{{"xdr":"{result_xdr}"}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn sas_get_fee_simulation_free() {
+        let contract_id = stellar_strkey::Contract([5u8; 32]).to_string();
+        let url = spawn_single_response_mock_server(fee_none_response());
+        let res = crate::run_sas(
+            crate::SasCommands::Get {
+                contract_id,
+                rpc_url: Some(url),
+            },
+            crate::OutputFormat::Json,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn sas_get_fee_simulation_configured() {
+        let contract_id = stellar_strkey::Contract([6u8; 32]).to_string();
+        let env = soroban_sdk::Env::default();
+        let token_addr = soroban_sdk::Address::generate(&env);
+        let url = spawn_single_response_mock_server(fee_configured_response(
+            &env,
+            &token_addr,
+            1_000_000,
+        ));
+        let res = crate::run_sas(
+            crate::SasCommands::Get {
+                contract_id,
+                rpc_url: Some(url),
+            },
+            crate::OutputFormat::Human,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(res.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod by_attester_query_tests {
+    use clap::{CommandFactory, Parser};
+    use soroban_sas_common::UID;
+    use soroban_sdk::xdr::{Limits, WriteXdr};
+    use soroban_sdk::BytesN;
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    use crate::{
+        format_attestations_by_attester, run_query, Cli, Commands, OutputFormat, QueryCommands,
+    };
+
+    const ATTESTER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    #[test]
+    fn parses_query_by_attester_flags() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "query",
+            "by-attester",
+            "--address",
+            ATTESTER,
+            "--contract-id",
+            CONTRACT,
+            "--rpc-url",
+            "https://soroban-testnet.stellar.org",
+        ])
+        .unwrap();
+
+        let Some(Commands::Query {
+            action:
+                QueryCommands::ByAttester {
+                    address,
+                    contract_id,
+                    rpc_url,
+                    page,
+                },
+        }) = cli.command
+        else {
+            panic!("expected query by-attester command");
+        };
+        // No pagination flags: the unpaginated complete-history query.
+        assert_eq!(page.resolve(), Ok(None));
+        assert_eq!(address, ATTESTER);
+        assert_eq!(contract_id, CONTRACT);
+        assert_eq!(
+            rpc_url.as_deref(),
+            Some("https://soroban-testnet.stellar.org")
+        );
+    }
+
+    #[test]
+    fn by_attester_help_documents_the_command_and_flags() {
+        let mut root = Cli::command();
+        let query = root.find_subcommand_mut("query").unwrap();
+        let query_help = query.render_long_help().to_string();
+        assert!(query_help.contains("by-attester"));
+
+        let by_attester = query.find_subcommand_mut("by-attester").unwrap();
+        let help = by_attester.render_long_help().to_string();
+        assert!(help.contains("--address"));
+        assert!(help.contains("Attester/issuer account address"));
+        assert!(help.contains("--contract-id"));
+        assert!(help.contains("Indexer contract address"));
+        assert!(help.contains("--rpc-url"));
+        assert!(help.contains("Soroban RPC endpoint URL"));
+    }
+
+    #[test]
+    fn network_shorthand_parses_without_an_explicit_rpc_url() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "--network",
+            "testnet",
+            "query",
+            "by-attester",
+            "--address",
+            ATTESTER,
+            "--contract-id",
+            CONTRACT,
+        ])
+        .unwrap();
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
+        let Some(Commands::Query {
+            action: QueryCommands::ByAttester { rpc_url, .. },
+        }) = cli.command
+        else {
+            panic!("expected query by-attester command");
+        };
+        assert!(rpc_url.is_none());
+        assert_eq!(
+            crate::resolve_rpc_url(rpc_url, cli.network.as_deref()).unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+    }
+
+    #[test]
+    fn formatter_produces_required_human_and_json_shapes() {
+        let env = soroban_sdk::Env::default();
+        let uids = soroban_sdk::vec![
+            &env,
+            UID(BytesN::from_array(&env, &[1u8; 32])),
+            UID(BytesN::from_array(&env, &[2u8; 32])),
+        ];
+        let (human, data) = format_attestations_by_attester(ATTESTER, &uids);
+        assert_eq!(
+            human,
+            format!(
+                "Attestations found: 2\n{}\n{}",
+                hex::encode([1u8; 32]),
+                hex::encode([2u8; 32])
+            )
+        );
+        let envelope = serde_json::json!({ "status": "ok", "data": data });
+        assert_eq!(envelope["status"], "ok");
+        assert_eq!(envelope["data"]["attester"], ATTESTER);
+        assert_eq!(
+            envelope["data"]["uids"],
+            serde_json::json!([hex::encode([1u8; 32]), hex::encode([2u8; 32])])
+        );
+        assert!(envelope["data"].get("count").is_none());
+    }
+
+    #[test]
+    fn formatter_handles_an_empty_result() {
+        let env = soroban_sdk::Env::default();
+        let uids = soroban_sdk::Vec::<UID>::new(&env);
+        let (human, data) = format_attestations_by_attester(ATTESTER, &uids);
+        assert_eq!(human, "Attestations found: 0");
+        assert_eq!(data["attester"], ATTESTER);
+        assert_eq!(data["uids"], serde_json::json!([]));
+    }
+
+    fn spawn_mock_rpc(response_body: String) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line).unwrap();
+                if read == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0u8; content_length];
+            reader.read_exact(&mut request_body).unwrap();
+            let mut stream = stream;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(), response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            String::from_utf8(request_body).unwrap()
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn run_query_uses_the_sdk_simulation_decode_path() {
+        let env = soroban_sdk::Env::default();
+        let expected = soroban_sdk::vec![
+            &env,
+            UID(BytesN::from_array(&env, &[7u8; 32])),
+            UID(BytesN::from_array(&env, &[8u8; 32])),
+        ];
+        let result_xdr = soroban_sas_sdk::simulate::encode_arg(&env, &expected)
+            .unwrap()
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        let response = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":100,"results":[{{"xdr":"{result_xdr}"}}]}}}}"#
+        );
+        let (rpc_url, server) = spawn_mock_rpc(response);
+
+        run_query(
+            QueryCommands::ByAttester {
+                address: ATTESTER.to_string(),
+                contract_id: CONTRACT.to_string(),
+                rpc_url: Some(rpc_url),
+                page: Default::default(),
+            },
+            OutputFormat::Json,
+            None,
+        )
+        .unwrap();
+
+        let request: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        assert_eq!(request["method"], "simulateTransaction");
+        assert!(request["params"]["transaction"].as_str().is_some());
+    }
+}
+
+#[cfg(test)]
+mod schema_withdraw_fees_tests {
+    use soroban_sdk::xdr::{
+        AccountEntry, AccountEntryExt, AccountId, ExtensionPoint, LedgerEntryData, LedgerFootprint,
+        Limits, PublicKey, SequenceNumber, SorobanResources, SorobanTransactionData, String32,
+        Thresholds, Uint256, VecM, WriteXdr,
+    };
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use crate::{OutputFormat, SchemaCommands};
+
+    /// Answers the four calls one signed write pipeline makes —
+    /// `getLedgerEntries`, `simulateTransaction`, `sendTransaction`,
+    /// `getTransaction` — and settles the write with `SUCCESS`. The
+    /// `getTransaction` reply deliberately omits `envelopeXdr`, which the
+    /// SDK treats as "envelope not checked" rather than a decode failure.
+    fn spawn_write_pipeline_mock(seed: [u8; 32]) -> String {
+        let public_key = soroban_sas_sdk::signature::derive_public_key(&seed);
+        let account_entry_xdr = LedgerEntryData::Account(AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(public_key))),
+            balance: 100_000_000,
+            seq_num: SequenceNumber(7),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: Default::default(),
+            ext: AccountEntryExt::V0,
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let transaction_data_xdr = SorobanTransactionData {
+            ext: ExtensionPoint::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::default(),
+                },
+                instructions: 0,
+                read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        }
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for expected_method in [
+                "getLedgerEntries",
+                "simulateTransaction",
+                "sendTransaction",
+                "getTransaction",
+            ] {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let request = read_request(&stream);
+                assert_eq!(request["method"], expected_method);
+                let id = request["id"].clone();
+                let response = match expected_method {
+                    "getLedgerEntries" => {
+                        let entries: Vec<serde_json::Value> = request["params"]["keys"]
+                            .as_array()
+                            .map(|keys| {
+                                keys.iter()
+                                    .map(|k| {
+                                        serde_json::json!({
+                                            "key": k.as_str().unwrap_or("AAAAAA=="),
+                                            "xdr": &account_entry_xdr,
+                                            "lastModifiedLedgerSeq": 1
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_else(|| {
+                                vec![serde_json::json!({
+                                    "key": "AAAAAA==",
+                                    "xdr": &account_entry_xdr,
+                                    "lastModifiedLedgerSeq": 1
+                                })]
+                            });
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id, "result": {
+                                "entries": entries,
+                                "latestLedger": 1
+                            }
+                        })
+                    }
+                    "simulateTransaction" => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": {
+                            "latestLedger": 1,
+                            "results": [{"xdr": "AAAAAA=="}],
+                            "transactionData": transaction_data_xdr,
+                            "minResourceFee": "0"
+                        }
+                    }),
+                    "sendTransaction" => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": {
+                            "status": "PENDING", "hash": "withdraw-hash", "latestLedger": 1
+                        }
+                    }),
+                    _ => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": {
+                            "status": "SUCCESS", "latestLedger": 1, "resultXdr": "AAAAAQAAAAA="
+                        }
+                    }),
+                };
+                write_response(stream, &response);
+            }
+        });
+        url
+    }
+
+    fn read_request(stream: &TcpStream) -> serde_json::Value {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).unwrap_or(0);
+            if read == 0 || line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn write_response(mut stream: TcpStream, response: &serde_json::Value) {
+        let body = response.to_string();
+        let http = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(http.as_bytes());
+        let _ = stream.flush();
+    }
+
+    #[test]
+    fn schema_withdraw_fees_runs_end_to_end_with_json_output() {
+        let seed = [61u8; 32];
+        let url = spawn_write_pipeline_mock(seed);
+        let res = crate::run_schema(
+            SchemaCommands::WithdrawFees {
+                amount: 500,
+                secret_key: Some(hex::encode(seed)),
+                network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+                registry_contract_id: stellar_strkey::Contract([62u8; 32]).to_string(),
+                rpc_url: Some(url),
+                dry_run: false,
+            },
+            OutputFormat::Json,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(res.is_ok(), "withdraw-fees should settle: {res:?}");
+    }
+}
+
+/// Issue #306: `query by-* --cursor/--limit` pagination flags.
+#[cfg(test)]
+mod pagination_query_tests {
+    use clap::{CommandFactory, Parser};
+    use soroban_sas_common::UID;
+    use soroban_sdk::BytesN;
+
+    use crate::{
+        format_page, run_query, Cli, Commands, OutputFormat, PageArgs, QueryCommands,
+        MAX_QUERY_PAGE_SIZE,
+    };
+
+    const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    fn account() -> String {
+        stellar_strkey::ed25519::PublicKey([5u8; 32]).to_string()
+    }
+
+    fn parse_page(extra: &[&str]) -> Result<PageArgs, clap::Error> {
+        let address = account();
+        let mut args = vec![
+            "soroban-sas",
+            "query",
+            "by-recipient",
+            "--address",
+            address.as_str(),
+            "--contract-id",
+            CONTRACT,
+        ];
+        args.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(args)?;
+        let Some(Commands::Query {
+            action: QueryCommands::ByRecipient { page, .. },
+        }) = cli.command
+        else {
+            panic!("expected query by-recipient command");
+        };
+        Ok(page)
+    }
+
+    #[test]
+    fn page_flags_are_optional_and_select_pagination_only_when_present() {
+        assert_eq!(parse_page(&[]).unwrap().resolve(), Ok(None));
+        assert_eq!(
+            parse_page(&["--limit", "5"]).unwrap().resolve(),
+            Ok(Some((0, 5)))
+        );
+        assert_eq!(
+            parse_page(&["--cursor", "7"]).unwrap().resolve(),
+            Ok(Some((7, MAX_QUERY_PAGE_SIZE)))
+        );
+        assert_eq!(
+            parse_page(&["--cursor", "7", "--limit", "3"])
+                .unwrap()
+                .resolve(),
+            Ok(Some((7, 3)))
+        );
+    }
+
+    #[test]
+    fn page_limit_is_bounded_before_any_rpc_call() {
+        for bad in ["0", "101"] {
+            let err = parse_page(&["--limit", bad])
+                .unwrap()
+                .resolve()
+                .unwrap_err();
+            assert!(err.contains("--limit must be between 1 and 100"), "{err}");
+        }
+        assert_eq!(
+            parse_page(&["--limit", "100"]).unwrap().resolve(),
+            Ok(Some((0, 100)))
+        );
+        // Non-numeric / negative values are rejected by clap itself.
+        assert!(parse_page(&["--limit", "-1"]).is_err());
+        assert!(parse_page(&["--cursor", "abc"]).is_err());
+    }
+
+    #[test]
+    fn invalid_limit_fails_without_touching_the_network() {
+        // An unreachable RPC URL proves the limit is validated first.
+        let err = run_query(
+            QueryCommands::BySchema {
+                uid: hex::encode([2u8; 32]),
+                contract_id: CONTRACT.to_string(),
+                rpc_url: Some("http://127.0.0.1:1/".to_string()),
+                page: PageArgs {
+                    cursor: Some(0),
+                    limit: Some(0),
+                },
+            },
+            OutputFormat::Json,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("--limit"), "{err}");
+    }
+
+    #[test]
+    fn every_query_command_documents_the_page_flags() {
+        let mut root = Cli::command();
+        let query = root.find_subcommand_mut("query").unwrap();
+        for name in ["by-recipient", "by-attester", "by-schema"] {
+            let help = query
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(help.contains("--cursor"), "{name}");
+            assert!(help.contains("--limit"), "{name}");
+            assert!(help.contains("complete history"), "{name}");
+        }
+    }
+
+    fn uids(env: &soroban_sdk::Env, seeds: &[u8]) -> soroban_sdk::Vec<UID> {
+        let mut out = soroban_sdk::Vec::new(env);
+        for seed in seeds {
+            out.push_back(UID(BytesN::from_array(env, &[*seed; 32])));
+        }
+        out
+    }
+
+    #[test]
+    fn format_page_reports_first_middle_and_final_pages() {
+        let env = soroban_sdk::Env::default();
+
+        let (human, data) = format_page(None, &uids(&env, &[1, 2]), 0, 2, 5);
+        assert_eq!(data["uids"].as_array().unwrap().len(), 2);
+        assert_eq!(data["cursor"], 0);
+        assert_eq!(data["limit"], 2);
+        assert_eq!(data["total"], 5);
+        assert_eq!(data["next_cursor"], 2);
+        assert!(
+            human.ends_with("Page: 1-2 of 5 (next: --cursor 2)"),
+            "{human}"
+        );
+
+        let (_, data) = format_page(None, &uids(&env, &[3, 4]), 2, 2, 5);
+        assert_eq!(data["next_cursor"], 4);
+
+        let (human, data) = format_page(None, &uids(&env, &[5]), 4, 2, 5);
+        assert_eq!(data["next_cursor"], serde_json::Value::Null);
+        assert!(human.ends_with("Page: 5-5 of 5"), "{human}");
+        assert!(data.get("attester").is_none());
+    }
+
+    #[test]
+    fn format_page_handles_empty_and_past_the_end_requests() {
+        let env = soroban_sdk::Env::default();
+        let empty = uids(&env, &[]);
+
+        let (human, data) = format_page(None, &empty, 0, 10, 0);
+        assert_eq!(data["uids"], serde_json::json!([]));
+        assert_eq!(data["next_cursor"], serde_json::Value::Null);
+        assert!(human.starts_with("No attestations found"), "{human}");
+
+        let (human, data) = format_page(None, &empty, 50, 10, 3);
+        assert_eq!(data["next_cursor"], serde_json::Value::Null);
+        assert!(
+            human.contains("cursor 50 is past the end (3 total)"),
+            "{human}"
+        );
+    }
+
+    #[test]
+    fn format_page_echoes_the_attester_like_the_unpaginated_command() {
+        let env = soroban_sdk::Env::default();
+        let attester = account();
+        let (_, data) = format_page(Some(("attester", &attester)), &uids(&env, &[1]), 0, 1, 1);
+        assert_eq!(data["attester"], attester.as_str());
+    }
+
+    fn canned_lines(answers: &[&str]) -> impl Iterator<Item = std::io::Result<String>> {
+        answers
+            .iter()
+            .map(|s| Ok(s.to_string()))
+            .collect::<std::vec::Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn build_schema_interactively_happy_path() {
+        let mut lines = canned_lines(&["name string", "age uint32", "", "CRESOLVER", "y"]);
+        let (schema, resolver, revocable) = crate::build_schema_interactively(&mut lines).unwrap();
+        assert_eq!(schema, "name string, age uint32");
+        assert_eq!(resolver, "CRESOLVER");
+        assert!(revocable);
+    }
+
+    #[test]
+    fn build_schema_interactively_retries_an_invalid_field() {
+        let mut lines = canned_lines(&["not a valid field!!", "name string", "", "CRESOLVER", "n"]);
+        let (schema, resolver, revocable) = crate::build_schema_interactively(&mut lines).unwrap();
+        assert_eq!(schema, "name string");
+        assert_eq!(resolver, "CRESOLVER");
+        assert!(!revocable);
+    }
+
+    #[test]
+    fn build_schema_interactively_requires_at_least_one_field() {
+        let mut lines = canned_lines(&["", "name string", "", "CRESOLVER", "yes"]);
+        let (schema, ..) = crate::build_schema_interactively(&mut lines).unwrap();
+        assert_eq!(schema, "name string");
+    }
+
+    #[test]
+    fn build_schema_interactively_retries_an_empty_resolver() {
+        let mut lines = canned_lines(&["name string", "", "", "CRESOLVER", "no"]);
+        let (_, resolver, _) = crate::build_schema_interactively(&mut lines).unwrap();
+        assert_eq!(resolver, "CRESOLVER");
+    }
+
+    #[test]
+    fn build_schema_interactively_retries_an_invalid_revocable_answer() {
+        let mut lines = canned_lines(&["name string", "", "CRESOLVER", "maybe", "y"]);
+        let (_, _, revocable) = crate::build_schema_interactively(&mut lines).unwrap();
+        assert!(revocable);
+    }
+
+    #[test]
+    fn build_schema_interactively_fails_on_unexpected_eof() {
+        let mut lines = canned_lines(&["name string", ""]);
+        let err = crate::build_schema_interactively(&mut lines).unwrap_err();
+        assert_eq!(err, "unexpected end of input");
+    }
+}
+
+/// Issue #469: `schema wizard` validation, the piped (non-TTY) fallback,
+/// and submission confirmation.
+#[cfg(test)]
+mod wizard_tests {
+    use clap::Parser;
+
+    use crate::{wizard, Cli, Commands, SchemaCommands};
+
+    // -----------------------------------------------------------------------
+    // `schema wizard` (#469)
+    // -----------------------------------------------------------------------
+
+    /// A syntactically valid `C...` contract strkey: the wizard refuses any
+    /// resolver that is not one.
+    const WIZARD_RESOLVER: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    /// Canned line-by-line stdin answers for the piped fallback.
+    fn canned_lines(answers: &[&str]) -> impl Iterator<Item = std::io::Result<String>> {
+        answers
+            .iter()
+            .map(|s| Ok(s.to_string()))
+            .collect::<std::vec::Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn wizard_validate_name_accepts_labels_and_rejects_bad_ones() {
+        assert!(wizard::validate_name("KYC Proof v1").is_ok());
+        assert!(wizard::validate_name("  KYC  ").is_ok());
+        assert!(wizard::validate_name("").is_err());
+        assert!(wizard::validate_name("   ").is_err());
+        let too_long = "n".repeat(65);
+        assert!(wizard::validate_name(&too_long)
+            .unwrap_err()
+            .contains("64-byte limit"));
+        assert!(wizard::validate_name("bad\u{7}name")
+            .unwrap_err()
+            .contains("control characters"));
+    }
+
+    #[test]
+    fn wizard_validate_field_applies_syntax_and_contract_limits() {
+        assert!(wizard::validate_field("bool verified").is_ok());
+        assert!(wizard::validate_field("  string full_name  ").is_ok());
+        assert!(wizard::validate_field("").is_err());
+        assert!(wizard::validate_field("   ").is_err());
+        // `validate_schema_syntax` rejects multiple spaces.
+        assert!(wizard::validate_field("bool   verified").is_err());
+        // Missing type.
+        assert!(wizard::validate_field("verified").is_err());
+        // Contract-enforced caps: max 64 bytes for the whole field.
+        let too_long_field = format!("{} string", "a".repeat(60));
+        assert!(wizard::validate_field(&too_long_field)
+            .unwrap_err()
+            .contains("64-byte limit"));
+        // Max 32 bytes for the identifier.
+        let too_long_ident = format!("{} string", "a".repeat(33));
+        assert!(wizard::validate_field(&too_long_ident)
+            .unwrap_err()
+            .contains("32-byte limit"));
+        // Max 32 bytes for the type.
+        let too_long_type = format!("flag {}", "a".repeat(33));
+        assert!(wizard::validate_field(&too_long_type)
+            .unwrap_err()
+            .contains("32-byte limit"));
+    }
+
+    #[test]
+    fn wizard_validate_resolver_accepts_contracts_and_defaults() {
+        assert_eq!(
+            wizard::validate_resolver(WIZARD_RESOLVER, None).unwrap(),
+            WIZARD_RESOLVER
+        );
+        // A blank answer falls back to the configured default …
+        assert_eq!(
+            wizard::validate_resolver("", Some(WIZARD_RESOLVER)).unwrap(),
+            WIZARD_RESOLVER
+        );
+        // … but without one the resolver is required, since it is part of
+        // the schema's on-chain identity.
+        assert!(wizard::validate_resolver("", None)
+            .unwrap_err()
+            .contains("resolver is required"));
+        // Accounts (G...) and garbage are both rejected.
+        assert!(wizard::validate_resolver(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            None
+        )
+        .is_err());
+        assert!(wizard::validate_resolver("not-an-address", None).is_err());
+    }
+
+    #[test]
+    fn wizard_validate_revocable_parses_yes_and_no() {
+        assert!(wizard::validate_revocable("y").unwrap());
+        assert!(wizard::validate_revocable(" YES ").unwrap());
+        assert!(!wizard::validate_revocable("N").unwrap());
+        assert!(!wizard::validate_revocable("no").unwrap());
+        assert!(wizard::validate_revocable("maybe").is_err());
+        assert!(wizard::validate_revocable("").is_err());
+    }
+
+    #[test]
+    fn wizard_validate_metadata_uri_accepts_known_schemes_only() {
+        assert_eq!(wizard::validate_metadata_uri("").unwrap(), None);
+        assert_eq!(
+            wizard::validate_metadata_uri("  ipfs://bafy/meta.json  ").unwrap(),
+            Some("ipfs://bafy/meta.json".to_string())
+        );
+        assert!(wizard::validate_metadata_uri("ar://abc123").is_ok());
+        assert!(wizard::validate_metadata_uri("https://example.com/schema.json").is_ok());
+        assert!(wizard::validate_metadata_uri("http://example.com/s").is_ok());
+        assert!(wizard::validate_metadata_uri("ftp://example.com/s")
+            .unwrap_err()
+            .contains("ipfs://"));
+        assert!(wizard::validate_metadata_uri("just some text").is_err());
+        assert!(wizard::validate_metadata_uri("https://")
+            .unwrap_err()
+            .contains("path"));
+        assert!(wizard::validate_metadata_uri("ipfs://a b").is_err());
+        let too_long = format!("ipfs://{}", "a".repeat(512));
+        assert!(wizard::validate_metadata_uri(&too_long)
+            .unwrap_err()
+            .contains("512-byte limit"));
+    }
+
+    #[test]
+    fn wizard_collect_piped_happy_path() {
+        let mut lines = canned_lines(&[
+            "KYC Proof v1",
+            "bool verified",
+            "string full_name",
+            "",
+            "y",
+            WIZARD_RESOLVER,
+            "ipfs://bafy/meta.json",
+        ]);
+        let answers = wizard::collect(wizard::Mode::Piped, &mut lines, None).unwrap();
+        assert_eq!(
+            answers,
+            wizard::WizardAnswers {
+                name: "KYC Proof v1".to_string(),
+                schema: "bool verified, string full_name".to_string(),
+                resolver: WIZARD_RESOLVER.to_string(),
+                revocable: true,
+                metadata_uri: Some("ipfs://bafy/meta.json".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn wizard_collect_piped_retries_every_invalid_answer() {
+        let mut lines = canned_lines(&[
+            "",    // name: empty -> re-prompt
+            "   ", // name: whitespace -> re-prompt
+            "KYC Proof v1",
+            "verified", // field: no type -> re-prompt
+            "bool verified",
+            "",      // blank line finishes the field list
+            "maybe", // revocable: not y/n -> re-prompt
+            "n",
+            "not-an-address", // resolver: not a contract -> re-prompt
+            WIZARD_RESOLVER,
+            "ftp://x", // metadata: unknown scheme -> re-prompt
+            "",
+        ]);
+        let answers = wizard::collect(wizard::Mode::Piped, &mut lines, None).unwrap();
+        assert_eq!(answers.name, "KYC Proof v1");
+        assert_eq!(answers.schema, "bool verified");
+        assert!(!answers.revocable);
+        assert_eq!(answers.resolver, WIZARD_RESOLVER);
+        assert_eq!(answers.metadata_uri, None);
+    }
+
+    #[test]
+    fn wizard_collect_piped_requires_a_resolver_without_a_default() {
+        let mut lines = canned_lines(&["KYC", "bool verified", "", "y", "", ""]);
+        let err = wizard::collect(wizard::Mode::Piped, &mut lines, None).unwrap_err();
+        assert!(err.contains("unexpected end of input"), "{err}");
+    }
+
+    #[test]
+    fn wizard_collect_piped_uses_the_default_resolver_for_a_blank_answer() {
+        let mut lines = canned_lines(&["KYC", "bool verified", "", "y", "", ""]);
+        let answers =
+            wizard::collect(wizard::Mode::Piped, &mut lines, Some(WIZARD_RESOLVER)).unwrap();
+        assert_eq!(answers.resolver, WIZARD_RESOLVER);
+        assert_eq!(answers.metadata_uri, None);
+    }
+
+    #[test]
+    fn wizard_collect_piped_requires_at_least_one_field() {
+        let mut lines = canned_lines(&["KYC", "", "bool verified", "", "n", WIZARD_RESOLVER, ""]);
+        let answers = wizard::collect(wizard::Mode::Piped, &mut lines, None).unwrap();
+        assert_eq!(answers.schema, "bool verified");
+    }
+
+    #[test]
+    fn wizard_collect_piped_caps_the_field_count() {
+        // One field over `MAX_SCHEMA_FIELDS` (64): the 65th is rejected at
+        // the prompt, and the blank line then finishes with 64 fields.
+        let mut answers_input = vec!["KYC".to_string()];
+        for index in 0..65u32 {
+            answers_input.push(format!("f{index} string"));
+        }
+        answers_input.push(String::new());
+        answers_input.push("n".to_string());
+        answers_input.push(WIZARD_RESOLVER.to_string());
+        answers_input.push(String::new());
+        let refs: Vec<&str> = answers_input.iter().map(String::as_str).collect();
+        let mut lines = canned_lines(&refs);
+        let answers = wizard::collect(wizard::Mode::Piped, &mut lines, None).unwrap();
+        assert_eq!(answers.schema.split(", ").count(), 64);
+    }
+
+    #[test]
+    fn wizard_collect_piped_fails_on_unexpected_eof() {
+        let mut lines = canned_lines(&["KYC Proof v1"]);
+        let err = wizard::collect(wizard::Mode::Piped, &mut lines, None).unwrap_err();
+        assert_eq!(err, "unexpected end of input");
+    }
+
+    #[test]
+    fn wizard_confirm_piped_accepts_yes_and_defaults_to_no() {
+        let mut yes = canned_lines(&["y"]);
+        assert!(wizard::confirm(wizard::Mode::Piped, &mut yes).unwrap());
+        let mut yes_spelled = canned_lines(&["YES"]);
+        assert!(wizard::confirm(wizard::Mode::Piped, &mut yes_spelled).unwrap());
+        let mut no = canned_lines(&["n"]);
+        assert!(!wizard::confirm(wizard::Mode::Piped, &mut no).unwrap());
+        let mut enter = canned_lines(&[""]);
+        assert!(!wizard::confirm(wizard::Mode::Piped, &mut enter).unwrap());
+        let mut retried = canned_lines(&["maybe", "y"]);
+        assert!(wizard::confirm(wizard::Mode::Piped, &mut retried).unwrap());
+    }
+
+    #[test]
+    fn wizard_confirm_piped_fails_on_unexpected_eof() {
+        let mut lines = canned_lines(&[]);
+        let err = wizard::confirm(wizard::Mode::Piped, &mut lines).unwrap_err();
+        assert_eq!(err, "unexpected end of input");
+    }
+
+    #[test]
+    fn wizard_subcommand_is_reachable_from_the_cli_parser() {
+        let cli = Cli::try_parse_from([
+            "soroban-sas",
+            "schema",
+            "wizard",
+            "--registry-contract-id",
+            WIZARD_RESOLVER,
+            "--resolver",
+            WIZARD_RESOLVER,
+        ])
+        .unwrap();
+        let Some(Commands::Schema {
+            action: SchemaCommands::Wizard { resolver, .. },
+        }) = cli.command
+        else {
+            panic!("expected the schema wizard subcommand");
+        };
+        assert_eq!(resolver.as_deref(), Some(WIZARD_RESOLVER));
+    }
+
+    #[test]
+    fn test_completions_cli_parsing() {
+        let shells = [
+            ("bash", clap_complete::Shell::Bash),
+            ("zsh", clap_complete::Shell::Zsh),
+            ("fish", clap_complete::Shell::Fish),
+            ("powershell", clap_complete::Shell::PowerShell),
+            ("elvish", clap_complete::Shell::Elvish),
+        ];
+
+        for (name, expected_shell) in shells {
+            let cli = Cli::try_parse_from(["sas", "completions", name]).unwrap();
+            match cli.command {
+                Some(Commands::Completions { shell }) => assert_eq!(shell, expected_shell),
+                _ => panic!("expected Completions command for {name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_completions_script_generation() {
+        use clap::CommandFactory;
+
+        let shells = [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::PowerShell,
+            clap_complete::Shell::Elvish,
+        ];
+
+        for shell in shells {
+            let mut buf = Vec::new();
+            let mut cmd = Cli::command();
+            crate::completions::generate_completions(&mut cmd, shell, &mut buf);
+            let script = String::from_utf8(buf).expect("completions should be valid UTF-8");
+            assert!(
+                !script.is_empty(),
+                "completions script for {shell:?} should not be empty"
+            );
+            assert!(
+                script.contains("sas"),
+                "completions script should reference 'sas'"
+            );
+        }
     }
 }
