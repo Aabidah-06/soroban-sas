@@ -10,6 +10,7 @@ use soroban_sas_common::{
         SCHEMA_OWNERSHIP_TRANSFERRED, SCHEMA_QUARANTINED, TREASURY_UPDATED,
     },
     validate_frost_group, validate_schema_lexical, validate_schema_syntax, ContractUpgradedEvent,
+    DelegatesStatus,
     FrostGroup, PreviousAddress, RevocationPolicy, SASError, SchemaDelegateAddedEvent,
     SchemaDelegateRemovedEvent, SchemaDeprecatedEvent, SchemaFeeUpdatedEvent,
     SchemaFrostGroupUpdatedEvent, SchemaOwnershipProposedEvent, SchemaOwnershipTransferredEvent,
@@ -56,6 +57,52 @@ fn renew_schema_record(env: &Env, uid: &UID) {
 /// not been initialized yet. The non-panicking counterpart of
 /// [`require_registry_admin`], used by the upgrade validation path so a
 /// candidate can be rejected with a typed error before any state is written.
+/// Lineage lookups are bounded to prevent an unbounded read-cost attack.
+const MAX_SCHEMA_HISTORY_DEPTH: u32 = 64;
+
+/// A compatible derivative may only append new fields. This preserves the
+/// original field names, types and relative positions byte-for-byte. The
+/// shared schema syntax validator runs on both definitions before this check.
+fn is_append_only_schema(predecessor: &String, successor: &String) -> bool {
+    let old_len = predecessor.len() as usize;
+    let new_len = successor.len() as usize;
+    if new_len <= old_len || old_len > 1024 || new_len > 1024 {
+        return false;
+    }
+    let mut old_buf = [0u8; 1024];
+    let mut new_buf = [0u8; 1024];
+    predecessor.copy_into_slice(&mut old_buf[..old_len]);
+    successor.copy_into_slice(&mut new_buf[..new_len]);
+    new_buf[..old_len] == old_buf[..old_len] && new_buf[old_len] == b','
+}
+
+/// Traverses stored predecessor edges newest-first, including the input UID.
+/// The linkage and every record are stored separately from SchemaRecord so
+/// deployed schema metadata retains its original serialized shape.
+fn schema_history(env: &Env, uid: UID) -> Vec<UID> {
+    let mut history = Vec::new(env);
+    let mut current = uid;
+    loop {
+        if history.len() >= MAX_SCHEMA_HISTORY_DEPTH {
+            panic_with_error!(env, SASError::InvalidSchemaDefinition);
+        }
+        if !env.storage().persistent().has(&current) {
+            panic_with_error!(env, SASError::SchemaNotFound);
+        }
+        renew_schema_record(env, &current);
+        history.push_back(current.clone());
+        let key = (SCHEMA_PREDECESSOR, current);
+        let Some(parent): Option<UID> = env.storage().persistent().get(&key) else {
+            break;
+        };
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        current = parent;
+    }
+    history
+}
+
 fn registry_admin(env: &Env) -> Result<Address, SASError> {
     match env.storage().instance().get(&REGISTRY_ADMIN) {
         Some(admin) => Ok(admin),
@@ -237,6 +284,48 @@ fn members_contain(members: &Vec<Address>, needle: &Address) -> bool {
         index = index.saturating_add(1);
     }
     false
+}
+
+fn add_to_delegate_list(env: &Env, uid: &UID, delegate: &Address) {
+    let list_key = (SCHEMA_DELEGATES, uid.clone());
+    let mut list: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&list_key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !members_contain(&list, delegate) {
+        list.push_back(delegate.clone());
+        env.storage().persistent().set(&list_key, &list);
+        env.storage()
+            .persistent()
+            .extend_ttl(&list_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+    }
+}
+
+fn remove_from_delegate_list(env: &Env, uid: &UID, delegate: &Address) {
+    let list_key = (SCHEMA_DELEGATES, uid.clone());
+    let Some(list) = env.storage().persistent().get::<_, Vec<Address>>(&list_key) else {
+        return;
+    };
+    let mut new_list: Vec<Address> = Vec::new(env);
+    let len = list.len();
+    let mut i = 0;
+    while i < len {
+        if let Some(m) = list.get(i) {
+            if &m != delegate {
+                new_list.push_back(m);
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    if new_list.is_empty() {
+        env.storage().persistent().remove(&list_key);
+    } else {
+        env.storage().persistent().set(&list_key, &new_list);
+        env.storage()
+            .persistent()
+            .extend_ttl(&list_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+    }
 }
 
 /// Returns the owner set that governs `uid` together with the number of
@@ -619,10 +708,70 @@ impl SchemaRegistry {
             LEDGERS_IN_ONE_YEAR,
         );
 
+        let expiry_key = (DELEGATE_EXPIRY, uid.clone(), delegate.clone());
+        env.storage().persistent().remove(&expiry_key);
+
+        add_to_delegate_list(&env, &uid, &delegate);
+
         env.events().publish(
             (SCHEMA_DELEGATE_ADDED, uid.clone()),
             SchemaDelegateAddedEvent {
                 schema_uid: uid,
+                delegate,
+                authorizer: owner,
+            },
+        );
+
+        extend_instance_ttl(&env);
+    }
+
+    /// Authorizes `delegate` to issue and revoke attestations under schema `schema_uid` with an expiration timestamp.
+    ///
+    /// Requires authorization from the primary schema owner (creator).
+    /// Emits `SchemaDelegateAdded`.
+    pub fn add_delegate_with_expiry(
+        env: Env,
+        schema_uid: UID,
+        delegate: Address,
+        expiry_timestamp: u64,
+    ) {
+        extend_instance_ttl(&env);
+        if !env.storage().persistent().has(&schema_uid) {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+
+        let creator_key = (SCHEMA_CREATOR, schema_uid.clone());
+        let creator: Option<Address> = env.storage().persistent().get(&creator_key);
+        let Some(owner) = creator else {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        };
+
+        owner.require_auth();
+
+        let delegate_key = (AUTHORIZED_DELEGATES, schema_uid.clone(), delegate.clone());
+        env.storage().persistent().set(&delegate_key, &true);
+        env.storage().persistent().extend_ttl(
+            &delegate_key,
+            LEDGERS_IN_ONE_YEAR,
+            LEDGERS_IN_ONE_YEAR,
+        );
+
+        let expiry_key = (DELEGATE_EXPIRY, schema_uid.clone(), delegate.clone());
+        env.storage()
+            .persistent()
+            .set(&expiry_key, &expiry_timestamp);
+        env.storage().persistent().extend_ttl(
+            &expiry_key,
+            LEDGERS_IN_ONE_YEAR,
+            LEDGERS_IN_ONE_YEAR,
+        );
+
+        add_to_delegate_list(&env, &schema_uid, &delegate);
+
+        env.events().publish(
+            (SCHEMA_DELEGATE_ADDED, schema_uid.clone()),
+            SchemaDelegateAddedEvent {
+                schema_uid,
                 delegate,
                 authorizer: owner,
             },
@@ -652,6 +801,11 @@ impl SchemaRegistry {
         let delegate_key = (AUTHORIZED_DELEGATES, uid.clone(), delegate.clone());
         env.storage().persistent().remove(&delegate_key);
 
+        let expiry_key = (DELEGATE_EXPIRY, uid.clone(), delegate.clone());
+        env.storage().persistent().remove(&expiry_key);
+
+        remove_from_delegate_list(&env, &uid, &delegate);
+
         env.events().publish(
             (SCHEMA_DELEGATE_REMOVED, uid.clone()),
             SchemaDelegateRemovedEvent {
@@ -662,6 +816,48 @@ impl SchemaRegistry {
         );
 
         extend_instance_ttl(&env);
+    }
+
+    /// Allows `delegate` to self-revoke their authorization under schema `uid` at any time.
+    ///
+    /// Requires authorization from `delegate` themselves.
+    /// Emits `SchemaDelegateRemoved`.
+    pub fn self_revoke_delegate(env: Env, uid: UID, delegate: Address) {
+        extend_instance_ttl(&env);
+        if !env.storage().persistent().has(&uid) {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+
+        delegate.require_auth();
+
+        let delegate_key = (AUTHORIZED_DELEGATES, uid.clone(), delegate.clone());
+        env.storage().persistent().remove(&delegate_key);
+
+        let expiry_key = (DELEGATE_EXPIRY, uid.clone(), delegate.clone());
+        env.storage().persistent().remove(&expiry_key);
+
+        remove_from_delegate_list(&env, &uid, &delegate);
+
+        env.events().publish(
+            (SCHEMA_DELEGATE_REMOVED, uid.clone()),
+            SchemaDelegateRemovedEvent {
+                schema_uid: uid,
+                delegate: delegate.clone(),
+                authorizer: delegate,
+            },
+        );
+
+        extend_instance_ttl(&env);
+    }
+
+    /// Revokes `delegate`'s authorization by `delegate` themselves.
+    pub fn revoke_delegate(env: Env, uid: UID, delegate: Address) {
+        Self::self_revoke_delegate(env, uid, delegate);
+    }
+
+    /// Self-revocation entrypoint.
+    pub fn self_revoke(env: Env, uid: UID, delegate: Address) {
+        Self::self_revoke_delegate(env, uid, delegate);
     }
 
     /// Transfers ownership of schema `uid` to `new_owner` (#229).
@@ -1119,6 +1315,79 @@ impl SchemaRegistry {
         env.events().publish((SCHEMA_DEPRECATED, uid), sender);
     }
 
+    /// Registers a derivative schema under the predecessor owner's authority.
+    ///
+    /// Existing `register` methods keep their unchanged ABI. A migration uses
+    /// this explicit entry point, an append-only field extension and a durable
+    /// predecessor link; no mutation of an existing schema UID is permitted.
+    pub fn register_with_predecessor(
+        env: Env,
+        owner: Address,
+        schema: String,
+        resolver: Address,
+        revocable: bool,
+        predecessor_uid: UID,
+    ) -> UID {
+        if let Err(error) = validate_schema_syntax(&env, &schema) {
+            panic_with_error!(&env, error);
+        }
+        let predecessor: SchemaRecord = env
+            .storage()
+            .persistent()
+            .get(&predecessor_uid)
+            .unwrap_or_else(|| panic_with_error!(&env, SASError::SchemaNotFound));
+        // The predecessor's current owner must personally authorize the
+        // derivative, even if its new owner is a different address.
+        let predecessor_owner = schema_creator(&env, &predecessor_uid)
+            .unwrap_or_else(|| panic_with_error!(&env, SASError::SchemaNotFound));
+        if let Err(error) = validate_schema_syntax(&env, &predecessor.schema) {
+            panic_with_error!(&env, error);
+        }
+        if !is_append_only_schema(&predecessor.schema, &schema) {
+            panic_with_error!(&env, SASError::InvalidSchemaDefinition);
+        }
+
+        // Require both parties, without allowing the registry administrator or
+        // unrelated delegates to bypass predecessor ownership.
+        predecessor_owner.require_auth();
+        owner.require_auth();
+
+        // Bound ancestry before adding another edge.
+        if schema_history(&env, predecessor_uid.clone()).len() >= MAX_SCHEMA_HISTORY_DEPTH {
+            panic_with_error!(&env, SASError::InvalidSchemaDefinition);
+        }
+        let uid = Self::register_internal(env.clone(), owner, schema, resolver, revocable, 0);
+        let key = (SCHEMA_PREDECESSOR, uid.clone());
+        env.storage().persistent().set(&key, &predecessor_uid);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        uid
+    }
+
+    /// Returns UIDs ordered newest-to-genesis. Unlinked legacy schemas have
+    /// a single-entry history, and unknown/expired UIDs fail explicitly.
+    pub fn get_schema_history(env: Env, schema_uid: UID) -> Vec<UID> {
+        extend_instance_ttl(&env);
+        schema_history(&env, schema_uid)
+    }
+
+    /// Returns the direct predecessor when a schema was registered as a
+    /// migration; legacy and genesis schemas return None.
+    pub fn get_schema_predecessor(env: Env, schema_uid: UID) -> Option<UID> {
+        extend_instance_ttl(&env);
+        if !env.storage().persistent().has(&schema_uid) {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+        let key = (SCHEMA_PREDECESSOR, schema_uid);
+        let result: Option<UID> = env.storage().persistent().get(&key);
+        if result.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        }
+        result
+    }
     /// Protocol admin toggles quarantine on a schema (#539).
     ///
     /// Quarantine blocks new attestations. Existing attestations stay stored
@@ -1663,25 +1932,38 @@ impl SchemaRegistry {
         }
     }
 
-    /// Returns true if `delegate` is currently an authorized delegate for `uid`.
+    /// Returns true if `delegate` is currently an authorized delegate for `uid`
+    /// and has not expired.
     pub fn is_delegate(env: Env, uid: UID, delegate: Address) -> bool {
         extend_instance_ttl(&env);
-        let delegate_key = (AUTHORIZED_DELEGATES, uid, delegate);
-        if env
+        let delegate_key = (AUTHORIZED_DELEGATES, uid.clone(), delegate.clone());
+        if !env
             .storage()
             .persistent()
             .get::<_, bool>(&delegate_key)
             .unwrap_or(false)
         {
+            return false;
+        }
+
+        let expiry_key = (DELEGATE_EXPIRY, uid.clone(), delegate.clone());
+        if let Some(expiry) = env.storage().persistent().get::<_, u64>(&expiry_key) {
+            if expiry != 0 && env.ledger().timestamp() >= expiry {
+                return false;
+            }
             env.storage().persistent().extend_ttl(
-                &delegate_key,
+                &expiry_key,
                 LEDGERS_IN_ONE_YEAR,
                 LEDGERS_IN_ONE_YEAR,
             );
-            true
-        } else {
-            false
         }
+
+        env.storage().persistent().extend_ttl(
+            &delegate_key,
+            LEDGERS_IN_ONE_YEAR,
+            LEDGERS_IN_ONE_YEAR,
+        );
+        true
     }
 
     /// Returns the creator/owner address recorded when schema `uid` was registered.
@@ -1763,22 +2045,75 @@ impl SchemaRegistry {
             return false;
         }
 
-        let delegate_key = (AUTHORIZED_DELEGATES, uid.clone(), attester);
-        if env
-            .storage()
+        Self::is_delegate(env, uid, attester)
+    }
+
+    /// Returns the active and expired delegates registered for schema `uid`.
+    pub fn get_delegates(env: Env, uid: UID) -> DelegatesStatus {
+        extend_instance_ttl(&env);
+        let mut active = Vec::new(&env);
+        let mut expired = Vec::new(&env);
+
+        let list_key = (SCHEMA_DELEGATES, uid.clone());
+        let Some(delegates) = env.storage().persistent().get::<_, Vec<Address>>(&list_key) else {
+            return DelegatesStatus { active, expired };
+        };
+
+        env.storage()
             .persistent()
-            .get::<_, bool>(&delegate_key)
-            .unwrap_or(false)
-        {
-            env.storage().persistent().extend_ttl(
-                &delegate_key,
-                LEDGERS_IN_ONE_YEAR,
-                LEDGERS_IN_ONE_YEAR,
-            );
-            return true;
+            .extend_ttl(&list_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+
+        let now = env.ledger().timestamp();
+        let len = delegates.len();
+        let mut i = 0;
+        while i < len {
+            if let Some(delegate) = delegates.get(i) {
+                let delegate_key = (AUTHORIZED_DELEGATES, uid.clone(), delegate.clone());
+                if env
+                    .storage()
+                    .persistent()
+                    .get::<_, bool>(&delegate_key)
+                    .unwrap_or(false)
+                {
+                    let expiry_key = (DELEGATE_EXPIRY, uid.clone(), delegate.clone());
+                    let expiry: Option<u64> = env.storage().persistent().get(&expiry_key);
+                    match expiry {
+                        Some(exp) if exp != 0 && now >= exp => {
+                            expired.push_back(delegate);
+                        }
+                        _ => {
+                            active.push_back(delegate);
+                        }
+                    }
+                }
+            }
+            i = i.saturating_add(1);
         }
 
-        false
+        DelegatesStatus { active, expired }
+    }
+
+    /// Query returning active vs expired delegates.
+    pub fn get_delegates_by_status(env: Env, uid: UID) -> DelegatesStatus {
+        Self::get_delegates(env, uid)
+    }
+
+    /// Query returning active vs expired delegates.
+    pub fn get_active_and_expired_delegates(env: Env, uid: UID) -> DelegatesStatus {
+        Self::get_delegates(env, uid)
+    }
+
+    /// Returns active vs expired delegates as a tuple of `(active, expired)`.
+    pub fn get_delegates_tuple(env: Env, uid: UID) -> (Vec<Address>, Vec<Address>) {
+        let status = Self::get_delegates(env, uid);
+        (status.active, status.expired)
+    }
+
+    /// Returns the expiration timestamp configured for `delegate` under schema `uid`, if any.
+    pub fn get_delegate_expiry(env: Env, uid: UID, delegate: Address) -> Option<u64> {
+        extend_instance_ttl(&env);
+        let expiry_key = (DELEGATE_EXPIRY, uid, delegate);
+        env.storage().persistent().get(&expiry_key)
     }
 
     /// Returns up to `limit` active schemas from `start`, skipping deprecated.
