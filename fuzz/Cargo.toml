@@ -8,6 +8,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
+base64 = "0.22"
 libfuzzer-sys = "0.4"
 soroban-sas-common = { path = "../packages/soroban-sas-common" }
 soroban-sas-sdk = { path = "../packages/soroban-sas-sdk" }
@@ -112,11 +113,22 @@ doc = false
 [[bin]]
 name = "differential_hashing_fuzz"
 path = "fuzz_targets/differential_hashing_fuzz.rs"
+[[bin]]
+name = "differential_schema_fuzz"
+path = "fuzz_targets/differential_schema_fuzz.rs"
 test = false
 doc = false
 
 [[bin]]
 name = "differential_fixture_export"
 path = "tools/differential_fixture_export.rs"
+name = "stateful_indexer_fuzz"
+path = "fuzz_targets/stateful_indexer_fuzz.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "indexer_stateful_fuzz"
+path = "fuzz_targets/indexer_stateful_fuzz.rs"
 test = false
 doc = false
