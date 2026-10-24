@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4.0", features = ["derive", "env"] }
 # Interactive terminal prompts (validators, confirmations) for the
 # `schema wizard` command (#469). Default features off: the optional
