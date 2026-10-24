@@ -125,7 +125,12 @@ impl DelegatedBatchSignaturePacket {
         let attestations_xdr = self
             .attestations
             .iter()
-            .map(|attestation| hex_encode(attestation.clone().to_xdr(env).to_alloc_vec()))
+            .map(|attestation| {
+                let bytes = attestation.clone().to_xdr(env);
+                let mut buf = vec![0u8; bytes.len() as usize];
+                bytes.copy_into_slice(&mut buf);
+                hex_encode(buf)
+            })
             .collect::<Vec<_>>();
 
         serde_json::to_string(&serde_json::json!({
