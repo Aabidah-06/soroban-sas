@@ -110,6 +110,15 @@ const RECIPIENT_ATTESTATION: Symbol = symbol_short!("RATT");
 /// `(RECIPIENT_ATTESTATION_COUNT, recipient)` stores the number of UIDs
 /// directly mapped to `recipient`.
 const RECIPIENT_ATTESTATION_COUNT: Symbol = symbol_short!("RATTC");
+/// Persistent key prefix for a direct schema-to-attestation mapping:
+/// `(SCHEMA_ATTESTATION, schema_uid, uid)` stores `true` when `uid` is
+/// indexed under `schema_uid`. Enables O(1) membership checks.
+const SCHEMA_ATTESTATION: Symbol = symbol_short!("SATT");
+/// Persistent key prefix for the count of direct schema mappings:
+/// `(SCHEMA_ATTESTATION_COUNT, schema_uid)` stores the number of UIDs
+/// directly mapped to `schema_uid`.
+const SCHEMA_ATTESTATION_COUNT: Symbol = symbol_short!("SATTC");
+
 /// Instance key recording the active adaptive chunk capacity (in UIDs).
 /// Absent on legacy deployments, which fall back to `DEFAULT_CHUNK_SIZE`.
 const CHUNK_CAPACITY: Symbol = symbol_short!("CHUNKCAP");
@@ -412,6 +421,37 @@ fn index_recipient_attestation(env: &Env, recipient: &Address, uid: &UID) {
         .extend_ttl(&mapping_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 
     let count_key = (RECIPIENT_ATTESTATION_COUNT, recipient.clone());
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&count_key, &count.saturating_add(1));
+    env.storage()
+        .persistent()
+        .extend_ttl(&count_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+    extend_instance_ttl(env);
+}
+
+/// Records a direct schema-to-attestation mapping for O(1) membership
+/// checks. Stores a boolean flag keyed by `(SCHEMA_ATTESTATION, schema_uid,
+/// uid)` and increments the per-schema mapping counter. Idempotent: a
+/// repeated call for the same `(schema_uid, uid)` pair is a no-op that only
+/// renews TTLs, so retries cannot inflate the mapping count.
+fn index_schema_attestation(env: &Env, schema_uid: &UID, uid: &UID) {
+    let mapping_key = (SCHEMA_ATTESTATION, schema_uid.clone(), uid.clone());
+    if env.storage().persistent().has(&mapping_key) {
+        env.storage().persistent().extend_ttl(
+            &mapping_key,
+            LEDGERS_IN_ONE_YEAR,
+            LEDGERS_IN_ONE_YEAR,
+        );
+        return;
+    }
+    env.storage().persistent().set(&mapping_key, &true);
+    env.storage()
+        .persistent()
+        .extend_ttl(&mapping_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+
+    let count_key = (SCHEMA_ATTESTATION_COUNT, schema_uid.clone());
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
     env.storage()
         .persistent()
@@ -855,6 +895,7 @@ impl Indexer {
         index_address_uid(&env, &recipient, &uid, RECIPIENT_TOTAL, DIM_RECIPIENT);
         index_recipient_attestation(&env, &recipient, &uid);
         index_uid_uid(&env, &schema_uid, &uid, SCHEMA_TOTAL, DIM_SCHEMA);
+        index_schema_attestation(&env, &schema_uid, &uid);
         index_address_uid(&env, &attester, &uid, ATTESTER_TOTAL, DIM_ATTESTER);
 
         let expiration_status = if expiration_time == 0 {
@@ -956,6 +997,44 @@ impl Indexer {
             );
         }
         count.unwrap_or(0)
+    }
+
+    /// Returns `true` when `uid` is directly mapped to `recipient` in the
+    /// recipient-to-attestation index. O(1) persistent lookup; renews the
+    /// mapping's TTL when found. Returns `false` for a pair that was never
+    /// indexed, without creating storage. Fast existence check that avoids
+    /// fetching full chunk pages.
+    pub fn has_attestation(env: Env, recipient: Address, uid: UID) -> bool {
+        extend_instance_ttl(&env);
+        let mapping_key = (RECIPIENT_ATTESTATION, recipient, uid);
+        let present = env.storage().persistent().has(&mapping_key);
+        if present {
+            env.storage().persistent().extend_ttl(
+                &mapping_key,
+                LEDGERS_IN_ONE_YEAR,
+                LEDGERS_IN_ONE_YEAR,
+            );
+        }
+        present
+    }
+
+    /// Returns `true` when `uid` is directly mapped to `schema_uid` in the
+    /// schema-to-attestation index. O(1) persistent lookup; renews the
+    /// mapping's TTL when found. Returns `false` for a pair that was never
+    /// indexed, without creating storage. Fast existence check that avoids
+    /// fetching full chunk pages.
+    pub fn has_schema_attestation(env: Env, schema_uid: UID, uid: UID) -> bool {
+        extend_instance_ttl(&env);
+        let mapping_key = (SCHEMA_ATTESTATION, schema_uid, uid);
+        let present = env.storage().persistent().has(&mapping_key);
+        if present {
+            env.storage().persistent().extend_ttl(
+                &mapping_key,
+                LEDGERS_IN_ONE_YEAR,
+                LEDGERS_IN_ONE_YEAR,
+            );
+        }
+        present
     }
 
     /// Total number of UIDs indexed under `schema_uid`. See
