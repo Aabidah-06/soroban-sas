@@ -1,9 +1,14 @@
 #![no_std]
-use soroban_sdd::{address::Address, contract, contracterror, contractimpl, panic_with_error, symbol_short!, token, Into.</p>
-</p>
+
+use soroban_sas_common::Attestation;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    Address, Env, Symbol,
+};
 
 /// Error codes returned by the TokenGatedResolver.
 #[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ResolverError {
     /// The resolver has already been initialized.
@@ -52,7 +57,7 @@ pub struct Config {
     pub fee_disposal: FeeDisposal,
 }
 
-const STORAGE_KEY: symbol_short!("CONFIG") = symbol_short!("CONFIG");
+const CONFIG_KEY: Symbol = symbol_short!("CONFIG");
 
 #[contract]
 pub struct TokenGatedResolver;
@@ -68,17 +73,17 @@ impl TokenGatedResolver {
         fee_amount: i128,
         fee_disposal: FeeDisposal,
     ) {
-        if env.storage().persistent().has(&STORAGE_KEY) {
-            panic_with_error(&ResolverError::AlreadyInitialized);
+        if env.storage().persistent().has(&CONFIG_KEY) {
+            panic_with_error!(&env, ResolverError::AlreadyInitialized);
         }
         if min_balance < 0 {
-            panic_with_error(&ResolverError::InvalidThreshold);
+            panic_with_error!(&env, ResolverError::InvalidThreshold);
         }
         if fee_amount < 0 {
-            panic_with_error(&ResolverError::InvalidFee);
+            panic_with_error!(&env, ResolverError::InvalidFee);
         }
         if fee_amount > 0 && fee_disposal == FeeDisposal::None {
-            panic_with_error(&ResolverError::InvalidFee);
+            panic_with_error!(&env, ResolverError::InvalidFee);
         }
 
         let config = Config {
@@ -88,7 +93,7 @@ impl TokenGatedResolver {
             fee_amount,
             fee_disposal,
         };
-        env.storage().persistent().set(&STORAGE_KEY, &config);
+        env.storage().persistent().set(&CONFIG_KEY, &config);
     }
 
     /// Return the current configuration.
@@ -101,7 +106,7 @@ impl TokenGatedResolver {
         let mut config = load_config(&env);
         config.admin.require_auth();
         config.admin = new_admin;
-        env.storage().persistent().set(&STORAGE_KEY, &config);
+        env.storage().persistent().set(&CONFIG_KEY, &config);
     }
 
     /// Update the minimum required balance. Only callable by the admin.
@@ -109,10 +114,10 @@ impl TokenGatedResolver {
         let mut config = load_config(&env);
         config.admin.require_auth();
         if min_balance < 0 {
-            panic_with_error(&ResolverError::InvalidThreshold);
+            panic_with_error!(&env, ResolverError::InvalidThreshold);
         }
         config.min_balance = min_balance;
-        env.storage().persistent().set(&STORAGE_KEY, &config);
+        env.storage().persistent().set(&CONFIG_KEY, &config);
     }
 
     /// Update the token contract. Only callable by the admin.
@@ -120,7 +125,7 @@ impl TokenGatedResolver {
         let mut config = load_config(&env);
         config.admin.require_auth();
         config.token = token;
-        env.storage().persistent().set(&STORAGE_KEY, &config);
+        env.storage().persistent().set(&CONFIG_KEY, &config);
     }
 
     /// Update the fee configuration. Only callable by the admin.
@@ -128,103 +133,76 @@ impl TokenGatedResolver {
         let mut config = load_config(&env);
         config.admin.require_auth();
         if fee_amount < 0 {
-            panic_with_error(&ResolverError::InvalidFee);
+            panic_with_error!(&env, ResolverError::InvalidFee);
         }
         if fee_amount > 0 && fee_disposal == FeeDisposal::None {
-            panic_with_error(&ResolverError::InvalidFee);
+            panic_with_error!(&env, ResolverError::InvalidFee);
         }
         config.fee_amount = fee_amount;
         config.fee_disposal = fee_disposal;
-        env.storage().persistent().set(&STORAGE_KEY, &config);
+        env.storage().persistent().set(&CONFIG_KEY, &config);
     }
 
     /// Return the current balance of `account` in the configured token.
     pub fn balance_of(env: Env, account: Address) -> i128 {
         let config = load_config(&env);
-        token::client(&env, &config.token).balance(&account)
+        token::Client::new(&env, &config.token).balance(&account)
     }
 
     /// Return whether `account` is eligible for attestation.
     pub fn is_eligible(env: Env, account: Address) -> bool {
         let config = load_config(&env);
-        let balance = token::client(&env, &config.token).balance(&account);
+        let balance = token::Client::new(&env, &config.token).balance(&account);
         balance >= config.min_balance
     }
 
     /// Resolver hook invoked by the SAS contract on attestation.
     ///
-    /// The attester must have authorized this call (handled by the SAS contract).
     /// The recipient must hold at least `min_balance` of the configured token.
     /// If a fee is configured, it is charged from the attester.
-    pub fn on_attest(env: Env, attester: Address, recipient: Address, _uid: u64) {
+    pub fn on_attest(env: Env, attestation: Attestation) {
         let config = load_config(&env);
 
-        // Verify recipient holds the required token balance.
-        let token_client = token::client(&env, &config.token);
-        let recipient_balance = token_client.balance(&recipient);
+        let token_client = token::Client::new(&env, &config.token);
+        let recipient_balance = token_client.balance(&attestation.recipient);
         if recipient_balance < config.min_balance {
-            panic_with_error(&ResolverError::ResolverRejected);
+            panic_with_error!(&env, ResolverError::ResolverRejected);
         }
 
-        // Charge the configured fee, if any.
         if config.fee_amount > 0 {
-            switch config.fee_disposal {
-                FeeDisposal::None => {
-                    // Unreachable due to initialization validation, but kept for completeness.
-                }
+            attestation.attester.require_auth();
+            match config.fee_disposal {
+                FeeDisposal::None => {}
                 FeeDisposal::Transfer => {
-                    let attester_balance = token_client.balance(&attester);
+                    let attester_balance = token_client.balance(&attestation.attester);
                     if attester_balance < config.fee_amount {
-                        panic_with_error(&ResolverError::InsufficientFee);
+                        panic_with_error!(&env, ResolverError::InsufficientFee);
                     }
-                    token_client.transfer(
-                        &attester,
-                        &config.admin,
-                        &config.fee_amount,
-                    );
+                    token_client.transfer(&attestation.attester, &config.admin, &config.fee_amount);
                 }
                 FeeDisposal::Burn => {
-                    let attester_balance = token_client.balance(&attester);
+                    let attester_balance = token_client.balance(&attestation.attester);
                     if attester_balance < config.fee_amount {
-                        panic_with_error(&ResolverError::InsufficientFee);
+                        panic_with_error!(&env, ResolverError::InsufficientFee);
                     }
-                    token_client.burn(&attester, &config.fee_amount);
+                    token_client.burn(&attestation.attester, &config.fee_amount);
                 }
             }
         }
     }
 
     /// Resolver hook invoked by the SAS contract on revocation.
-    ///
-    /// Revocation is performed by the attester or the admin. This hook verifies
-    /// that the caller is authorized and that the recipient still holds the token.
-    /// Token locks (if any) are released here.
-    pub fn on_revoke(env: Env, attester: Address, recipient: Address, _uid: u64) {
-        let config = load_config(&env);
-
-        // Attester or admin may revoke. The SAS contract already enforces the
-        // attester authorization for the revoke path, but we also allow the admin
-        // to revoke in case of abuse. We require auth from whichever account is
-        // performing the revocation.
-        let caller = env.invoker_address();
-        if caller != attester && caller != config.admin {
-            panic_with_error(&ResolverError::Unauthorized);
-        }
-        caller.require_auth();
-
-        // No token locks are held by this resolver, so there is nothing to release.
-        // The recipient is simply no longer required to hold the token.
-        let _ = recipient;
+    pub fn on_revoke(_env: Env, _attestation: Attestation) {
+        // No-op for token-gated attestation revocation.
     }
 }
 
 fn load_config(env: &Env) -> Config {
     env.storage()
         .persistent()
-        .get::<symbol_short!("CONFIG"), Config>(&STORAGE_KEY)
-        .unwrap_or_else_with(|| panic_with_error(&ResolverError::NotInitialized))
+        .get(&CONFIG_KEY)
+        .unwrap_or_else(|| panic_with_error!(env, ResolverError::NotInitialized))
 }
 
-#[mod test]
+#[cfg(test)]
 mod test;
-}

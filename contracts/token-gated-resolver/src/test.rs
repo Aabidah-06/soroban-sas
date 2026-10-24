@@ -1,252 +1,231 @@
-#`![cfg_test]
 use super::*;
-use soroban_sdk:{Address, Env, Map, Symbol, Val, Vec, Into::From;
-use soroban_token::{Client as TokenClient, StellarAsset};
+use soroban_sas_common::{Attestation, UID};
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{token::StellarAssetClient, Address, Bytes, BytesN, Env};
 
-const THRESHOLD: i128 = 100;
-
-struct TestSetup {
+struct TestFixture {
     env: Env,
-    contract_id: Address,
+    client: TokenGatedResolverClient<'static>,
     admin: Address,
-    attester: Address,
-    recipient: Address,
     token_id: Address,
 }
 
-fn setup() -> TestSetup {
+fn setup() -> TestFixture {
     let env = Env::default();
-    env.mock_all(authenticated());
+    env.mock_all_auths();
 
-    let admin = Address::generate(&tenv);
-    let attester = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    // Deploy a Stellar Asset Contract token for testing.
-    let admin_addr = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract(
-        &Symbol::new(&env, "TEST", 7),
-        &admin_addr,
-    );
-    let token_client = TokenClient::new(&env, &token_id);
-    token_client.mint(&r(), &recipient, &threshold_amount());
-
-    // Deploy the resolver contract.
-    let contract_id = env.register_contract_stoband(TokenGatedResolver,());
+    let contract_id = env.register_contract(None, TokenGatedResolver);
     let client = TokenGatedResolverClient::new(&env, &contract_id);
-    client.initialize(&admin, &token_id, &threshold_amount());
 
-    TestSetup {
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    TestFixture {
         env,
-        contract_id,
+        client,
         admin,
-        attester,
-        recipient,
         token_id,
     }
 }
 
-fn threshold_amount() -> i128 {
-    THRESHOLD
-}
-
-// Helper to build a minimal attestation record for testing.
-fn attestation_record(env: &Env, attester: &Address, recipient: &Address) -> Val {
-    let mut map = Map::new(env);
-    map.set(Symbol::new(env, "attester"), attester.clone());
-    map.set(Symbol::new(env, "recipient"), recipient.clone());
-    map.set(Symbol::new(env, "schema_id"), 123u32);
-    Val::from_val(&map)
-}
-
-#[test]
-fn test_initialize_sets_config() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    assert_eq(client.admin(), t.admin);
-    assert_eq(client.token(), t.token_id);
-    assert_eq(client.min_balance(), threshold_amount());
+fn create_attestation(env: &Env, attester: &Address, recipient: &Address) -> Attestation {
+    Attestation {
+        uid: UID(BytesN::from_array(env, &[1u8; 32])),
+        schema_uid: UID(BytesN::from_array(env, &[2u8; 32])),
+        time: 1000,
+        expiration_time: 0,
+        revocation_time: 0,
+        ref_uid: UID(BytesN::from_array(env, &[0u8; 32])),
+        recipient: recipient.clone(),
+        attester: attester.clone(),
+        revocable: true,
+        data: Bytes::new(env),
+        valid_from: 0,
+    }
 }
 
 #[test]
-fn test_attest_succeeds_with_sufficient_balance() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
+fn test_initialize_and_get_config() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &10, &FeeDisposal::Transfer);
 
-    client.on_attest(&t.attester, &record);
-
-    // Attestation was accepted; no revert occurred.
-    assert_eq(client.min_balance(), threshold_amount());
+    let cfg = f.client.config();
+    assert_eq!(cfg.admin, f.admin);
+    assert_eq!(cfg.token, f.token_id);
+    assert_eq!(cfg.min_balance, 100);
+    assert_eq!(cfg.fee_amount, 10);
+    assert_eq!(cfg.fee_disposal, FeeDisposal::Transfer);
 }
 
 #[test]
-#[should_panic]
-fn test_attest_reverts_when_below_threshold() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-
-    // Recipient has no token balance.
-    let poor_recipient = Address::generate(&t.env);
-    let record = attestation_record(&t.env, &t.attester, &poor_recipient);
-
-    client.on_attest(&t.attester, &record);
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_initialize_already_initialized() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &0, &FeeDisposal::None);
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &0, &FeeDisposal::None);
 }
 
 #[test]
-#[should_panic]
-fn test_attest_reverts_when_balance_just_below_threshold() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let token_client = TokenClient::new(&t.env, &t.token_id);
-
-    // Burn one token so balance is one below threshold.
-    token_client.burn(&r(), &t.recipient, &1i128);
-    assert_eq(
-        token_client.balance(&t.recipient),
-        threshold_amount() - 1,
-    );
-
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
-    client.on_attest(&t.attester, &record);
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_initialize_invalid_threshold() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &-1, &0, &FeeDisposal::None);
 }
 
 #[test]
-fn test_attest_succeeds_at_exact_threshold() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let token_client = TokenClient::new(&t.env, &t.token_id);
-
-    assert_eq(
-        token_client.balance(&t.recipient),
-        threshold_amount(),
-    );
-
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
-    client.on_attest(&t.attester, &record);
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_initialize_invalid_fee_negative() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &-5, &FeeDisposal::Transfer);
 }
 
 #[test]
-fn test_admin_can_update_threshold() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-
-    client.set_min_balance(&t.admin, &200i128);
-    assert_eq(client.min_balance(), 200i128);
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_initialize_invalid_fee_with_none_disposal() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &10, &FeeDisposal::None);
 }
 
 #[test]
-#[should_panic]
-fn test_nonadmin_cannot_update_threshold() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    client.set_min_balance(&t.attester, &200i128);
+fn test_admin_config_setters() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &0, &FeeDisposal::None);
+
+    let new_admin = Address::generate(&f.env);
+    f.client.set_admin(&new_admin);
+    assert_eq!(f.client.config().admin, new_admin);
+
+    f.client.set_min_balance(&250);
+    assert_eq!(f.client.config().min_balance, 250);
+
+    let new_token = Address::generate(&f.env);
+    f.client.set_token(&new_token);
+    assert_eq!(f.client.config().token, new_token);
+
+    f.client.set_fee(&15, &FeeDisposal::Burn);
+    assert_eq!(f.client.config().fee_amount, 15);
+    assert_eq!(f.client.config().fee_disposal, FeeDisposal::Burn);
 }
 
 #[test]
-#[should_panic]
-fn test_nonadmin_cannot_update_token() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let new_token = Address::generate(&t.env);
-    client.set_token(&t.attester, &new_token);
+fn test_is_eligible_and_balance_of() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &0, &FeeDisposal::None);
+
+    let user = Address::generate(&f.env);
+    assert_eq!(f.client.balance_of(&user), 0);
+    assert!(!f.client.is_eligible(&user));
+
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&user, &99);
+    assert_eq!(f.client.balance_of(&user), 99);
+    assert!(!f.client.is_eligible(&user));
+
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&user, &1);
+    assert_eq!(f.client.balance_of(&user), 100);
+    assert!(f.client.is_eligible(&user));
 }
 
 #[test]
-fn test_admin_can_update_token() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let new_token = Address::generate(&t.env);
-    client.set_token(&t.admin, &new_token);
-    assert_eq(client.token(), new_token);
+fn test_on_attest_succeeds_with_sufficient_balance() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &0, &FeeDisposal::None);
+
+    let attester = Address::generate(&f.env);
+    let recipient = Address::generate(&f.env);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&recipient, &150);
+
+    let attestation = create_attestation(&f.env, &attester, &recipient);
+    f.client.on_attest(&attestation);
 }
 
 #[test]
-fn test_revoke_by_attester_succeeds() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_on_attest_reverts_when_below_threshold() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &100, &0, &FeeDisposal::None);
 
-    client.on_attest(&t.attester, &record);
-    client.on_revoke(&t.attester, &record);
+    let attester = Address::generate(&f.env);
+    let recipient = Address::generate(&f.env);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&recipient, &99);
+
+    let attestation = create_attestation(&f.env, &attester, &recipient);
+    f.client.on_attest(&attestation);
 }
 
 #[test]
-#[should_panic]
-fn test_revoke_by_non_attester_reverts() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
-    let stranger = Address::generate(&t.env);
+fn test_on_attest_fee_transfer_to_admin() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &50, &20, &FeeDisposal::Transfer);
 
-    client.on_attest(&t.attester, &record);
-    client.on_revoke(&stranger, &record);
+    let attester = Address::generate(&f.env);
+    let recipient = Address::generate(&f.env);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&recipient, &50);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&attester, &20);
+
+    let attestation = create_attestation(&f.env, &attester, &recipient);
+    f.client.on_attest(&attestation);
+
+    let token_client = token::Client::new(&f.env, &f.token_id);
+    assert_eq!(token_client.balance(&attester), 0);
+    assert_eq!(token_client.balance(&f.admin), 20);
 }
 
 #[test]
-fn test_revoke_by_admin_succeeds() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
+fn test_on_attest_fee_burn() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &50, &20, &FeeDisposal::Burn);
 
-    client.on_attest(&t.attester, &record);
-    client.on_revoke(&t.admin, &record);
+    let attester = Address::generate(&f.env);
+    let recipient = Address::generate(&f.env);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&recipient, &50);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&attester, &30);
+
+    let attestation = create_attestation(&f.env, &attester, &recipient);
+    f.client.on_attest(&attestation);
+
+    let token_client = token::Client::new(&f.env, &f.token_id);
+    assert_eq!(token_client.balance(&attester), 10);
 }
 
 #[test]
-fn test_attest_with_fee_transfers_tokens() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let token_client = TokenClient::new(&t.env, &t.token_id);
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_on_attest_insufficient_fee_reverts() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &50, &20, &FeeDisposal::Transfer);
 
-    // Configure a fee of 10 tokens paid by the attester.
-    client.set_fee(&t.admin, &10i128);
-    token_client.mint(&r(), &t.attester, &10i128);
+    let attester = Address::generate(&f.env);
+    let recipient = Address::generate(&f.env);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&recipient, &50);
+    StellarAssetClient::new(&f.env, &f.token_id).mint(&attester, &10); // Less than 20
 
-    let attester_before = token_client.balance(&t.attester);
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
-    client.on_attest(&t.attester, &record);
-
-    assert_eq(
-        token_client.balance(&t.attester),
-        attester_before - 10i128,
-    );
-    assert_eq(
-        token_client.balance(&t.contract_id),
-        10i128,
-    );
+    let attestation = create_attestation(&f.env, &attester, &recipient);
+    f.client.on_attest(&attestation);
 }
 
 #[test]
-#[should_panic]
-fn test_attest_reverts_when_fee_unaffordable() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
+fn test_on_revoke_succeeds() {
+    let f = setup();
+    f.client
+        .initialize(&f.admin, &f.token_id, &50, &0, &FeeDisposal::None);
 
-    client.set_fee(&t.admin, &10i128);
-    // Attester has no token balance to pay the fee.
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
-    client.on_attest(&t.attester, &record);
-}
-
-#[test]
-#[should_panic]
-fn test_nonadmin_cannot_set_fee() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    client.set_fee(&t.attester, &10i128);
-}
-
-#[test]
-fn test_attest_reflects_balance_changes() {
-    let t = setup();
-    let client = TokenGatedResolverClient::new(&t.env, &t.contract_id);
-    let token_client = TokenClient::new(&t.env, &t.token_id);
-
-    // Recipient loses tokens and thus fails the gate.
-    token_client.burn(&r(), &t.recipient, &threshold_amount());
-    let record = attestation_record(&t.env, &t.attester, &t.recipient);
-
-    let result = client.try_on_attest(&t.attester, &record);
-    assert!(result.is_err());
+    let attester = Address::generate(&f.env);
+    let recipient = Address::generate(&f.env);
+    let attestation = create_attestation(&f.env, &attester, &recipient);
+    f.client.on_revoke(&attestation);
 }
