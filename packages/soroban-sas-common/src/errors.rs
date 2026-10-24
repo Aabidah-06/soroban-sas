@@ -78,6 +78,15 @@ pub enum SASError {
     InvalidTimeRange = 418,
     /// Expiration time exceeds schema's max_ttl or perpetual attestation under capped schema (#441).
     InvalidExpirationTime = 419,
+    /// A new attestation was attempted under a schema the protocol admin has quarantined (#539).
+    SchemaQuarantined = 420,
+    /// A time-window resolver rejected an attestation because the recipient's
+    /// cooldown period has not elapsed yet (#549).
+    CooldownActive = 421,
+    /// The payment asset is not authorized by the protocol fee allowlist.
+    InvalidToken = 422,
+    /// The attester has exhausted their configured ledger-window quota.
+    RateLimitExceeded = 423,
 
     /// Circuit breaker errors
     /// The contract is paused and write operations are not permitted (#255).
@@ -87,4 +96,6 @@ pub enum SASError {
     /// A callback (resolver or indexer) re-entered `multi_attest` while the
     /// outer batch was still executing (#296).
     Reentrancy = 502,
+    /// A resolver callback attempted an indirect mutating call back into SAS.
+    ReentrancyDetected = 503,
 }
