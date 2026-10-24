@@ -244,6 +244,7 @@ impl HostileIndexer {
         _recipient: Address,
         _schema_uid: UID,
         _attester: Address,
+        _expiration_time: u64,
     ) {
         run_attack(&env);
     }
