@@ -74,6 +74,14 @@ The workspace has evolved beyond initial mocks and now includes comprehensive do
   - Accepts versioned proof payloads carrying EVM schema, recipient, mapped Stellar address, and data.
   - Documents its [wire format and trust limits](docs/cross-chain-verification.md).
 
+- `contracts/time-window-resolver`
+  **Role**: Enforces a minimum delay between attestations issued to the same recipient.
+  **Duties**:
+  - Records the last accepted issuance time per recipient.
+  - Rejects issuance inside the configured cooldown with `SASError::CooldownActive`.
+  - Lets the resolver admin adjust the cooldown window with authorization.
+  - Documents its [cooldown semantics and storage limits](docs/time-window-resolver.md).
+
 ### Rust Packages
 
 - `packages/soroban-sas-common`
@@ -357,6 +365,9 @@ TMPDIR=/tmp cargo test --workspace
 - [Fee Collection and Treasury Mechanics](docs/fee-collection-and-treasury.md): protocol fee configuration, treasury routing, and token withdrawals.
 - [Internationalization (i18n) and Translation Guidelines](docs/i18n-translation-guidelines.md): localization conventions, terminology glossary, and contribution guidelines.
 - [Upgrade Runbook](docs/UPGRADE_RUNBOOK.md): staged upgrade and forward-recovery procedures for `schema-registry`, `sas`, and `indexer`.
+- [Time-Window Resolver](docs/time-window-resolver.md): enforcing minimum
+  delays between recurring attestations issued to the same recipient, with
+  cooldown boundaries, administrative updates, and storage expiry limits.
 - [Glossary of Terms](docs/glossary.md): authoritative protocol definitions for Attestation, Schema, Issuer, Resolver, UID, and lifecycle terms.
 
 ## Project Roadmap
