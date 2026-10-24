@@ -14,6 +14,10 @@ pub enum SASError {
     InvalidSchema = 101,
     InvalidSchemaFormat = 104,
     EmptySchema = 105,
+    /// A schema definition string violated strict lexical rules: it contained
+    /// control characters, invalid/invisible unicode whitespace, or malformed
+    /// separators (trailing/leading delimiters, non-canonical spacing). See
+    /// `validate_schema_lexical`.
     InvalidSchemaDefinition = 106,
     SchemaAlreadyExists = 102,
     SchemaNotFound = 103,
@@ -24,6 +28,10 @@ pub enum SASError {
     NotRevocable = 203,
     AlreadyExpired = 204,
     DuplicateAttestation = 205,
+    /// An attestation's revocability flag violated the schema's revocation
+    /// policy: an irrevocable attestation was issued under a `RevocableOnly`
+    /// schema. (The inverse violation — a revocable attestation under an
+    /// `IrrevocableOnly` schema — reuses `NotRevocable`.)
     InvalidRevocability = 206,
 
     /// Authorization errors
@@ -85,6 +93,15 @@ pub enum SASError {
     InvalidTimestamp = 420,
     /// No issuance or revocation timestamp anchor exists for the UID (#436).
     TimestampAnchorNotFound = 421,
+    /// A new attestation was attempted under a schema the protocol admin has quarantined (#539).
+    SchemaQuarantined = 420,
+    /// A time-window resolver rejected an attestation because the recipient's
+    /// cooldown period has not elapsed yet (#549).
+    CooldownActive = 421,
+    /// The payment asset is not authorized by the protocol fee allowlist.
+    InvalidToken = 422,
+    /// The attester has exhausted their configured ledger-window quota.
+    RateLimitExceeded = 423,
 
     /// Circuit breaker errors
     /// The contract is paused and write operations are not permitted (#255).
@@ -94,4 +111,6 @@ pub enum SASError {
     /// A callback (resolver or indexer) re-entered `multi_attest` while the
     /// outer batch was still executing (#296).
     Reentrancy = 502,
+    /// A resolver callback attempted an indirect mutating call back into SAS.
+    ReentrancyDetected = 503,
 }
