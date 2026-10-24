@@ -701,9 +701,11 @@ impl Indexer {
     /// Idempotent: a repeated call with the **same**
     /// `(recipient, schema_uid, attester, expiration_time)` quadruple is a no-op (it only
     /// renews TTLs), so a retried cross-contract call or a migration replay
-    /// can't duplicate query results or inflate storage. A repeated call
-    /// for the same `uid` with a **different** quadruple is rejected with
-    /// `SASError::DuplicateAttestation`.
+    /// can't duplicate query results or inflate storage. This ensures that
+    /// `bulk_reindex` replays after partial failures are safe: if some UIDs
+    /// were successfully indexed before a failure, replaying the entire batch
+    /// won't create duplicates. A repeated call for the same `uid` with a
+    /// **different** quadruple is rejected with `SASError::DuplicateAttestation`.
     pub fn index_attestation(
         env: Env,
         uid: UID,

@@ -63,6 +63,7 @@ mod mock_attacker {
             recipient: Address,
             schema_uid: UID,
             attester: Address,
+
             expiration_time: u64,
         ) {
             env.invoke_contract::<()>(
@@ -449,6 +450,7 @@ fn test_index_attestation_rejects_unrelated_contract() {
 
     let res =
         attacker_client.try_relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
+
     assert!(res.is_err());
 
     let indexer_client = IndexerClient::new(&env, &indexer_id);
@@ -500,6 +502,7 @@ fn test_reindexing_identical_metadata_is_a_no_op() {
     let attester = Address::generate(&env);
 
     // Same call three times — a retried cross-contract call / migration replay.
+
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
@@ -541,6 +544,7 @@ fn test_get_count_by_tracks_indexing_across_chunk_boundary() {
         let mut bytes = [0u8; 32];
         bytes[0..4].copy_from_slice(&i.to_be_bytes());
         let uid = UID(soroban_sdk::BytesN::from_array(&env, &bytes));
+
         sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
 
         assert_eq!(client.get_count_by_recipient(&recipient), i + 1);
@@ -621,6 +625,7 @@ fn test_reusing_a_uid_with_a_different_schema_or_attester_is_rejected() {
 
     let wrong_schema =
         sas_client.try_relay_index(&indexer_id, &uid, &recipient, &schema_b, &attester_a, &0);
+
     assert_eq!(
         wrong_schema,
         Err(Ok(soroban_sas_common::SASError::DuplicateAttestation.into()))
@@ -628,6 +633,7 @@ fn test_reusing_a_uid_with_a_different_schema_or_attester_is_rejected() {
 
     let wrong_attester =
         sas_client.try_relay_index(&indexer_id, &uid, &recipient, &schema_a, &attester_b, &0);
+
     assert_eq!(
         wrong_attester,
         Err(Ok(soroban_sas_common::SASError::DuplicateAttestation.into()))
@@ -649,7 +655,9 @@ fn test_get_attestation_status_defaults_to_none_until_a_callback_sets_it() {
     let attester = Address::generate(&env);
 
     assert_eq!(client.get_attestation_status(&uid), None);
+
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
+
     // A freshly indexed UID has no explicit status entry; `None` is read as
     // active by the filtered queries.
     assert_eq!(client.get_attestation_status(&uid), None);
@@ -692,6 +700,7 @@ fn test_attester_indexing_large_datasets() {
         let mut bytes = [0u8; 32];
         bytes[0] = i;
         let uid = UID(soroban_sdk::BytesN::from_array(&env, &bytes));
+
         sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
     }
 
@@ -719,6 +728,7 @@ fn test_cursor_pagination_large_datasets() {
         let mut bytes = [0u8; 32];
         bytes[0] = i;
         let uid = UID(soroban_sdk::BytesN::from_array(&env, &bytes));
+
         sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
     }
 
@@ -937,12 +947,14 @@ fn test_index_attestation_renews_decayed_instance_ttl() {
         li.sequence_number += INSTANCE_EXTEND_TO_LEDGERS - 1000;
     });
     let uid1 = UID(soroban_sdk::BytesN::from_array(&env, &[8u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid1, &recipient, &schema_uid, &attester, &0);
 
     env.ledger().with_mut(|li| {
         li.sequence_number += INSTANCE_EXTEND_TO_LEDGERS - 1000;
     });
     let uid2 = UID(soroban_sdk::BytesN::from_array(&env, &[9u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid2, &recipient, &schema_uid, &attester, &0);
 }
 
@@ -962,12 +974,14 @@ fn test_instance_ttl_renewed_by_trusted_write_and_read() {
         li.sequence_number += INSTANCE_EXTEND_TO_LEDGERS - 1000;
     });
     let uid1 = UID(soroban_sdk::BytesN::from_array(&env, &[8u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid1, &recipient, &schema_uid, &attester, &0);
 
     env.ledger().with_mut(|li| {
         li.sequence_number += INSTANCE_EXTEND_TO_LEDGERS - 1000;
     });
     let uid2 = UID(soroban_sdk::BytesN::from_array(&env, &[9u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid2, &recipient, &schema_uid, &attester, &0);
 
     // get_admin/get_sas read instance storage directly; if the instance
@@ -983,6 +997,7 @@ fn test_instance_ttl_renewed_by_trusted_write_and_read() {
     let schema_uid = UID(soroban_sdk::BytesN::from_array(&env, &[78u8; 32]));
     let recipient = Address::generate(&env);
     let attester = Address::generate(&env);
+
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
 
     // Advance another half-year + 100 beyond original TTL; without renewal this would have expired
@@ -1009,6 +1024,7 @@ fn test_read_only_renews_instance_without_mutating_chunks() {
     let schema_uid = UID(soroban_sdk::BytesN::from_array(&env, &[89u8; 32]));
     let recipient = Address::generate(&env);
     let attester = Address::generate(&env);
+
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
 
     // Capture chunk before read-only renewal
@@ -1097,6 +1113,7 @@ fn test_all_dimensions_chunk_at_max_and_complete_reads_walk_every_chunk() {
         let mut bytes = [0u8; 32];
         bytes[0..4].copy_from_slice(&i.to_be_bytes());
         let uid = UID(soroban_sdk::BytesN::from_array(&env, &bytes));
+
         sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
     }
 
@@ -1189,6 +1206,7 @@ fn test_recipient_counter_survives_simulated_instance_storage_expiry() {
     let attester = Address::generate(&env);
 
     let uid1 = UID(soroban_sdk::BytesN::from_array(&env, &[1u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid1, &recipient, &schema_uid, &attester, &0);
 
     let count_key = (RECIPIENT_TOTAL, recipient.clone());
@@ -1225,6 +1243,7 @@ fn test_recipient_counter_survives_simulated_instance_storage_expiry() {
     });
 
     let uid2 = UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid2, &recipient, &schema_uid, &attester, &0);
 
     env.as_contract(&indexer_id, || {
@@ -1252,6 +1271,7 @@ fn test_recipient_read_preserves_hot_index_ttl() {
     let recipient = Address::generate(&env);
     let attester = Address::generate(&env);
     let uid = UID(soroban_sdk::BytesN::from_array(&env, &[12u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
 
     let chunk_key = (recipient.clone(), 0u32);
@@ -1296,6 +1316,7 @@ fn test_schema_read_preserves_hot_index_ttl() {
     let recipient = Address::generate(&env);
     let attester = Address::generate(&env);
     let uid = UID(soroban_sdk::BytesN::from_array(&env, &[22u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
 
     let chunk_key = (schema_uid.clone(), 0u32);
@@ -1333,6 +1354,7 @@ fn test_attester_read_preserves_hot_index_ttl() {
     let recipient = Address::generate(&env);
     let attester = Address::generate(&env);
     let uid = UID(soroban_sdk::BytesN::from_array(&env, &[24u8; 32]));
+
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
 
     let chunk_key = (attester.clone(), 0u32);
@@ -1515,6 +1537,7 @@ fn test_get_by_issuer_matches_get_by_attester_happy_path() {
         let mut bytes = [0u8; 32];
         bytes[0] = i;
         let uid = UID(soroban_sdk::BytesN::from_array(&env, &bytes));
+
         sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &issuer, &0);
     }
 
@@ -1586,6 +1609,7 @@ fn test_get_by_issuer_filtered_excludes_revoked() {
     let uid = UID(soroban_sdk::BytesN::from_array(&env, &[5u8; 32]));
 
     sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &issuer, &0);
+
     env.as_contract(&indexer_id, || {
         set_index_status(&env, &uid, IndexStatus::Revoked);
     });
@@ -1600,6 +1624,81 @@ fn test_get_by_issuer_filtered_excludes_revoked() {
     );
     // Count is unaffected by status: the UID stays indexed.
     assert_eq!(client.get_count_by_issuer(&issuer), 1);
+}
+
+/// Test that index_attestation is idempotent: replaying the same attestation
+/// with identical metadata is a no-op and doesn't cause duplicates.
+#[test]
+fn test_index_attestation_idempotent_replay() {
+    let env = Env::default();
+    let (indexer_id, client, sas) = setup_indexed(&env);
+    let sas_client = mock::MockSasClient::new(&env, &sas);
+
+    let recipient = Address::generate(&env);
+    let schema_uid = UID(soroban_sdk::BytesN::from_array(&env, &[1u8; 32]));
+    let attester = Address::generate(&env);
+    let uid = UID(soroban_sdk::BytesN::from_array(&env, &[10u8; 32]));
+
+    // Index the attestation once
+    sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
+    assert_eq!(client.get_count_by_recipient(&recipient), 1);
+    assert_eq!(client.get_count_by_schema(&schema_uid), 1);
+    assert_eq!(client.get_count_by_attester(&attester), 1);
+
+    // Replay the same attestation with identical metadata (simulating
+    // a bulk_reindex replay after an indexer outage). This should be a no-op.
+    sas_client.relay_index(&indexer_id, &uid, &recipient, &schema_uid, &attester, &0);
+
+    // Verify counts haven't changed (no duplicates)
+    assert_eq!(client.get_count_by_recipient(&recipient), 1);
+    assert_eq!(client.get_count_by_schema(&schema_uid), 1);
+    assert_eq!(client.get_count_by_attester(&attester), 1);
+
+    // Verify the UID appears exactly once in the index
+    let recipient_uids = client.get_attestations_by_recipient(&recipient);
+    assert_eq!(recipient_uids.len(), 1);
+    assert_eq!(recipient_uids.get(0), Some(uid));
+}
+
+/// Test that simulates bulk_reindex partial failure scenario: some UIDs succeed
+/// before failure, then retrying the entire batch doesn't create duplicates.
+#[test]
+fn test_bulk_reindex_partial_failure_idempotency() {
+    let env = Env::default();
+    let (indexer_id, client, sas) = setup_indexed(&env);
+    let sas_client = mock::MockSasClient::new(&env, &sas);
+
+    let recipient = Address::generate(&env);
+    let schema_uid = UID(soroban_sdk::BytesN::from_array(&env, &[1u8; 32]));
+    let attester = Address::generate(&env);
+
+    let uid1 = UID(soroban_sdk::BytesN::from_array(&env, &[10u8; 32]));
+    let uid2 = UID(soroban_sdk::BytesN::from_array(&env, &[11u8; 32]));
+    let uid3 = UID(soroban_sdk::BytesN::from_array(&env, &[12u8; 32]));
+
+    // Simulate initial indexing: first two succeed, third "fails" (not indexed)
+    sas_client.relay_index(&indexer_id, &uid1, &recipient, &schema_uid, &attester, &0);
+    sas_client.relay_index(&indexer_id, &uid2, &recipient, &schema_uid, &attester, &0);
+    // uid3 not indexed yet
+
+    assert_eq!(client.get_count_by_recipient(&recipient), 2);
+
+    // Now retry all three (simulating bulk_reindex after fixing the issue)
+    sas_client.relay_index(&indexer_id, &uid1, &recipient, &schema_uid, &attester, &0);
+    sas_client.relay_index(&indexer_id, &uid2, &recipient, &schema_uid, &attester, &0);
+    sas_client.relay_index(&indexer_id, &uid3, &recipient, &schema_uid, &attester, &0);
+
+    // Verify no duplicates: should still be 3 total (not 5)
+    assert_eq!(client.get_count_by_recipient(&recipient), 3);
+    assert_eq!(client.get_count_by_schema(&schema_uid), 3);
+    assert_eq!(client.get_count_by_attester(&attester), 3);
+
+    // Verify all three UIDs are present exactly once
+    let recipient_uids = client.get_attestations_by_recipient(&recipient);
+    assert_eq!(recipient_uids.len(), 3);
+    assert!(recipient_uids.contains(&uid1));
+    assert!(recipient_uids.contains(&uid2));
+    assert!(recipient_uids.contains(&uid3));
 }
 
 /// Test expiration status indexing: perpetual attestations are indexed
