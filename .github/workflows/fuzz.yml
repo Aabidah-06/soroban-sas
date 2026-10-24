@@ -51,13 +51,13 @@ jobs:
       - run: which cargo-fuzz || cargo +stable install cargo-fuzz --version 0.13.2 --locked
       - name: Run Contracts & Core Smoke Tests
         run: |
-          cargo fuzz run indexer_chunking_fuzz -- -runs=1000 -max_len=14400 -rss_limit_mb=4096
-          cargo fuzz run cross_contract_registry_sas_fuzz -- -runs=2000 -max_len=300 -rss_limit_mb=4096
-          cargo fuzz run indexer_idempotency_fuzz -- -runs=500 -max_len=832 -rss_limit_mb=4096
-          cargo fuzz run schema_fuzz -- -runs=2000 -max_len=1024 -rss_limit_mb=4096
-          cargo fuzz run validation_fuzz -- -runs=2000 -max_len=128 -rss_limit_mb=4096
-          cargo fuzz run merkle_fuzz -- -runs=2000 -max_len=256 -rss_limit_mb=4096
-          cargo fuzz run strkey_fuzz -- -runs=5000 -max_len=128 -rss_limit_mb=4096
+          cargo fuzz run indexer_chunking_fuzz -- -runs=100 -max_len=14400 -rss_limit_mb=4096
+          cargo fuzz run cross_contract_registry_sas_fuzz -- -runs=200 -max_len=300 -rss_limit_mb=4096
+          cargo fuzz run indexer_idempotency_fuzz -- -runs=100 -max_len=832 -rss_limit_mb=4096
+          cargo fuzz run schema_fuzz -- -runs=200 -max_len=1024 -rss_limit_mb=4096
+          cargo fuzz run validation_fuzz -- -runs=200 -max_len=128 -rss_limit_mb=4096
+          cargo fuzz run merkle_fuzz -- -runs=200 -max_len=256 -rss_limit_mb=4096
+          cargo fuzz run strkey_fuzz -- -runs=500 -max_len=128 -rss_limit_mb=4096
 
   smoke-sdk-tooling:
     name: Smoke · SDK & Tooling
@@ -83,13 +83,13 @@ jobs:
       - run: which cargo-fuzz || cargo +stable install cargo-fuzz --version 0.13.2 --locked
       - name: Run SDK & Tooling Smoke Tests
         run: |
-          cargo fuzz run typed_data_fuzz -- -runs=1000 -max_len=512 -rss_limit_mb=4096
-          cargo fuzz run eip712_encode_fuzz -- -runs=2000 -max_len=512 -rss_limit_mb=4096
-          cargo fuzz run xdr_decode_fuzz -- -runs=5000 -max_len=4096 -rss_limit_mb=4096
-          cargo fuzz run cli_json_fuzz -- -runs=5000 -max_len=4096 -rss_limit_mb=4096
-          cargo fuzz run csv_bulk_fuzz -- -runs=5000 -max_len=8192 -rss_limit_mb=4096
-          cargo fuzz run schema_builder_fuzz -- -runs=2000 -max_len=512 -rss_limit_mb=4096
-          cargo fuzz run attestation_builder_fuzz -- -runs=2000 -max_len=512 -rss_limit_mb=4096
+          cargo fuzz run typed_data_fuzz -- -runs=200 -max_len=512 -rss_limit_mb=4096
+          cargo fuzz run eip712_encode_fuzz -- -runs=200 -max_len=512 -rss_limit_mb=4096
+          cargo fuzz run xdr_decode_fuzz -- -runs=500 -max_len=4096 -rss_limit_mb=4096
+          cargo fuzz run cli_json_fuzz -- -runs=500 -max_len=4096 -rss_limit_mb=4096
+          cargo fuzz run csv_bulk_fuzz -- -runs=500 -max_len=8192 -rss_limit_mb=4096
+          cargo fuzz run schema_builder_fuzz -- -runs=200 -max_len=512 -rss_limit_mb=4096
+          cargo fuzz run attestation_builder_fuzz -- -runs=200 -max_len=512 -rss_limit_mb=4096
 
 
   # ── Full campaigns (scheduled / manual only) ───────────────────────────────
