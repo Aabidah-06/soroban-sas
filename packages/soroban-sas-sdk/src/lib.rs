@@ -9,6 +9,7 @@ extern crate self as soroban_sas_sdk;
 
 pub mod account;
 pub mod attestation_builder;
+pub mod auth;
 pub mod batch;
 pub mod client;
 pub mod delegation;
@@ -28,6 +29,7 @@ pub mod errors;
 pub mod events;
 pub mod schema_macro;
 pub use attestation_builder::AttestationRequestBuilder;
+pub use auth::AuthEntryBuilder;
 pub use rpc::{RateLimitPolicy, RpcBackend};
 pub use schema_builder::SchemaBuilder;
 pub use schema_macro::SchemaType;
