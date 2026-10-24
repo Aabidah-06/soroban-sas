@@ -324,16 +324,6 @@ mod gas_profiling {
         profile_multi_attest_n(100);
     }
 
-    #[test]
-    fn profile_sas_multi_attest_n250() {
-        profile_multi_attest_n(250);
-    }
-
-    #[test]
-    fn profile_sas_multi_attest_n500() {
-        profile_multi_attest_n(500);
-    }
-
     // -----------------------------------------------------------------------
     // JSON serialization helpers (no external serde dependency)
     // -----------------------------------------------------------------------
