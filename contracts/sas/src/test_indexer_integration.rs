@@ -118,6 +118,7 @@ impl Deployment {
             schema_uid: self.schema_uid.clone(),
             time: 0,
             expiration_time: 0,
+            valid_from: 0,
             revocation_time: 0,
             ref_uid: UID(BytesN::from_array(&self.env, &[0u8; 32])),
             recipient: recipient.clone(),
@@ -279,7 +280,7 @@ fn indexing_is_authorized_by_the_bound_sas_alone() {
     let forged = UID(BytesN::from_array(&d.env, &[0xABu8; 32]));
     assert!(d
         .indexer
-        .try_index_attestation(&forged, &recipient, &d.schema_uid, &d.attester)
+        .try_index_attestation(&forged, &recipient, &d.schema_uid, &d.attester, &0)
         .is_err());
     assert_eq!(d.indexer.get_count_by_recipient(&recipient), 1);
 }
