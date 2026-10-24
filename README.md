@@ -63,12 +63,14 @@ The workspace has evolved beyond initial mocks and now includes comprehensive do
   **Duties**:
   - Maintains mappings from recipient addresses to their respective attestations.
   - Maintains mappings from schemas to all associated attestations.
+  - Supports newest-first cursor pages for recipient, schema, and attester history.
 
 - `contracts/cross-chain-verifier`
   **Role**: Verifies remote attestation status updates authenticated by an Axelar GMP gateway.
   **Duties**:
   - Binds one remote chain and source contract at deployment.
   - Rejects unapproved, stale or expired updates and exposes short-lived remote verdicts.
+  - Accepts versioned proof payloads carrying EVM schema, recipient, mapped Stellar address, and data.
   - Documents its [wire format and trust limits](docs/cross-chain-verification.md).
 
 ### Rust Packages
@@ -188,9 +190,9 @@ Precedence (explicit flag > environment variable > TOML default > built-in netwo
 
 ## Delegated Issuance
 
-Delegated issuance and revocation let an attester sign an operation off-chain
+Delegated issuance, revocation, and consented replacement let parties sign an operation off-chain
 while a separate relayer submits and pays for the transaction. See
-[Delegated Issuance and Revocation](docs/delegation.md) for the typed-data
+[Delegated Issuance and Replacement](docs/delegation.md) for the typed-data
 domain, nonce high-watermark rules, key rotation behavior, CLI commands, and
 SDK workflow.
 

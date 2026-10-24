@@ -1,10 +1,11 @@
 use crate::{SASClient, SAS};
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sas_common::{
-    hash_delegated_revocation, AdminTransferCompletedEvent, AdminTransferProposedEvent,
-    Attestation, AttestationDomain, AttestationIssuedEvent, AttestationRevokedEvent,
-    BatchAttestedEvent, BatchRevokedEvent, ContractUpgradedEvent, IndexerStrictUpdatedEvent,
-    IndexerUpdatedEvent, PreviousAddress, SASError, UID,
+    hash_delegated_replacement_consent, hash_delegated_revocation, AdminTransferCompletedEvent,
+    AdminTransferProposedEvent, Attestation, AttestationDomain, AttestationIssuedEvent,
+    AttestationRevokedEvent, BatchAttestedEvent, BatchRevokedEvent, ContractUpgradedEvent,
+    IndexerStrictUpdatedEvent, IndexerUpdatedEvent, PreviousAddress, ReplacementApproval,
+    ReplacementConsentDomain, SASError, UID,
 };
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::testutils::Events as _;
@@ -28,6 +29,7 @@ fn attestation_fixture(
         schema_uid,
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(BytesN::from_array(env, &[0u8; 32])),
         recipient: recipient.clone(),
@@ -136,12 +138,21 @@ pub mod mock4 {
 
     #[contractimpl]
     impl MockIndexer {
+        pub fn handle_replace(env: Env, old_uid: UID, new_uid: UID) {
+            env.storage().persistent().set(&old_uid, &new_uid);
+        }
+
+        pub fn get_replacement(env: Env, old_uid: UID) -> Option<UID> {
+            env.storage().persistent().get(&old_uid)
+        }
+
         pub fn index_attestation(
             env: Env,
             uid: UID,
             recipient: Address,
             _schema_uid: UID,
             _attester: Address,
+            _expiration_time: u64,
         ) {
             let mut uids: soroban_sdk::Vec<UID> = env
                 .storage()
@@ -266,6 +277,7 @@ fn test_happy_path_attestation() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid,
         recipient,
@@ -305,6 +317,7 @@ fn test_auth_failure_missing_signature() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+            valid_from: 0,
         revocation_time: 0,
         ref_uid,
         recipient,
@@ -342,6 +355,7 @@ fn test_schema_validation_rejection() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+            valid_from: 0,
         revocation_time: 0,
         ref_uid,
         recipient,
@@ -379,6 +393,7 @@ fn test_revocation_success() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -432,6 +447,7 @@ mod replace {
             schema_uid,
             time: 1000,
             expiration_time: 0,
+            valid_from: 0,
             revocation_time: 0,
             ref_uid: UID(BytesN::from_array(&env, &[0u8; 32])),
             recipient: recipient.clone(),
@@ -479,6 +495,7 @@ mod replace {
                 schema_uid,
                 time: 2000,
                 expiration_time: 0,
+                valid_from: 0,
                 revocation_time: 0,
                 // Deliberately wrong: replace_attestation must overwrite this
                 // with old_uid regardless of what's passed in.
@@ -510,6 +527,182 @@ fn test_replace_attestation_success() {
     // overwriting whatever the caller passed.
     let stored: Attestation = f.sas_client.get_attestation(&new_attestation.uid).unwrap();
     assert_eq!(stored.ref_uid, f.old_uid);
+}
+
+mod replacement_consent {
+    use super::*;
+
+    pub struct Fixture {
+        pub env: Env,
+        pub sas_id: Address,
+        pub old: Attestation,
+        pub next: Attestation,
+        pub attester_key: SigningKey,
+        pub recipient_key: SigningKey,
+    }
+
+    fn address_for_key(env: &Env, key: &SigningKey) -> Address {
+        let strkey = stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
+        Address::from_string(&soroban_sdk::String::from_str(env, &strkey))
+    }
+
+    pub fn setup() -> Fixture {
+        let env = Env::default();
+        let registry_id = env.register_contract(None, mock1::MockRegistry);
+        let sas_id = env.register_contract(None, SAS);
+        let attester_key = SigningKey::from_bytes(&[31; 32]);
+        let recipient_key = SigningKey::from_bytes(&[32; 32]);
+        let attester = address_for_key(&env, &attester_key);
+        let recipient = address_for_key(&env, &recipient_key);
+        let client = SASClient::new(&env, &sas_id);
+        env.mock_all_auths();
+        client.init(&Address::generate(&env), &registry_id);
+        let old = attestation_fixture(&env, &attester, &recipient, [10; 32]);
+        client.attest(&old);
+        env.ledger().with_mut(|li| li.timestamp = 5000);
+        let next = attestation_fixture(&env, &attester, &recipient, [11; 32]);
+        Fixture {
+            env,
+            sas_id,
+            old,
+            next,
+            attester_key,
+            recipient_key,
+        }
+    }
+
+    pub fn approvals(
+        f: &Fixture,
+        old_uid: &UID,
+        next: &Attestation,
+        a_nonce: u64,
+        r_nonce: u64,
+    ) -> (ReplacementApproval, ReplacementApproval) {
+        let domain = ReplacementConsentDomain {
+            network_id: f.env.ledger().network_id(),
+            contract: f.sas_id.clone(),
+            attester_nonce: a_nonce,
+            recipient_nonce: r_nonce,
+        };
+        let digest = hash_delegated_replacement_consent(&f.env, old_uid, next, &domain);
+        (
+            ReplacementApproval {
+                nonce: a_nonce,
+                signature: BytesN::from_array(
+                    &f.env,
+                    &f.attester_key.sign(&digest.to_array()).to_bytes(),
+                ),
+                public_key: BytesN::from_array(&f.env, &f.attester_key.verifying_key().to_bytes()),
+            },
+            ReplacementApproval {
+                nonce: r_nonce,
+                signature: BytesN::from_array(
+                    &f.env,
+                    &f.recipient_key.sign(&digest.to_array()).to_bytes(),
+                ),
+                public_key: BytesN::from_array(&f.env, &f.recipient_key.verifying_key().to_bytes()),
+            },
+        )
+    }
+}
+
+#[test]
+fn test_replacement_consent_revokes_links_indexes_and_consumes_both_nonces() {
+    let f = replacement_consent::setup();
+    let client = SASClient::new(&f.env, &f.sas_id);
+    let indexer_id = f.env.register_contract(None, mock4::MockIndexer);
+    client.set_indexer(&indexer_id);
+    let indexer = mock4::MockIndexerClient::new(&f.env, &indexer_id);
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &f.next, 7, 9);
+
+    let uid = client.replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r);
+    assert_eq!(uid, f.next.uid);
+    assert!(!client.verify_attestation(&f.old.uid));
+    assert!(client.verify_attestation(&uid));
+    assert_eq!(client.get_attestation(&uid).unwrap().ref_uid, f.old.uid);
+    assert_eq!(indexer.get_replacement(&f.old.uid), Some(uid.clone()));
+    assert!(indexer
+        .get_attestations_by_recipient(&f.next.recipient)
+        .contains(&uid));
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), Some(7));
+    assert_eq!(
+        client.get_recipient_consent_nonce(&f.old.recipient),
+        Some(9)
+    );
+
+    let old2 = attestation_fixture(&f.env, &f.old.attester, &f.old.recipient, [12; 32]);
+    let next2 = attestation_fixture(&f.env, &f.old.attester, &f.old.recipient, [13; 32]);
+    client.attest(&old2);
+    let (a, r) = replacement_consent::approvals(&f, &old2.uid, &next2, 8, 9);
+    assert_eq!(
+        client.try_replace_by_delegation_consent(&old2.uid, &next2, &a, &r),
+        Err(Ok(SASError::DelegationReplay.into()))
+    );
+    assert!(client.verify_attestation(&old2.uid));
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), Some(7));
+}
+
+#[test]
+fn test_replacement_consent_rejects_wrong_recipient_and_tampering_without_consuming_nonces() {
+    let f = replacement_consent::setup();
+    let client = SASClient::new(&f.env, &f.sas_id);
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &f.next, 1, 2);
+    let wrong_key = BytesN::from_array(&f.env, &[99; 32]);
+    let mut wrong_recipient = r.clone();
+    wrong_recipient.public_key = wrong_key;
+    assert_eq!(
+        client.try_replace_by_delegation_consent(&f.old.uid, &f.next, &a, &wrong_recipient),
+        Err(Ok(SASError::Unauthorized.into()))
+    );
+
+    let mut tampered = f.next.clone();
+    tampered.data = Bytes::from_slice(&f.env, &[42]);
+    recompute_uid(&f.env, &mut tampered);
+    assert!(client
+        .try_replace_by_delegation_consent(&f.old.uid, &tampered, &a, &r)
+        .is_err());
+    let mut wrong_signature = r.clone();
+    wrong_signature.signature = BytesN::from_array(&f.env, &[0; 64]);
+    assert!(client
+        .try_replace_by_delegation_consent(&f.old.uid, &f.next, &a, &wrong_signature)
+        .is_err());
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), None);
+    assert_eq!(client.get_recipient_consent_nonce(&f.old.recipient), None);
+    assert!(client.verify_attestation(&f.old.uid));
+    assert!(client.get_attestation(&f.next.uid).is_none());
+
+    client.replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r);
+    assert_eq!(
+        client.get_recipient_consent_nonce(&f.old.recipient),
+        Some(2)
+    );
+    assert!(client
+        .try_replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r)
+        .is_err());
+}
+
+#[test]
+fn test_replacement_consent_rolls_back_both_nonces_if_replacement_fails() {
+    let f = replacement_consent::setup();
+    let client = SASClient::new(&f.env, &f.sas_id);
+    let mut invalid = f.next.clone();
+    invalid.uid = UID(BytesN::from_array(&f.env, &[55; 32]));
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &invalid, 4, 6);
+    assert_eq!(
+        client.try_replace_by_delegation_consent(&f.old.uid, &invalid, &a, &r),
+        Err(Ok(SASError::InvalidUID.into()))
+    );
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), None);
+    assert_eq!(client.get_recipient_consent_nonce(&f.old.recipient), None);
+    assert!(client.verify_attestation(&f.old.uid));
+
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &f.next, 4, 6);
+    client.replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r);
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), Some(4));
+    assert_eq!(
+        client.get_recipient_consent_nonce(&f.old.recipient),
+        Some(6)
+    );
 }
 
 #[test]
@@ -611,6 +804,7 @@ mod renew {
             schema_uid,
             time: 1000,
             expiration_time: initial_expiration,
+            valid_from: 0,
             revocation_time: 0,
             ref_uid: UID(BytesN::from_array(&env, &[0u8; 32])),
             recipient: recipient.clone(),
@@ -702,6 +896,7 @@ fn test_renew_attestation_rejects_non_revocable() {
         schema_uid,
         time: 1000,
         expiration_time: 10000,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(BytesN::from_array(&env, &[0u8; 32])),
         recipient: recipient.clone(),
@@ -766,6 +961,7 @@ fn test_revocation_failure() {
         schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
         time: 1000,
         expiration_time: 0,
+            valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -811,6 +1007,7 @@ fn test_multi_attest_returns_both_uids() {
         schema_uid: schema_uid.clone(),
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient: recipient.clone(),
@@ -824,6 +1021,7 @@ fn test_multi_attest_returns_both_uids() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -865,6 +1063,7 @@ fn test_batch_operations() {
         schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
         time: 1000,
         expiration_time: 0,
+            valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient: recipient.clone(),
@@ -878,6 +1077,7 @@ fn test_batch_operations() {
         schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
         time: 1000,
         expiration_time: 0,
+            valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -941,6 +1141,7 @@ fn test_resolver_callback() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -1528,7 +1729,8 @@ fn test_attestation_expiration() {
         uid: uid.clone(),
         schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
         time: 1000,
-        expiration_time: 100, // Expired if ledger is > 100
+        expiration_time: 100,
+            valid_from: 0, // Expired if ledger is > 100
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -1566,6 +1768,7 @@ fn test_attest_by_delegation() {
         schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
         time: 1000,
         expiration_time: 0,
+            valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -1624,6 +1827,7 @@ mod offchain {
             schema_uid,
             time: 1000,
             expiration_time: 0,
+            valid_from: 0,
             revocation_time: 0,
             ref_uid: UID(BytesN::from_array(&env, &[0u8; 32])),
             recipient,
@@ -2231,6 +2435,7 @@ fn test_comprehensive_lifecycle() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -2277,6 +2482,7 @@ fn test_attest_emits_attestation_issued_event() {
         schema_uid: schema_uid.clone(),
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient: recipient.clone(),
@@ -2329,6 +2535,7 @@ fn test_revoke_emits_attestation_revoked_event() {
         schema_uid,
         time: 1000,
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -2619,6 +2826,7 @@ pub mod mock_trap_indexer {
             _recipient: Address,
             _schema_uid: UID,
             _attester: Address,
+            _expiration_time: u64,
         ) {
             soroban_sdk::panic_with_error!(&env, SASError::NotInitialized);
         }
@@ -2983,6 +3191,7 @@ fn test_delegated_attest_normalizes_time_to_ledger_timestamp() {
         schema_uid,
         time: 1, // caller-provided, must be overwritten
         expiration_time: 0,
+        valid_from: 0,
         revocation_time: 0,
         ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
@@ -3868,6 +4077,7 @@ mod snapshot_tests {
 
 mod view_functions {
     use super::*;
+    use schema_registry::{SchemaRegistry, SchemaRegistryClient};
 
     fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
@@ -3875,6 +4085,17 @@ mod view_functions {
         let sas_id = env.register_contract(None, SAS);
         let admin = Address::generate(&env);
         env.mock_all_auths();
+        SASClient::new(&env, &sas_id).init(&admin, &registry_id);
+        (env, sas_id, admin, registry_id)
+    }
+
+    fn setup_with_real_registry() -> (Env, Address, Address, Address) {
+        let env = Env::default();
+        let registry_id = env.register_contract(None, SchemaRegistry);
+        let sas_id = env.register_contract(None, SAS);
+        let admin = Address::generate(&env);
+        env.mock_all_auths();
+        SchemaRegistryClient::new(&env, &registry_id).init(&admin);
         SASClient::new(&env, &sas_id).init(&admin, &registry_id);
         (env, sas_id, admin, registry_id)
     }
@@ -3920,6 +4141,222 @@ mod view_functions {
     }
 
     #[test]
+    fn test_timelocked_attestation_pre_active_and_post_expiration() {
+        let (env, sas_id, _admin, _registry) = setup();
+        let client = SASClient::new(&env, &sas_id);
+
+        let attester = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let mut attestation = attestation_fixture(&env, &attester, &recipient, [210u8; 32]);
+        attestation.valid_from = 200;
+        attestation.expiration_time = 500;
+
+        let uid = client.attest(&attestation);
+
+        // Pre-activation state (timestamp = 100 < valid_from = 200)
+        assert!(!client.verify_attestation(&uid));
+        assert!(!client.verify_attestation_view(&uid));
+        assert_eq!(client.get_valid_from(&uid), 200);
+
+        // At boundary before activation
+        env.ledger().with_mut(|li| li.timestamp = 199);
+        assert!(!client.verify_attestation(&uid));
+        assert!(!client.verify_attestation_view(&uid));
+
+        // Active state at exact valid_from activation
+        env.ledger().with_mut(|li| li.timestamp = 200);
+        assert!(client.verify_attestation(&uid));
+        assert!(client.verify_attestation_view(&uid));
+
+        // Active state mid-lifecycle
+        env.ledger().with_mut(|li| li.timestamp = 350);
+        assert!(client.verify_attestation(&uid));
+        assert!(client.verify_attestation_view(&uid));
+
+        // Active state at boundary before expiration
+        env.ledger().with_mut(|li| li.timestamp = 499);
+        assert!(client.verify_attestation(&uid));
+
+        // Post-expiration state (timestamp = 500 >= expiration_time)
+        env.ledger().with_mut(|li| li.timestamp = 500);
+        assert!(!client.verify_attestation(&uid));
+        assert!(!client.verify_attestation_view(&uid));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #418)")]
+    fn test_timelocked_attestation_rejects_valid_from_greater_than_expiration() {
+        let (env, sas_id, _admin, _registry) = setup();
+        let client = SASClient::new(&env, &sas_id);
+
+        let attester = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let mut attestation = attestation_fixture(&env, &attester, &recipient, [211u8; 32]);
+        attestation.valid_from = 600;
+        attestation.expiration_time = 500; // valid_from > expiration_time > 0
+
+        client.attest(&attestation);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #418)")]
+    fn test_timelocked_attestation_rejects_valid_from_equal_to_expiration() {
+        let (env, sas_id, _admin, _registry) = setup();
+        let client = SASClient::new(&env, &sas_id);
+
+        let attester = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let mut attestation = attestation_fixture(&env, &attester, &recipient, [212u8; 32]);
+        attestation.valid_from = 500;
+        attestation.expiration_time = 500; // valid_from == expiration_time > 0
+
+        client.attest(&attestation);
+    }
+
+    #[test]
+    fn test_timelocked_perpetual_attestation_succeeds() {
+        let (env, sas_id, _admin, _registry) = setup();
+        let client = SASClient::new(&env, &sas_id);
+
+        let attester = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let mut attestation = attestation_fixture(&env, &attester, &recipient, [213u8; 32]);
+        attestation.valid_from = 250;
+        attestation.expiration_time = 0; // perpetual
+
+        let uid = client.attest(&attestation);
+
+        // Pre-activation
+        assert!(!client.verify_attestation(&uid));
+
+        // Activated
+        env.ledger().with_mut(|li| li.timestamp = 300);
+        assert!(client.verify_attestation(&uid));
+
+        // Far future still active
+        env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+        assert!(client.verify_attestation(&uid));
+    }
+
+    #[test]
+    fn test_schema_max_ttl_enforcement() {
+        let (env, sas_id, _admin, registry_id) = setup_with_real_registry();
+        let client = SASClient::new(&env, &sas_id);
+        let reg_client = SchemaRegistryClient::new(&env, &registry_id);
+
+        let attester = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let resolver = env.register_contract(None, mock3::MockResolver);
+
+        // Register a schema with max_ttl = 300 seconds
+        let schema_str = soroban_sdk::String::from_str(&env, "bool kyc_verified");
+        let schema_uid =
+            reg_client.register_with_max_ttl(&attester, &schema_str, &resolver, &true, &300u64);
+
+        env.ledger().with_mut(|li| li.timestamp = 1000);
+
+        // 1. Valid expiration within max_ttl (timestamp 1000 + 200 = 1200 <= 1300)
+        let mut valid_att = attestation_fixture(&env, &attester, &recipient, [214u8; 32]);
+        valid_att.schema_uid = schema_uid.clone();
+        recompute_uid(&env, &mut valid_att);
+        valid_att.expiration_time = 1200;
+        let uid1 = client.attest(&valid_att);
+        assert!(client.verify_attestation(&uid1));
+
+        // 2. Exact boundary expiration (timestamp 1000 + 300 = 1300)
+        let mut boundary_att = attestation_fixture(&env, &attester, &recipient, [215u8; 32]);
+        boundary_att.schema_uid = schema_uid.clone();
+        recompute_uid(&env, &mut boundary_att);
+        boundary_att.expiration_time = 1300;
+        let uid2 = client.attest(&boundary_att);
+        assert!(client.verify_attestation(&uid2));
+
+        // 3. Schema with max_ttl == 0 allows perpetual and long expiration
+        let unconstrained_schema_uid = reg_client.register_with_max_ttl(
+            &attester,
+            &soroban_sdk::String::from_str(&env, "string title"),
+            &resolver,
+            &true,
+            &0u64,
+        );
+        let mut unconstrained_att = attestation_fixture(&env, &attester, &recipient, [216u8; 32]);
+        unconstrained_att.schema_uid = unconstrained_schema_uid.clone();
+        recompute_uid(&env, &mut unconstrained_att);
+        unconstrained_att.expiration_time = 0; // Perpetual
+        let uid3 = client.attest(&unconstrained_att);
+        assert!(client.verify_attestation(&uid3));
+
+        let mut long_att = attestation_fixture(&env, &attester, &recipient, [217u8; 32]);
+        long_att.schema_uid = unconstrained_schema_uid;
+        recompute_uid(&env, &mut long_att);
+        long_att.expiration_time = 1000 + 100_000;
+        let uid4 = client.attest(&long_att);
+        assert!(client.verify_attestation(&uid4));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #419)")]
+    fn test_schema_max_ttl_rejects_exceeded_expiration() {
+        let (env, sas_id, _admin, registry_id) = setup_with_real_registry();
+        let client = SASClient::new(&env, &sas_id);
+        let reg_client = SchemaRegistryClient::new(&env, &registry_id);
+
+        let attester = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let resolver = Address::generate(&env);
+
+        let schema_str = soroban_sdk::String::from_str(&env, "bool session_token");
+        let schema_uid =
+            reg_client.register_with_max_ttl(&attester, &schema_str, &resolver, &true, &300u64);
+
+        env.ledger().with_mut(|li| li.timestamp = 1000);
+
+        // Expiration 1301 > 1000 + 300
+        let mut att = attestation_fixture(&env, &attester, &recipient, [218u8; 32]);
+        att.schema_uid = schema_uid;
+        recompute_uid(&env, &mut att);
+        att.expiration_time = 1301;
+        client.attest(&att);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #419)")]
+    fn test_schema_max_ttl_rejects_perpetual_attestation() {
+        let (env, sas_id, _admin, registry_id) = setup_with_real_registry();
+        let client = SASClient::new(&env, &sas_id);
+        let reg_client = SchemaRegistryClient::new(&env, &registry_id);
+
+        let attester = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let resolver = Address::generate(&env);
+
+        let schema_str = soroban_sdk::String::from_str(&env, "bool capped_credential");
+        let schema_uid =
+            reg_client.register_with_max_ttl(&attester, &schema_str, &resolver, &true, &600u64);
+
+        env.ledger().with_mut(|li| li.timestamp = 1000);
+
+        // Perpetual attestation (expiration_time == 0) on capped schema
+        let mut att = attestation_fixture(&env, &attester, &recipient, [219u8; 32]);
+        att.schema_uid = schema_uid;
+        recompute_uid(&env, &mut att);
+        att.expiration_time = 0;
+        client.attest(&att);
+    }
+
+    #[test]
     fn test_revocation_policy_compliance_paths() {
         use crate::test::mock_policy_registry;
         use soroban_sas_common::RevocationPolicy;
@@ -3937,7 +4374,6 @@ mod view_functions {
 
         let attester = Address::generate(&env);
         let recipient = Address::generate(&env);
-
         // 1. IrrevocableOnly schema
         let uid_irrev = UID(BytesN::from_array(&env, &[1u8; 32]));
         policy_client.set_policy(&uid_irrev, &RevocationPolicy::IrrevocableOnly);

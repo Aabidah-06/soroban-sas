@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | Indexer | `soroban_sas_indexer.wasm` | `TBD` |
 
 ### Added
+- Reverse cursor pagination for recipient, schema, and attester index lookups,
+  with stable next cursors and bounded chunk reads. (#449)
+- Version 2 Axelar GMP proof payloads with EVM schema UID, EVM recipient,
+  explicit Soroban recipient mapping, and raw attestation data. The verifier
+  retains gateway approval and revision checks and exposes `get_proof`. (#458)
 - Indexer pagination for every lookup dimension:
   `get_atts_by_schema_paginated` and `get_atts_by_attester_paginated` join
   `get_atts_by_recipient_paginated`, all backed by one chunk-window reader
@@ -71,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validator and `validate_schema_syntax` both replay the shared golden
   vectors in `packages/soroban-sas-common/test_vectors/schema_syntax.tsv`.
   Built and tested in the *Developer Tooling* workflow. (#346)
+- `soroban-sas schema wizard`: interactive schema registration that prompts
+  for a name, field-by-field definitions, revocability, an optional resolver
+  address, and a metadata URI, validating every answer as it is typed
+  (dialoguer prompts on a TTY; a line-based fallback reads piped stdin when
+  not). It estimates the network fee by simulating the exact call, shows a
+  summary for confirmation, and only then signs and submits the
+  registration. The name and metadata URI are off-chain labels echoed in the
+  result, since the registry identifies schemas by the
+  `(schema, resolver, revocable)` tuple alone. (#469)
 
 ### Fixed
 - Missing recipients are handled gracefully. `AttestationRequestBuilder` no

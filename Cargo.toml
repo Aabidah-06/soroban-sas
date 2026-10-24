@@ -7,8 +7,10 @@ members = [
     "packages/soroban-sas-sdk",
     "packages/soroban-sas-cli",
     "contracts/permissive-resolver",
-"tools/prometheus-exporter",
-"contracts/cross-chain-verifier",
+    "contracts/token-gated-resolver",
+    "tools/prometheus-exporter",
+    "contracts/cross-chain-verifier",
+    "contracts/zk-verifier",
 ]
 exclude = ["fuzz", "tools/gas-profiler"]
 resolver = "2"
@@ -25,18 +27,21 @@ soroban-sas-common = { workspace = true }
 soroban-sas-sdk = { path = "packages/soroban-sas-sdk" }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 hex = "0.4"
-stellar-str-key = "0.0.8"
-edwards-dalek = "2.0.0"
+stellar-strkey = "0.0.8"
+ed25519-dalek = "2.0.0"
+serde_json = "1"
+sas = { path = "contracts/sas" }
+schema-registry = { path = "contracts/schema-registry" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ureq = "2"
 
-[[Bench]]
+[[bench]]
 name = "hashing_benchmark"
 harness = false
 
-[[Bench]]
+[[bench]]
 name = "attestations_benchmark"
 harness = false
 
@@ -74,9 +79,6 @@ panic = "unwind"
 soroban-sdk = "21.7.7"
 criterion = { version = "0.5", features = ["html_reports"] }
 soroban-sas-common = { path = "packages/soroban-sas-common" }
-
-# Make the SDK's testutils feature available to the workspace for mock client usage.
-soroban-sas-sdk-testutils = { path = "packages/soroban-sas-sdk", features = ["testutils"] }
 
 [workspace.lints.clippy]
 new_without_default = "allow"

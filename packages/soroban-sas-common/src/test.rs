@@ -407,6 +407,7 @@ fn sample_attestation(env: &Env, attester: Address) -> Attestation {
         attester,
         revocable: true,
         data: Bytes::from_slice(env, &[0xde, 0xad, 0xbe, 0xef]),
+        valid_from: 0,
     }
 }
 
@@ -654,6 +655,21 @@ fn test_delegation_nonce_key_xdr_smaller_than_tuple() {
 }
 
 #[test]
+fn recipient_consent_nonce_key_is_distinct_from_attester_nonce_key() {
+    use soroban_sdk::xdr::ToXdr;
+    let env = Env::default();
+    let address = Address::generate(&env);
+    let attester_key = crate::DelegationNonceKey {
+        attester: address.clone(),
+    };
+    let recipient_key = crate::RecipientConsentNonceKey {
+        scope: soroban_sdk::symbol_short!("RCONSENT"),
+        recipient: address,
+    };
+    assert_ne!(attester_key.to_xdr(&env), recipient_key.to_xdr(&env));
+}
+
+#[test]
 fn test_compact_attestation_pack_unpack_meta() {
     let env = Env::default();
     let time = 1_700_000_000u64;
@@ -744,6 +760,7 @@ fn test_compact_attestation_roundtrip() {
         attester: attester.clone(),
         revocable: true,
         data: data.clone(),
+        valid_from: 0,
     };
 
     let compact = crate::CompactAttestation::from_attestation(&env, &original);
@@ -784,6 +801,7 @@ fn test_compact_attestation_storage_footprint_reduction_exceeds_15_percent() {
         attester: attester.clone(),
         revocable: true,
         data: data.clone(),
+        valid_from: 0,
     };
 
     let compact = crate::CompactAttestation::from_attestation(&env, &original);
