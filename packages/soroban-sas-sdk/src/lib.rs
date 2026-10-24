@@ -31,5 +31,7 @@ pub use simulate::{
     build_invoke_transaction, build_simulate_transaction_xdr, decode_result, encode_arg,
     sign_transaction, unsigned_envelope_xdr, validate_simulated_transaction,
 };
+pub mod mock;
+pub use mock::{IndexerClientTrait, MockCall, MockSASClient, SASClientTrait};
 #[cfg(test)]
 mod test;
