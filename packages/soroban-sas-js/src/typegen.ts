@@ -199,8 +199,10 @@ function encodeValue(type: SchemaType, value: unknown, path: string): ScVal {
 function decodeValue(type: SchemaType, value: ScVal): unknown {
   if (type.kind === "option") {
     const vals = value.vec();
-    if (!vals || vals.length === 1 && vals[0].sym() === "None") return null;
-    if (!vals || vals.length !== 2 || vals[0].sym() !== "Some") throw new Error("invalid encoded Option");
+    if (!vals || vals.length === 0) throw new Error("invalid encoded Option");
+    const tag = Buffer.from(vals[0].sym()).toString("utf8");
+    if (vals.length === 1 && tag === "None") return null;
+    if (vals.length !== 2 || tag !== "Some") throw new Error("invalid encoded Option");
     return decodeValue(type.item, vals[1]);
   }
   if (type.kind === "array" || type.kind === "vector" || type.kind === "tuple") {
