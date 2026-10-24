@@ -2,12 +2,12 @@ use soroban_sas_common::{
     events::{
         ADMIN_TRANSFER_COMPLETED, ADMIN_TRANSFER_PROPOSED, ATTESTATION_RENEWED, ATTESTED,
         BATCH_ATTESTED, BATCH_REVOKED, CONTRACT_PAUSED, CONTRACT_UNPAUSED, CONTRACT_UPGRADED,
-        INDEXER_STRICT_UPDATED, INDEXER_UPDATED, REVOKED, SCHEMA_REVOKED,
+        INDEXER_STRICT_UPDATED, INDEXER_UPDATED, REVOKED,
     },
     AdminTransferCompletedEvent, AdminTransferProposedEvent, Attestation, AttestationIssuedEvent,
     AttestationRenewedEvent, AttestationRevokedEvent, BatchAttestedEvent, BatchRevokedEvent,
     ContractPausedEvent, ContractUnpausedEvent, ContractUpgradedEvent, IndexerStrictUpdatedEvent,
-    IndexerUpdatedEvent, SchemaRevokedEvent, UID,
+    IndexerUpdatedEvent, UID,
 };
 use soroban_sdk::{symbol_short, Address, Env};
 
