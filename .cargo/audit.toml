@@ -24,4 +24,6 @@ ignore = [
     "RUSTSEC-2026-0381",
     # rustls-webpki / webpki transitive via ureq.
     "RUSTSEC-2026-0382",
+    # tokio: AsyncFd I/O safety; 1.54.0+ requires Rust >=1.85.
+    "RUSTSEC-2026-0386",
 ]
