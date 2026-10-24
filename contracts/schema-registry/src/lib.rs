@@ -6,13 +6,14 @@
 use soroban_sas_common::{
     events::{
         CONTRACT_UPGRADED, SCHEMA_DELEGATE_ADDED, SCHEMA_DELEGATE_REMOVED, SCHEMA_DEPRECATED,
-        SCHEMA_FEE_UPDATED, SCHEMA_OWNERSHIP_PROPOSED, SCHEMA_OWNERSHIP_TRANSFERRED,
-        TREASURY_UPDATED,
+        SCHEMA_FEE_UPDATED, SCHEMA_FROST_GROUP_UPDATED, SCHEMA_OWNERSHIP_PROPOSED,
+        SCHEMA_OWNERSHIP_TRANSFERRED, SCHEMA_QUARANTINED, TREASURY_UPDATED,
     },
-    validate_schema_syntax, ContractUpgradedEvent, PreviousAddress, RevocationPolicy, SASError,
-    SchemaDelegateAddedEvent, SchemaDelegateRemovedEvent, SchemaDeprecatedEvent,
-    SchemaFeeUpdatedEvent, SchemaOwnershipProposedEvent, SchemaOwnershipTransferredEvent,
-    SchemaRecord, TreasuryUpdatedEvent, LEDGERS_IN_ONE_YEAR, UID,
+    validate_frost_group, validate_schema_syntax, ContractUpgradedEvent, FrostGroup,
+    PreviousAddress, RevocationPolicy, SASError, SchemaDelegateAddedEvent,
+    SchemaDelegateRemovedEvent, SchemaDeprecatedEvent, SchemaFeeUpdatedEvent,
+    SchemaFrostGroupUpdatedEvent, SchemaOwnershipProposedEvent, SchemaOwnershipTransferredEvent,
+    SchemaRecord, SchemaStatus, TreasuryUpdatedEvent, LEDGERS_IN_ONE_YEAR, UID,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, String,
@@ -156,6 +157,9 @@ fn commit_upgrade(env: &Env, admin: &Address, new_wasm_hash: &BytesN<32>, new_ve
 }
 
 const MAX_SCAN_BUDGET: u32 = 100;
+/// Highest creator royalty, in basis points. 5000 bps is 50% (#538).
+pub const MAX_CREATOR_ROYALTY_BPS: u32 = 5_000;
+const MAX_EXPLANATION_URI_LEN: u32 = 256;
 
 // ===== MULTI-SIGNATURE SCHEMA OWNERS (#288) =====
 
@@ -1115,6 +1119,74 @@ impl SchemaRegistry {
         env.events().publish((SCHEMA_DEPRECATED, uid), sender);
     }
 
+    /// Protocol admin toggles quarantine on a schema (#539).
+    ///
+    /// Quarantine blocks new attestations. Existing attestations stay stored
+    /// and verifiable. `explanation_uri` records why the status changed.
+    pub fn set_schema_quarantine(env: Env, uid: UID, quarantined: bool, explanation_uri: String) {
+        let admin = require_registry_admin(&env);
+        admin.require_auth();
+        if !env.storage().persistent().has(&uid) {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+        let uri_len = explanation_uri.len();
+        if uri_len == 0 || uri_len > MAX_EXPLANATION_URI_LEN {
+            panic_with_error!(&env, SASError::InvalidValue);
+        }
+
+        let flag_key = (SCHEMA_QUARANTINE, uid.clone());
+        env.storage().persistent().set(&flag_key, &quarantined);
+        env.storage()
+            .persistent()
+            .extend_ttl(&flag_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        let uri_key = (SCHEMA_QUARANTINE_URI, uid.clone());
+        env.storage().persistent().set(&uri_key, &explanation_uri);
+        env.storage()
+            .persistent()
+            .extend_ttl(&uri_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+
+        env.events()
+            .publish((SCHEMA_QUARANTINED, uid, quarantined), explanation_uri);
+    }
+
+    /// `true` when the schema is currently quarantined (#539).
+    pub fn is_schema_quarantined(env: Env, uid: UID) -> bool {
+        extend_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get(&(SCHEMA_QUARANTINE, uid))
+            .unwrap_or(false)
+    }
+
+    /// Derived status for `uid` (#539). Quarantine wins over deprecation.
+    pub fn get_schema_status(env: Env, uid: UID) -> SchemaStatus {
+        extend_instance_ttl(&env);
+        if !env.storage().persistent().has(&uid) {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+        if Self::is_schema_quarantined(env.clone(), uid.clone()) {
+            return SchemaStatus::Quarantined;
+        }
+        let deprecated: bool = env
+            .storage()
+            .persistent()
+            .get(&(DEPRECATED, uid))
+            .unwrap_or(false);
+        if deprecated {
+            SchemaStatus::Deprecated
+        } else {
+            SchemaStatus::Active
+        }
+    }
+
+    /// Explanation URI from the latest quarantine toggle, if one was recorded.
+    pub fn get_quarantine_uri(env: Env, uid: UID) -> Option<String> {
+        extend_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get(&(SCHEMA_QUARANTINE_URI, uid))
+    }
+
     pub fn register(
         env: Env,
         owner: Address,
@@ -1174,6 +1246,29 @@ impl SchemaRegistry {
         uid
     }
 
+    /// Registers a schema and stores the creator royalty in basis points (#538).
+    /// `royalty_bps` must be in `0..=5000`. `0` sends the whole attestation fee
+    /// to the protocol treasury.
+    pub fn register_with_royalty(
+        env: Env,
+        owner: Address,
+        schema: String,
+        resolver: Address,
+        revocable: bool,
+        royalty_bps: u32,
+    ) -> UID {
+        if royalty_bps > MAX_CREATOR_ROYALTY_BPS {
+            panic_with_error!(&env, SASError::InvalidValue);
+        }
+        let uid = Self::register(env.clone(), owner, schema, resolver, revocable);
+        let key = (SCHEMA_ROYALTY, uid.clone());
+        env.storage().persistent().set(&key, &royalty_bps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        uid
+    }
+
     /// Returns the schema's revocation policy (#448).
     /// Defaults to Permissive if revocable is true, or IrrevocableOnly if revocable is false.
     pub fn get_schema_policy(env: Env, uid: UID) -> RevocationPolicy {
@@ -1197,6 +1292,107 @@ impl SchemaRegistry {
     /// Alias for `get_schema_policy` (#448).
     pub fn get_revocation_policy(env: Env, uid: UID) -> RevocationPolicy {
         Self::get_schema_policy(env, uid)
+    }
+
+    /// Declares, or rotates, the FROST threshold group whose aggregate
+    /// signatures must endorse delegated attestations under `uid` (#534).
+    ///
+    /// Only a schema owner (the creator, a member of the configured owner set)
+    /// or the registry admin may declare the group, and `authorizer` must
+    /// authorize the call. The group is validated with
+    /// [`validate_frost_group`] before anything is written: a threshold below
+    /// two, a threshold above `max_signers`, a group larger than
+    /// `MAX_FROST_SIGNERS`, or an all-zero group key is rejected.
+    ///
+    /// Once set, SAS stops binding delegated signatures to
+    /// `attestation.attester`'s account/registered key for this schema and
+    /// accepts only aggregates that verify under `group.group_public_key`.
+    /// The stored `SchemaRecord` is unchanged, so the XDR layout of existing
+    /// schemas is preserved.
+    ///
+    /// Emits `SchemaFrostGroupUpdated` with the new group, so indexers and
+    /// wallets can discover the requirement without polling.
+    pub fn set_schema_frost_group(env: Env, authorizer: Address, uid: UID, group: FrostGroup) {
+        extend_instance_ttl(&env);
+        authorizer.require_auth();
+        if Self::get_schema(env.clone(), uid.clone()).is_none() {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+        if !is_owner_address(&env, &uid, &authorizer) {
+            panic_with_error!(&env, SASError::Unauthorized);
+        }
+        if let Err(error) = validate_frost_group(&group) {
+            panic_with_error!(&env, error);
+        }
+
+        let key = (FROST_GROUP, uid.clone());
+        env.storage().persistent().set(&key, &group);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+
+        env.events().publish(
+            (SCHEMA_FROST_GROUP_UPDATED, uid.clone()),
+            SchemaFrostGroupUpdatedEvent {
+                schema_uid: uid,
+                authorizer,
+                enabled: true,
+                group_public_key: group.group_public_key,
+                threshold: group.threshold,
+                max_signers: group.max_signers,
+            },
+        );
+
+        extend_instance_ttl(&env);
+    }
+
+    /// Removes a schema's FROST group requirement (#534), restoring the
+    /// ordinary single-key delegated attestation paths for `uid`. Same
+    /// authorization as [`SchemaRegistry::set_schema_frost_group`]. Removing a group
+    /// that was never configured is a no-op write plus an event, so callers
+    /// can retry safely.
+    pub fn clear_schema_frost_group(env: Env, authorizer: Address, uid: UID) {
+        extend_instance_ttl(&env);
+        authorizer.require_auth();
+        if Self::get_schema(env.clone(), uid.clone()).is_none() {
+            panic_with_error!(&env, SASError::SchemaNotFound);
+        }
+        if !is_owner_address(&env, &uid, &authorizer) {
+            panic_with_error!(&env, SASError::Unauthorized);
+        }
+
+        let key = (FROST_GROUP, uid.clone());
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (SCHEMA_FROST_GROUP_UPDATED, uid.clone()),
+            SchemaFrostGroupUpdatedEvent {
+                schema_uid: uid,
+                authorizer,
+                enabled: false,
+                group_public_key: BytesN::from_array(&env, &[0u8; 32]),
+                threshold: 0,
+                max_signers: 0,
+            },
+        );
+
+        extend_instance_ttl(&env);
+    }
+
+    /// Returns the FROST group `uid` requires for delegated signatures, or
+    /// `None` when the schema uses the ordinary single-key binding (#534).
+    /// Renews the group entry's TTL when present; the missing path writes
+    /// nothing.
+    pub fn get_schema_frost_group(env: Env, uid: UID) -> Option<FrostGroup> {
+        extend_instance_ttl(&env);
+        let key = (FROST_GROUP, uid);
+        let group: Option<FrostGroup> = env.storage().persistent().get(&key);
+        if group.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        }
+        group
     }
 
     /// Registers a new schema, paying the configured registration fee (#1).
@@ -1493,6 +1689,38 @@ impl SchemaRegistry {
             );
         }
         creator
+    }
+
+    /// Creator royalty in basis points (#538). Missing entries are `0`.
+    pub fn get_creator_royalty(env: Env, uid: UID) -> u32 {
+        extend_instance_ttl(&env);
+        let key = (SCHEMA_ROYALTY, uid);
+        let bps: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if bps > 0 {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        }
+        bps
+    }
+
+    /// Creator or registry admin sets the royalty share for attestation fees (#538).
+    pub fn set_creator_royalty(env: Env, caller: Address, uid: UID, royalty_bps: u32) {
+        if royalty_bps > MAX_CREATOR_ROYALTY_BPS {
+            panic_with_error!(&env, SASError::InvalidValue);
+        }
+        caller.require_auth();
+        let creator = Self::get_creator(env.clone(), uid.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, SASError::SchemaNotFound));
+        let admin = require_registry_admin(&env);
+        if caller != creator && caller != admin {
+            panic_with_error!(&env, SASError::Unauthorized);
+        }
+        let key = (SCHEMA_ROYALTY, uid);
+        env.storage().persistent().set(&key, &royalty_bps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
     }
 
     /// Checks whether `attester` is authorized to issue attestations under

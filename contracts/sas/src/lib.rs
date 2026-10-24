@@ -4,9 +4,13 @@
 #[cfg(test)]
 extern crate alloc;
 
+#[cfg(test)]
+mod frost_test;
+
 use soroban_sas_common::{
     Attestation, CompactAttestation, CompactAttestationKey, ContractUpgradedEvent,
-    DelegationNonceKey, SASError, LEDGERS_IN_ONE_YEAR, MAX_ATTESTATION_DATA_BYTES, UID,
+    DelegationNonceKey, FrostGroup, RecipientConsentNonceKey, SASError, LEDGERS_IN_ONE_YEAR,
+    MAX_ATTESTATION_DATA_BYTES, UID,
 };
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -40,6 +44,7 @@ pub const ATTESTER_KEY: Symbol = symbol_short!("ATTKEY");
 /// protection with one `instance` entry per attester (bounded growth) whose
 /// lifetime tracks contract liveness via `extend_instance_ttl`.
 pub const DELEGATION_NONCE: Symbol = symbol_short!("DELNONCE");
+pub const RECIPIENT_CONSENT_NONCE: Symbol = symbol_short!("RCONSENT");
 pub const VALID_FROM: Symbol = symbol_short!("V_FROM");
 /// Monotonic contract version. Missing on legacy initialized deployments,
 /// which are treated as genesis version 1.
@@ -53,7 +58,7 @@ pub const PAUSED: Symbol = symbol_short!("PAUSED");
 pub const MAX_KNOWN_VERSION: u32 = 2;
 /// Maximum number of attestations in one multi_attest invocation. This keeps
 /// authorization and storage work within the measured Soroban budget envelope.
-pub const MAX_MULTI_ATTEST: u32 = 100;
+pub const MAX_MULTI_ATTEST: u32 = soroban_sas_common::MAX_MULTI_ATTEST;
 /// Maximum number of UIDs in one multi_revoke invocation. Bounded like
 /// `MAX_MULTI_ATTEST` so the loop cannot exhaust the Soroban budget and
 /// callers get a predictable `BatchTooLarge` error up front.
@@ -98,6 +103,71 @@ fn require_registry(env: &Env) -> Address {
     }
 }
 
+/// Splits an attestation fee between the protocol treasury and the schema
+/// creator (#538).
+///
+/// Creator share is `value * bps / 10_000`, rounded down. The remainder stays
+/// with the treasury, so the two shares always add back to `value`. A registry
+/// that does not expose royalty (or a schema with `0` bps and no treasury)
+/// leaves the fee on this contract, matching the pre-split withdraw path.
+fn distribute_attestation_fee(env: &Env, schema_uid: &UID, token: &Address, value: i128) {
+    let Ok(registry) = env
+        .storage()
+        .instance()
+        .get::<_, Address>(&SCHEMA_REGISTRY)
+        .ok_or(())
+    else {
+        return;
+    };
+    let bps: u32 = match env.try_invoke_contract::<u32, soroban_sdk::Error>(
+        &registry,
+        &Symbol::new(env, "get_creator_royalty"),
+        soroban_sdk::vec![env, schema_uid.clone().into_val(env)],
+    ) {
+        Ok(Ok(bps)) => bps,
+        _ => return,
+    };
+    if bps > 5_000 {
+        panic_with_error!(env, SASError::InvalidValue);
+    }
+    let creator_amount = value
+        .checked_mul(i128::from(bps))
+        .and_then(|product| product.checked_div(10_000))
+        .unwrap_or_else(|| panic_with_error!(env, SASError::InvalidValue));
+    let treasury_amount = value
+        .checked_sub(creator_amount)
+        .unwrap_or_else(|| panic_with_error!(env, SASError::InvalidValue));
+
+    let treasury: Option<Address> = env.storage().instance().get(&TREASURY);
+    if treasury.is_none() && creator_amount == 0 {
+        return;
+    }
+    let treasury = treasury.unwrap_or_else(|| panic_with_error!(env, SASError::TreasuryNotSet));
+    let token_client = token::Client::new(env, token);
+    if treasury_amount > 0 {
+        token_client.transfer(&env.current_contract_address(), &treasury, &treasury_amount);
+    }
+    if creator_amount > 0 {
+        let creator = match env.try_invoke_contract::<Option<Address>, soroban_sdk::Error>(
+            &registry,
+            &Symbol::new(env, "get_creator"),
+            soroban_sdk::vec![env, schema_uid.clone().into_val(env)],
+        ) {
+            Ok(Ok(Some(creator))) => creator,
+            _ => panic_with_error!(env, SASError::SchemaNotFound),
+        };
+        token_client.transfer(&env.current_contract_address(), &creator, &creator_amount);
+    }
+
+    env.events().publish(
+        (
+            soroban_sas_common::events::FEE_DISTRIBUTED,
+            schema_uid.clone(),
+        ),
+        (treasury_amount, creator_amount),
+    );
+}
+
 /// Checks if the contract is paused. Returns `true` if paused, `false` otherwise.
 fn is_paused_status(env: &Env) -> bool {
     env.storage().instance().get(&PAUSED).unwrap_or(false)
@@ -127,6 +197,21 @@ fn enter_reentrancy_guard(env: &Env) {
 /// Releases the `multi_attest` reentrancy guard on the success path.
 fn exit_reentrancy_guard(env: &Env) {
     env.storage().instance().remove(&REENTRANCY_GUARD);
+}
+
+/// Returns the EIP-712 domain separator fields for off-chain structured
+/// message signing. Wallet connectors (Freighter `signAuthEntry`, Albedo,
+/// MetaMask Snaps) display these fields so users can verify what they sign.
+///
+/// The domain binds signatures to this network and contract address, matching
+/// the on-chain `AttestationDomain` used by `attest_by_delegation`.
+pub fn eip712_domain(env: &Env) -> soroban_sas_common::Eip712Domain {
+    soroban_sas_common::Eip712Domain {
+        name: soroban_sdk::String::from_str(env, "Stellar Attestation Service"),
+        version: soroban_sdk::String::from_str(env, "1"),
+        chain_id: env.ledger().network_id(),
+        verifying_contract: env.current_contract_address(),
+    }
 }
 
 /// Validates that an attestation has not expired. Returns `Ok(())` if valid,
@@ -556,6 +641,16 @@ impl SAS {
         Self::attest_internal(env, attestation)
     }
 
+    /// Issues an attestation endorsed by an off-chain ed25519 signature and
+    /// relayed by any funded account.
+    ///
+    /// When the schema declares a FROST threshold group (#534), `public_key`
+    /// must be that group's public key and `signature` a standard 64-byte
+    /// Ed25519 aggregate produced by at least `threshold` shares. The attester
+    /// account key and registered attester keys are not accepted for such a
+    /// schema. A FROST aggregate has exactly the same shape as a single-signer
+    /// signature, so this entrypoint's calldata and its single
+    /// `ed25519_verify` cost are unchanged.
     pub fn attest_by_delegation(
         env: Env,
         attestation: Attestation,
@@ -569,7 +664,13 @@ impl SAS {
         if attestation.revocation_time != 0 {
             panic_with_error!(&env, SASError::AlreadyRevoked);
         }
-        Self::require_attester_key(&env, &attestation.attester, &public_key);
+        Self::require_nonce_not_replayed(&env, &attestation.attester, nonce);
+        let group = Self::require_delegation_key(
+            &env,
+            &attestation.schema_uid,
+            &attestation.attester,
+            &public_key,
+        );
         let domain = soroban_sas_common::AttestationDomain {
             network_id: env.ledger().network_id(),
             contract: env.current_contract_address(),
@@ -577,7 +678,7 @@ impl SAS {
         };
         let payload_hash =
             soroban_sas_common::hash_offchain_attestation(&env, &attestation, &domain);
-        soroban_sas_common::verify_offchain_signature(&env, &payload_hash, &public_key, &signature);
+        Self::verify_delegated_signature(&env, &payload_hash, &public_key, &signature, &group);
         Self::consume_delegation_nonce(&env, &attestation.attester, nonce);
 
         Self::attest_internal(env, attestation)
@@ -636,7 +737,13 @@ impl SAS {
             if attestation.revocation_time != 0 {
                 panic_with_error!(&env, SASError::AlreadyRevoked);
             }
-            Self::require_attester_key(&env, &attestation.attester, &public_key);
+            Self::require_nonce_not_replayed(&env, &attestation.attester, nonce);
+            let group = Self::require_delegation_key(
+                &env,
+                &attestation.schema_uid,
+                &attestation.attester,
+                &public_key,
+            );
             let domain = soroban_sas_common::AttestationDomain {
                 network_id: env.ledger().network_id(),
                 contract: env.current_contract_address(),
@@ -644,12 +751,7 @@ impl SAS {
             };
             let payload_hash =
                 soroban_sas_common::hash_offchain_attestation(&env, &attestation, &domain);
-            soroban_sas_common::verify_offchain_signature(
-                &env,
-                &payload_hash,
-                &public_key,
-                &signature,
-            );
+            Self::verify_delegated_signature(&env, &payload_hash, &public_key, &signature, &group);
             Self::consume_delegation_nonce(&env, &attestation.attester, nonce);
 
             attesters.set(attestation.attester.clone(), true);
@@ -741,6 +843,21 @@ impl SAS {
         let Some(schema) = schema_opt else {
             panic_with_error!(&env, SASError::InvalidSchema);
         };
+
+        // Quarantine blocks new issuances only. Reads of existing attestations
+        // do not come through this path (#539). A registry that predates the
+        // method is treated as not quarantined.
+        let quarantined: bool = match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &registry,
+            &Symbol::new(&env, "is_schema_quarantined"),
+            soroban_sdk::vec![&env, attestation.schema_uid.clone().into_val(&env)],
+        ) {
+            Ok(Ok(flag)) => flag,
+            _ => false,
+        };
+        if quarantined {
+            panic_with_error!(&env, SASError::SchemaQuarantined);
+        }
 
         // Maximum expiration window limit per schema (#441):
         let max_ttl: u64 = match env.try_invoke_contract::<u64, soroban_sdk::Error>(
@@ -897,7 +1014,7 @@ impl SAS {
     }
 
     /// The single encoding of the SAS -> Indexer write:
-    /// `Indexer::index_attestation(uid, recipient, schema_uid, attester)`.
+    /// `Indexer::index_attestation(uid, recipient, schema_uid, attester, expiration_time)`.
     /// Returns whether the indexer accepted it. Issuance, `reindex_attestation`,
     /// and `bulk_reindex` all go through here so the call shape cannot drift
     /// between them (#309).
@@ -911,6 +1028,7 @@ impl SAS {
                 attestation.recipient.clone().into_val(env),
                 attestation.schema_uid.clone().into_val(env),
                 attestation.attester.clone().into_val(env),
+                attestation.expiration_time.into_val(env),
             ],
         );
         matches!(outcome, Ok(Ok(())))
@@ -1047,6 +1165,12 @@ impl SAS {
         Self::revoke_by_authorizer(env, uid, delegate);
     }
 
+    /// Revokes an attestation under an off-chain ed25519 signature.
+    ///
+    /// The key binding is taken from the recorded attestation's schema: a
+    /// schema with a FROST group (#534) requires the group public key and a
+    /// valid aggregate, so a single participant cannot revoke a jointly
+    /// endorsed attestation on its own.
     pub fn revoke_by_delegation(
         env: Env,
         uid: UID,
@@ -1060,7 +1184,13 @@ impl SAS {
         let Some(attestation) = read_attestation(&env, &uid) else {
             panic_with_error!(&env, SASError::AttestationNotFound);
         };
-        Self::require_attester_key(&env, &attestation.attester, &public_key);
+        Self::require_nonce_not_replayed(&env, &attestation.attester, nonce);
+        let group = Self::require_delegation_key(
+            &env,
+            &attestation.schema_uid,
+            &attestation.attester,
+            &public_key,
+        );
         let domain = soroban_sas_common::AttestationDomain {
             network_id: env.ledger().network_id(),
             contract: env.current_contract_address(),
@@ -1072,7 +1202,7 @@ impl SAS {
             &attestation.attester,
             &domain,
         );
-        soroban_sas_common::verify_offchain_signature(&env, &payload_hash, &public_key, &signature);
+        Self::verify_delegated_signature(&env, &payload_hash, &public_key, &signature, &group);
         Self::consume_delegation_nonce(&env, &attestation.attester, nonce);
 
         Self::revoke_internal(env, uid)
@@ -1139,7 +1269,13 @@ impl SAS {
                 panic_with_error!(&env, SASError::AlreadyRevoked);
             }
 
-            Self::require_attester_key(&env, &attestation.attester, &public_key);
+            Self::require_nonce_not_replayed(&env, &attestation.attester, nonce);
+            let group = Self::require_delegation_key(
+                &env,
+                &attestation.schema_uid,
+                &attestation.attester,
+                &public_key,
+            );
             let domain = soroban_sas_common::AttestationDomain {
                 network_id: env.ledger().network_id(),
                 contract: env.current_contract_address(),
@@ -1151,12 +1287,7 @@ impl SAS {
                 &attestation.attester,
                 &domain,
             );
-            soroban_sas_common::verify_offchain_signature(
-                &env,
-                &payload_hash,
-                &public_key,
-                &signature,
-            );
+            Self::verify_delegated_signature(&env, &payload_hash, &public_key, &signature, &group);
 
             distinct.set(attestation.attester.clone(), true);
         }
@@ -1272,6 +1403,63 @@ impl SAS {
 
         old.attester.require_auth();
 
+        Self::replace_internal(env, old_uid, new_data, old)
+    }
+
+    /// Relayed replacement requiring independent off-chain approvals from
+    /// the old attester and recipient. Both sign the same domain-separated
+    /// digest of `old_uid`, the complete `new_data`, and both nonces. The
+    /// attester nonce shares the delegated issuance/revocation watermark;
+    /// recipient consent has its own per-recipient watermark. All writes,
+    /// callbacks and indexer updates commit or revert together.
+    pub fn replace_by_delegation_consent(
+        env: Env,
+        old_uid: UID,
+        new_data: Attestation,
+        attester_approval: soroban_sas_common::ReplacementApproval,
+        recipient_approval: soroban_sas_common::ReplacementApproval,
+    ) -> UID {
+        if is_paused_status(&env) {
+            panic_with_error!(&env, SASError::ContractPaused);
+        }
+        extend_instance_ttl(&env);
+        let Some(old) = read_attestation(&env, &old_uid) else {
+            panic_with_error!(&env, SASError::AttestationNotFound);
+        };
+        if new_data.attester != old.attester || new_data.recipient != old.recipient {
+            panic_with_error!(&env, SASError::Unauthorized);
+        }
+        Self::require_attester_key(&env, &old.attester, &attester_approval.public_key);
+        Self::require_attester_key(&env, &old.recipient, &recipient_approval.public_key);
+
+        let domain = soroban_sas_common::ReplacementConsentDomain {
+            network_id: env.ledger().network_id(),
+            contract: env.current_contract_address(),
+            attester_nonce: attester_approval.nonce,
+            recipient_nonce: recipient_approval.nonce,
+        };
+        let digest = soroban_sas_common::hash_delegated_replacement_consent(
+            &env, &old_uid, &new_data, &domain,
+        );
+        soroban_sas_common::verify_offchain_signature(
+            &env,
+            &digest,
+            &attester_approval.public_key,
+            &attester_approval.signature,
+        );
+        soroban_sas_common::verify_offchain_signature(
+            &env,
+            &digest,
+            &recipient_approval.public_key,
+            &recipient_approval.signature,
+        );
+        Self::consume_delegation_nonce(&env, &old.attester, attester_approval.nonce);
+        Self::consume_recipient_consent_nonce(&env, &old.recipient, recipient_approval.nonce);
+
+        Self::replace_internal(env, old_uid, new_data, old)
+    }
+
+    fn replace_internal(env: Env, old_uid: UID, new_data: Attestation, old: Attestation) -> UID {
         if !old.revocable {
             panic_with_error!(&env, SASError::NotRevocable);
         }
@@ -1509,6 +1697,7 @@ impl SAS {
                 &env.current_contract_address(),
                 &value,
             );
+            distribute_attestation_fee(&env, &attestation.schema_uid, &token, value);
         }
 
         Self::attest_internal(env, attestation)
@@ -1759,10 +1948,131 @@ impl SAS {
         }
     }
 
+    /// Resolves the FROST group a schema requires for delegated signatures
+    /// (#534).
+    ///
+    /// Registries that predate threshold support do not expose
+    /// `get_schema_frost_group`; that interface failure is treated as "no
+    /// group configured", so existing deployments and lightweight registry
+    /// mocks keep working and only schemas that explicitly opted in are
+    /// affected. The real `SchemaRegistry` in this workspace always implements
+    /// the getter.
+    fn schema_frost_group(env: &Env, schema_uid: &UID) -> Option<FrostGroup> {
+        let registry = require_registry(env);
+        match env.try_invoke_contract::<Option<FrostGroup>, soroban_sdk::Error>(
+            &registry,
+            &Symbol::new(env, "get_schema_frost_group"),
+            soroban_sdk::vec![env, schema_uid.clone().into_val(env)],
+        ) {
+            Ok(Ok(group)) => group,
+            _ => None,
+        }
+    }
+
+    /// Binds a delegated signature to the key allowed to authorize it.
+    ///
+    /// For a schema with a declared FROST group, only the group public key is
+    /// accepted — the attester account key and any key registered through
+    /// `register_attester_key` are intentionally ignored, so a single member
+    /// cannot bypass the threshold. Every other schema keeps the existing
+    /// single-signer binding, so this is backwards compatible and adds one
+    /// optional cross-contract read only on delegated paths.
+    ///
+    /// Returns the configured group (if any) so the caller can verify the
+    /// aggregate against it.
+    fn require_delegation_key(
+        env: &Env,
+        schema_uid: &UID,
+        attester: &Address,
+        public_key: &soroban_sdk::BytesN<32>,
+    ) -> Option<FrostGroup> {
+        match Self::schema_frost_group(env, schema_uid) {
+            Some(group) => {
+                if *public_key != group.group_public_key {
+                    panic_with_error!(env, SASError::Unauthorized);
+                }
+                Some(group)
+            }
+            None => {
+                Self::require_attester_key(env, attester, public_key);
+                None
+            }
+        }
+    }
+
+    /// Verifies a delegated payload digest against the key that was bound by
+    /// [`Self::require_delegation_key`].
+    ///
+    /// A FROST aggregate is an ordinary Ed25519 signature, so both branches
+    /// make exactly one `ed25519_verify` host call: the threshold path has the
+    /// same cryptographic verification cost as a single-signer attestation.
+    fn verify_delegated_signature(
+        env: &Env,
+        payload_hash: &BytesN<32>,
+        public_key: &BytesN<32>,
+        signature: &BytesN<64>,
+        group: &Option<FrostGroup>,
+    ) {
+        match group {
+            Some(group) => soroban_sas_common::verify_frost_aggregate_signature(
+                env,
+                payload_hash,
+                group,
+                signature,
+            ),
+            None => soroban_sas_common::verify_offchain_signature(
+                env,
+                payload_hash,
+                public_key,
+                signature,
+            ),
+        }
+    }
+
+    /// Fails fast on a nonce that is not strictly greater than the recorded
+    /// high-watermark, without consuming it.
+    ///
+    /// Delegated paths call this before resolving the schema's FROST group and
+    /// before verifying the signature, so a replay is rejected by local state
+    /// alone. That preserves the historical failure mode (and cost) for
+    /// replays even when the registry has since been archived, and it keeps the
+    /// stronger rule that a *failed signature* consumes nothing: only
+    /// [`Self::consume_delegation_nonce`] writes the watermark, after every
+    /// check has passed.
+    fn require_nonce_not_replayed(env: &Env, attester: &Address, nonce: u64) {
+        extend_instance_ttl(env);
+        let key = DelegationNonceKey {
+            attester: attester.clone(),
+        };
+        if let Some(last) = env.storage().instance().get::<_, u64>(&key) {
+            if nonce <= last {
+                panic_with_error!(env, SASError::DelegationReplay);
+            }
+        }
+    }
+
     fn consume_delegation_nonce(env: &Env, attester: &Address, nonce: u64) {
         extend_instance_ttl(env);
         let key = DelegationNonceKey {
             attester: attester.clone(),
+        };
+        // Re-check before writing: callers also call
+        // [`Self::require_nonce_not_replayed`] before any signature work, but
+        // keeping the guard here makes the invariant local to the write.
+        if let Some(last) = env.storage().instance().get::<_, u64>(&key) {
+            if nonce <= last {
+                panic_with_error!(env, SASError::DelegationReplay);
+            }
+        }
+        env.storage().instance().set(&key, &nonce);
+        extend_instance_ttl(env);
+    }
+
+    fn consume_recipient_consent_nonce(env: &Env, recipient: &Address, nonce: u64) {
+        extend_instance_ttl(env);
+        let key = RecipientConsentNonceKey {
+            scope: RECIPIENT_CONSENT_NONCE,
+            recipient: recipient.clone(),
         };
         if let Some(last) = env.storage().instance().get::<_, u64>(&key) {
             if nonce <= last {
@@ -1863,6 +2173,8 @@ impl SAS {
     /// (unknown/deprecated schema), or ed25519 error. Schema check mirrors
     /// on-chain attest: deprecated invalidates prior signatures as well.
     /// Resolver not invoked (read-only), but schema existence is consistent.
+    /// For a schema with a declared FROST group (#534) the key binding is the
+    /// group key instead, so aggregate signatures verify here too.
     pub fn verify_offchain_attestation(
         env: Env,
         attestation: Attestation,
@@ -1871,7 +2183,12 @@ impl SAS {
         signature: soroban_sdk::BytesN<64>,
     ) -> bool {
         extend_instance_ttl(&env);
-        Self::require_attester_key(&env, &attestation.attester, &public_key);
+        let group = Self::require_delegation_key(
+            &env,
+            &attestation.schema_uid,
+            &attestation.attester,
+            &public_key,
+        );
 
         if attestation.revocation_time != 0 {
             panic_with_error!(&env, SASError::AlreadyRevoked);
@@ -1922,9 +2239,34 @@ impl SAS {
         };
         let payload_hash =
             soroban_sas_common::hash_offchain_attestation(&env, &attestation, &domain);
-        soroban_sas_common::verify_offchain_signature(&env, &payload_hash, &public_key, &signature);
+        Self::verify_delegated_signature(&env, &payload_hash, &public_key, &signature, &group);
 
         true
+    }
+
+    /// Returns the EIP-712 typed-data domain for off-chain structured message
+    /// signing. Wallet connectors use this to render readable confirmation
+    /// screens (schema UID, recipient, claims) instead of opaque hex blobs.
+    ///
+    /// The returned domain matches the on-chain `AttestationDomain` used by
+    /// `attest_by_delegation`, so a signature produced over the typed payload
+    /// verifies accurately on-chain.
+    pub fn get_eip712_domain(env: Env) -> soroban_sas_common::Eip712Domain {
+        extend_instance_ttl(&env);
+        eip712_domain(&env)
+    }
+
+    /// Returns the EIP-712 typed-data payload hash for an off-chain attestation
+    /// signed under `nonce`. Wallets display the structured fields; the
+    /// resulting signature is verified by `attest_by_delegation`.
+    pub fn get_eip712_payload_hash(env: Env, attestation: Attestation, nonce: u64) -> BytesN<32> {
+        extend_instance_ttl(&env);
+        let domain = soroban_sas_common::AttestationDomain {
+            network_id: env.ledger().network_id(),
+            contract: env.current_contract_address(),
+            nonce,
+        };
+        soroban_sas_common::hash_offchain_attestation(&env, &attestation, &domain)
     }
 
     pub fn verify_attestation(env: Env, uid: UID) -> bool {
@@ -2146,6 +2488,19 @@ impl SAS {
         nonce
     }
 
+    /// Highest consumed recipient consent nonce, or `None` before first use.
+    /// The next consent nonce must be strictly greater than this value.
+    pub fn get_recipient_consent_nonce(env: Env, recipient: Address) -> Option<u64> {
+        extend_instance_ttl(&env);
+        let key = RecipientConsentNonceKey {
+            scope: RECIPIENT_CONSENT_NONCE,
+            recipient,
+        };
+        let nonce = env.storage().instance().get::<_, u64>(&key);
+        extend_instance_ttl(&env);
+        nonce
+    }
+
     /// Returns `attester`'s registered delegated-verification key record, or
     /// `None` if one was never registered (#214).
     ///
@@ -2195,7 +2550,11 @@ mod test_issue_293;
 #[cfg(test)]
 mod test_issue_296;
 #[cfg(test)]
+mod test_issue_491;
+#[cfg(test)]
 mod test_round_trip;
+#[cfg(test)]
+mod test_security_replay;
 #[cfg(test)]
 mod test_timestamp;
 #[cfg(test)]

@@ -5,7 +5,15 @@ const common = { sourcemap: true, target: "es2022" as const };
 export default [
   defineConfig({
     ...common,
-    entry: { index: "src/index.ts", node: "src/node.ts", client: "src/client-entry.ts" },
+    entry: {
+      index: "src/index.ts",
+      node: "src/node.ts",
+      client: "src/client-entry.ts",
+      cli: "src/cli.ts",
+      testing: "src/testing.ts",
+      schema: "src/schema.ts",
+      typegen: "src/typegen.ts",
+    },
     format: ["esm", "cjs"],
     dts: true,
     clean: true,
