@@ -37,6 +37,10 @@ pub const ADMIN_TRANSFER_PROPOSED: Symbol = symbol_short!("ADMPROP");
 pub const ADMIN_TRANSFER_COMPLETED: Symbol = symbol_short!("ADMCOMP");
 /// First topic of every `SchemaOwnershipTransferred` event.
 pub const SCHEMA_OWNERSHIP_TRANSFERRED: Symbol = symbol_short!("SCHOWN");
+/// First topic of every `SchemaOwnershipProposed` event (#446).
+pub const SCHEMA_OWNERSHIP_PROPOSED: Symbol = symbol_short!("SCHPROP");
+/// First topic of every `NoncesInvalidated` event (#437).
+pub const NONCES_INVALIDATED: Symbol = symbol_short!("NONCEINV");
 /// First topic of every `BatchAttested` event.
 pub const BATCH_ATTESTED: Symbol = symbol_short!("BATCHATT");
 /// First topic of every `BatchRevoked` event.
@@ -51,6 +55,10 @@ pub const CONTRACT_PAUSED: Symbol = symbol_short!("PAUSED");
 pub const CONTRACT_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
 /// First topic of every `AttestationRenewed` event.
 pub const ATTESTATION_RENEWED: Symbol = symbol_short!("ATSTRENEW");
+/// First topic of every `FeeDistributed` event (#538).
+pub const FEE_DISTRIBUTED: Symbol = symbol_short!("FEEDIST");
+/// First topic of every schema quarantine toggle (#539).
+pub const SCHEMA_QUARANTINED: Symbol = symbol_short!("SCHQUAR");
 
 /// Payload of the `SchemaRegistered` event.
 ///
@@ -273,6 +281,30 @@ pub struct SchemaOwnershipTransferredEvent {
     pub new_owner: Address,
 }
 pub type SchemaOwnershipTransferred = SchemaOwnershipTransferredEvent;
+
+/// Payload of the `SchemaOwnershipProposed` event (#446).
+///
+/// Published with topics `(SCHEMA_OWNERSHIP_PROPOSED, schema_uid)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaOwnershipProposedEvent {
+    pub schema_uid: UID,
+    pub current_owner: Address,
+    pub proposed_owner: Address,
+}
+pub type SchemaOwnershipProposed = SchemaOwnershipProposedEvent;
+
+/// Payload of the `NoncesInvalidated` event (#437).
+///
+/// Published with topics `(NONCES_INVALIDATED, attester)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoncesInvalidatedEvent {
+    pub attester: Address,
+    pub min_nonce: u64,
+    pub max_nonce: u64,
+}
+pub type NoncesInvalidated = NoncesInvalidatedEvent;
 
 /// Payload of the `BatchAttested` event.
 ///
