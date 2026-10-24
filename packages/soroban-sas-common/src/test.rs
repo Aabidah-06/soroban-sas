@@ -655,6 +655,21 @@ fn test_delegation_nonce_key_xdr_smaller_than_tuple() {
 }
 
 #[test]
+fn recipient_consent_nonce_key_is_distinct_from_attester_nonce_key() {
+    use soroban_sdk::xdr::ToXdr;
+    let env = Env::default();
+    let address = Address::generate(&env);
+    let attester_key = crate::DelegationNonceKey {
+        attester: address.clone(),
+    };
+    let recipient_key = crate::RecipientConsentNonceKey {
+        scope: soroban_sdk::symbol_short!("RCONSENT"),
+        recipient: address,
+    };
+    assert_ne!(attester_key.to_xdr(&env), recipient_key.to_xdr(&env));
+}
+
+#[test]
 fn test_compact_attestation_pack_unpack_meta() {
     let env = Env::default();
     let time = 1_700_000_000u64;
@@ -807,4 +822,49 @@ fn test_compact_attestation_storage_footprint_reduction_exceeds_15_percent() {
         original_len,
         compact_len
     );
+}
+
+#[test]
+fn test_validate_frost_group_accepts_only_consistent_groups() {
+    use crate::{validate_frost_group, FrostGroup, SASError, MAX_FROST_SIGNERS};
+
+    let env = soroban_sdk::Env::default();
+    let key = soroban_sdk::BytesN::from_array(&env, &[3u8; 32]);
+
+    let valid = FrostGroup {
+        group_public_key: key.clone(),
+        threshold: 2,
+        max_signers: 3,
+    };
+    assert!(validate_frost_group(&valid).is_ok());
+
+    for (threshold, max_signers) in [(1, 3), (0, 3), (4, 3), (2, 0)] {
+        let group = FrostGroup {
+            group_public_key: key.clone(),
+            threshold,
+            max_signers,
+        };
+        assert_eq!(
+            validate_frost_group(&group),
+            Err(SASError::InvalidValue),
+            "threshold {threshold} of {max_signers} must be rejected"
+        );
+    }
+
+    let oversized = FrostGroup {
+        group_public_key: key.clone(),
+        threshold: 2,
+        max_signers: MAX_FROST_SIGNERS + 1,
+    };
+    assert_eq!(
+        validate_frost_group(&oversized),
+        Err(SASError::LimitExceeded)
+    );
+
+    let zero_key = FrostGroup {
+        group_public_key: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        threshold: 2,
+        max_signers: 3,
+    };
+    assert_eq!(validate_frost_group(&zero_key), Err(SASError::InvalidValue));
 }

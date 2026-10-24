@@ -1,10 +1,11 @@
 use crate::{SASClient, SAS};
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sas_common::{
-    hash_delegated_revocation, AdminTransferCompletedEvent, AdminTransferProposedEvent,
-    Attestation, AttestationDomain, AttestationIssuedEvent, AttestationRevokedEvent,
-    BatchAttestedEvent, BatchRevokedEvent, ContractUpgradedEvent, IndexerStrictUpdatedEvent,
-    IndexerUpdatedEvent, PreviousAddress, SASError, UID,
+    hash_delegated_replacement_consent, hash_delegated_revocation, AdminTransferCompletedEvent,
+    AdminTransferProposedEvent, Attestation, AttestationDomain, AttestationIssuedEvent,
+    AttestationRevokedEvent, BatchAttestedEvent, BatchRevokedEvent, ContractUpgradedEvent,
+    IndexerStrictUpdatedEvent, IndexerUpdatedEvent, PreviousAddress, ReplacementApproval,
+    ReplacementConsentDomain, SASError, UID,
 };
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::testutils::Events as _;
@@ -137,12 +138,21 @@ pub mod mock4 {
 
     #[contractimpl]
     impl MockIndexer {
+        pub fn handle_replace(env: Env, old_uid: UID, new_uid: UID) {
+            env.storage().persistent().set(&old_uid, &new_uid);
+        }
+
+        pub fn get_replacement(env: Env, old_uid: UID) -> Option<UID> {
+            env.storage().persistent().get(&old_uid)
+        }
+
         pub fn index_attestation(
             env: Env,
             uid: UID,
             recipient: Address,
             _schema_uid: UID,
             _attester: Address,
+            _expiration_time: u64,
         ) {
             let mut uids: soroban_sdk::Vec<UID> = env
                 .storage()
@@ -517,6 +527,182 @@ fn test_replace_attestation_success() {
     // overwriting whatever the caller passed.
     let stored: Attestation = f.sas_client.get_attestation(&new_attestation.uid).unwrap();
     assert_eq!(stored.ref_uid, f.old_uid);
+}
+
+mod replacement_consent {
+    use super::*;
+
+    pub struct Fixture {
+        pub env: Env,
+        pub sas_id: Address,
+        pub old: Attestation,
+        pub next: Attestation,
+        pub attester_key: SigningKey,
+        pub recipient_key: SigningKey,
+    }
+
+    fn address_for_key(env: &Env, key: &SigningKey) -> Address {
+        let strkey = stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
+        Address::from_string(&soroban_sdk::String::from_str(env, &strkey))
+    }
+
+    pub fn setup() -> Fixture {
+        let env = Env::default();
+        let registry_id = env.register_contract(None, mock1::MockRegistry);
+        let sas_id = env.register_contract(None, SAS);
+        let attester_key = SigningKey::from_bytes(&[31; 32]);
+        let recipient_key = SigningKey::from_bytes(&[32; 32]);
+        let attester = address_for_key(&env, &attester_key);
+        let recipient = address_for_key(&env, &recipient_key);
+        let client = SASClient::new(&env, &sas_id);
+        env.mock_all_auths();
+        client.init(&Address::generate(&env), &registry_id);
+        let old = attestation_fixture(&env, &attester, &recipient, [10; 32]);
+        client.attest(&old);
+        env.ledger().with_mut(|li| li.timestamp = 5000);
+        let next = attestation_fixture(&env, &attester, &recipient, [11; 32]);
+        Fixture {
+            env,
+            sas_id,
+            old,
+            next,
+            attester_key,
+            recipient_key,
+        }
+    }
+
+    pub fn approvals(
+        f: &Fixture,
+        old_uid: &UID,
+        next: &Attestation,
+        a_nonce: u64,
+        r_nonce: u64,
+    ) -> (ReplacementApproval, ReplacementApproval) {
+        let domain = ReplacementConsentDomain {
+            network_id: f.env.ledger().network_id(),
+            contract: f.sas_id.clone(),
+            attester_nonce: a_nonce,
+            recipient_nonce: r_nonce,
+        };
+        let digest = hash_delegated_replacement_consent(&f.env, old_uid, next, &domain);
+        (
+            ReplacementApproval {
+                nonce: a_nonce,
+                signature: BytesN::from_array(
+                    &f.env,
+                    &f.attester_key.sign(&digest.to_array()).to_bytes(),
+                ),
+                public_key: BytesN::from_array(&f.env, &f.attester_key.verifying_key().to_bytes()),
+            },
+            ReplacementApproval {
+                nonce: r_nonce,
+                signature: BytesN::from_array(
+                    &f.env,
+                    &f.recipient_key.sign(&digest.to_array()).to_bytes(),
+                ),
+                public_key: BytesN::from_array(&f.env, &f.recipient_key.verifying_key().to_bytes()),
+            },
+        )
+    }
+}
+
+#[test]
+fn test_replacement_consent_revokes_links_indexes_and_consumes_both_nonces() {
+    let f = replacement_consent::setup();
+    let client = SASClient::new(&f.env, &f.sas_id);
+    let indexer_id = f.env.register_contract(None, mock4::MockIndexer);
+    client.set_indexer(&indexer_id);
+    let indexer = mock4::MockIndexerClient::new(&f.env, &indexer_id);
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &f.next, 7, 9);
+
+    let uid = client.replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r);
+    assert_eq!(uid, f.next.uid);
+    assert!(!client.verify_attestation(&f.old.uid));
+    assert!(client.verify_attestation(&uid));
+    assert_eq!(client.get_attestation(&uid).unwrap().ref_uid, f.old.uid);
+    assert_eq!(indexer.get_replacement(&f.old.uid), Some(uid.clone()));
+    assert!(indexer
+        .get_attestations_by_recipient(&f.next.recipient)
+        .contains(&uid));
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), Some(7));
+    assert_eq!(
+        client.get_recipient_consent_nonce(&f.old.recipient),
+        Some(9)
+    );
+
+    let old2 = attestation_fixture(&f.env, &f.old.attester, &f.old.recipient, [12; 32]);
+    let next2 = attestation_fixture(&f.env, &f.old.attester, &f.old.recipient, [13; 32]);
+    client.attest(&old2);
+    let (a, r) = replacement_consent::approvals(&f, &old2.uid, &next2, 8, 9);
+    assert_eq!(
+        client.try_replace_by_delegation_consent(&old2.uid, &next2, &a, &r),
+        Err(Ok(SASError::DelegationReplay.into()))
+    );
+    assert!(client.verify_attestation(&old2.uid));
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), Some(7));
+}
+
+#[test]
+fn test_replacement_consent_rejects_wrong_recipient_and_tampering_without_consuming_nonces() {
+    let f = replacement_consent::setup();
+    let client = SASClient::new(&f.env, &f.sas_id);
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &f.next, 1, 2);
+    let wrong_key = BytesN::from_array(&f.env, &[99; 32]);
+    let mut wrong_recipient = r.clone();
+    wrong_recipient.public_key = wrong_key;
+    assert_eq!(
+        client.try_replace_by_delegation_consent(&f.old.uid, &f.next, &a, &wrong_recipient),
+        Err(Ok(SASError::Unauthorized.into()))
+    );
+
+    let mut tampered = f.next.clone();
+    tampered.data = Bytes::from_slice(&f.env, &[42]);
+    recompute_uid(&f.env, &mut tampered);
+    assert!(client
+        .try_replace_by_delegation_consent(&f.old.uid, &tampered, &a, &r)
+        .is_err());
+    let mut wrong_signature = r.clone();
+    wrong_signature.signature = BytesN::from_array(&f.env, &[0; 64]);
+    assert!(client
+        .try_replace_by_delegation_consent(&f.old.uid, &f.next, &a, &wrong_signature)
+        .is_err());
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), None);
+    assert_eq!(client.get_recipient_consent_nonce(&f.old.recipient), None);
+    assert!(client.verify_attestation(&f.old.uid));
+    assert!(client.get_attestation(&f.next.uid).is_none());
+
+    client.replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r);
+    assert_eq!(
+        client.get_recipient_consent_nonce(&f.old.recipient),
+        Some(2)
+    );
+    assert!(client
+        .try_replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r)
+        .is_err());
+}
+
+#[test]
+fn test_replacement_consent_rolls_back_both_nonces_if_replacement_fails() {
+    let f = replacement_consent::setup();
+    let client = SASClient::new(&f.env, &f.sas_id);
+    let mut invalid = f.next.clone();
+    invalid.uid = UID(BytesN::from_array(&f.env, &[55; 32]));
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &invalid, 4, 6);
+    assert_eq!(
+        client.try_replace_by_delegation_consent(&f.old.uid, &invalid, &a, &r),
+        Err(Ok(SASError::InvalidUID.into()))
+    );
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), None);
+    assert_eq!(client.get_recipient_consent_nonce(&f.old.recipient), None);
+    assert!(client.verify_attestation(&f.old.uid));
+
+    let (a, r) = replacement_consent::approvals(&f, &f.old.uid, &f.next, 4, 6);
+    client.replace_by_delegation_consent(&f.old.uid, &f.next, &a, &r);
+    assert_eq!(client.get_delegation_nonce(&f.old.attester), Some(4));
+    assert_eq!(
+        client.get_recipient_consent_nonce(&f.old.recipient),
+        Some(6)
+    );
 }
 
 #[test]
@@ -2640,6 +2826,7 @@ pub mod mock_trap_indexer {
             _recipient: Address,
             _schema_uid: UID,
             _attester: Address,
+            _expiration_time: u64,
         ) {
             soroban_sdk::panic_with_error!(&env, SASError::NotInitialized);
         }
@@ -4345,21 +4532,24 @@ mod view_functions {
     }
 }
 
-
 // Regression tests for bundled Stellar Wave issues #525, #532 and #533.
 #[test]
 fn test_multi_asset_fee_allowlist_and_treasury_settlement() {
     let (env, sas_client, _sas_id, admin, attester, recipient) = fee_test_env();
     let treasury = Address::generate(&env);
-    let default_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let alternate = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let unknown = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let default_token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let alternate = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let unknown = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let default_client = soroban_sdk::token::Client::new(&env, &default_token);
     let alternate_client = soroban_sdk::token::Client::new(&env, &alternate);
-    soroban_sdk::token::StellarAssetClient::new(&env, &default_token)
-        .mint(&attester, &1_000);
-    soroban_sdk::token::StellarAssetClient::new(&env, &alternate)
-        .mint(&attester, &1_000);
+    soroban_sdk::token::StellarAssetClient::new(&env, &default_token).mint(&attester, &1_000);
+    soroban_sdk::token::StellarAssetClient::new(&env, &alternate).mint(&attester, &1_000);
 
     sas_client.set_treasury(&treasury);
     sas_client.set_fee(&default_token, &100);
@@ -4407,7 +4597,7 @@ fn test_rolling_ledger_rate_limit_bursts_and_exemptions() {
         Err(Ok(SASError::RateLimitExceeded.into()))
     );
 
-    env.ledger().with_mut(|li| li.sequence += 3);
+    env.ledger().with_mut(|li| li.sequence_number += 3);
     sas_client.attest(&blocked);
     let blocked_again = attestation_fixture(&env, &attester, &recipient, [94u8; 32]);
     sas_client.set_rate_limit_exempt(&attester, &true);
@@ -4446,21 +4636,23 @@ mod callback_loop {
     impl Hop {
         pub fn configure(env: Env, next: Address, terminal: bool) {
             env.storage().instance().set(&symbol_short!("NEXT"), &next);
-            env.storage().instance().set(&symbol_short!("FINAL"), &terminal);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("FINAL"), &terminal);
         }
         pub fn on_attest(env: Env, attestation: Attestation) {
-            let next: Address = env.storage().instance().get(&symbol_short!("NEXT")).unwrap();
+            let next: Address = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("NEXT"))
+                .unwrap();
             let terminal: bool = env
                 .storage()
                 .instance()
                 .get(&symbol_short!("FINAL"))
                 .unwrap();
             if terminal {
-                env.invoke_contract::<()>(
-                    &next,
-                    &symbol_short!("pause"),
-                    soroban_sdk::vec![&env],
-                );
+                env.invoke_contract::<()>(&next, &symbol_short!("pause"), soroban_sdk::vec![&env]);
             } else {
                 env.invoke_contract::<()>(
                     &next,
@@ -4476,8 +4668,10 @@ mod callback_loop {
     pub struct LoopRegistry;
     #[contractimpl]
     impl LoopRegistry {
-        pub fn configure(env: Env, resolver: Address) {
-            env.storage().instance().set(&symbol_short!("RESOLVER"), &resolver);
+        pub fn set_resolver(env: Env, resolver: Address) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("RESOLVER"), &resolver);
         }
         pub fn sasreg(_env: Env) -> bool {
             true
@@ -4514,7 +4708,7 @@ fn test_three_contract_resolver_reentrancy_loop_rolls_back() {
     let admin = Address::generate(&env);
     let client = SASClient::new(&env, &sas);
     client.init(&admin, &registry);
-    callback_loop::LoopRegistryClient::new(&env, &registry).configure(&a);
+    callback_loop::LoopRegistryClient::new(&env, &registry).set_resolver(&a);
     let hop_a = callback_loop::HopClient::new(&env, &a);
     let hop_b = callback_loop::HopClient::new(&env, &b);
     let hop_c = callback_loop::HopClient::new(&env, &c);
@@ -4530,7 +4724,7 @@ fn test_three_contract_resolver_reentrancy_loop_rolls_back() {
 
     // A trapped callback must not poison the context for future issuances.
     let good_resolver = env.register_contract(None, mock3::MockResolver);
-    callback_loop::LoopRegistryClient::new(&env, &registry).configure(&good_resolver);
+    callback_loop::LoopRegistryClient::new(&env, &registry).set_resolver(&good_resolver);
     let clean = attestation_fixture(&env, &attester, &recipient, [102u8; 32]);
     assert_eq!(client.attest(&clean), clean.uid);
 }
