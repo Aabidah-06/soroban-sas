@@ -75,6 +75,7 @@ jobs:
           cargo fuzz run validation_fuzz -- -runs=200 -max_len=128 -rss_limit_mb=4096
           cargo fuzz run merkle_fuzz -- -runs=200 -max_len=256 -rss_limit_mb=4096
           cargo fuzz run strkey_fuzz -- -runs=500 -max_len=128 -rss_limit_mb=4096
+          cargo fuzz run stateful_indexer_fuzz -- -runs=100 -max_len=1024 -rss_limit_mb=4096
 
   smoke-sdk-tooling:
     name: Smoke · SDK & Tooling
@@ -107,7 +108,6 @@ jobs:
           cargo fuzz run csv_bulk_fuzz -- -runs=500 -max_len=8192 -rss_limit_mb=4096
           cargo fuzz run schema_builder_fuzz -- -runs=200 -max_len=512 -rss_limit_mb=4096
           cargo fuzz run attestation_builder_fuzz -- -runs=200 -max_len=512 -rss_limit_mb=4096
-
 
   # ── Full campaigns (scheduled / manual only) ───────────────────────────────
   # Campaign jobs run on a weekly schedule and on manual dispatch.  They run
