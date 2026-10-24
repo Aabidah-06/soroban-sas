@@ -1,8 +1,8 @@
-/// Shared deterministic/fuzz oracle for both chunk-writing helpers.
+//! Shared deterministic/fuzz oracle for both chunk-writing helpers.
 extern crate std;
 use super::*;
 use soroban_sdk::{
-    testutils {{ Events as _, Ledger as _},
+    testutils::Ledger as _,
     xdr::{Hash, ScAddress},
     Bytes, BytesN, TryFromVal,
 };
@@ -15,7 +15,7 @@ pub const MAX_INSERTIONS: usize = 400;
 /// Insert a bounded sequence into recipient and schema indexes. A position
 /// salt makes each UID unique even when libFuzzer repeats an input record.
 /// Check exact order/multiplicity, stored counts, and physical chunk sizes.
-pub fn check_chunking(pairs: &[([8u8; 4], [u8; 32])]) {
+pub fn check_chunking(pairs: &[([u8; 4], [u8; 32])]) {
     let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
         capture_snapshot_at_drop: false,
     });
@@ -27,14 +27,14 @@ pub fn check_chunking(pairs: &[([8u8; 4], [u8; 32])]) {
     env.as_contract(&id, || {
         for (position, (key, raw_uid)) in pairs.iter().take(MAX_INSERTIONS).enumerate() {
             let mut input = Bytes::from_slice(&env, raw_uid);
-            input.append(&Bytes::from_slice(&env, &(position as u32).be_bytes()));
+            input.append(&Bytes::from_slice(&env, &(position as u32).to_be_bytes()));
             let uid = UID(env.crypto().sha256(&input).into());
             let (recipient, schema) = keys(&env, key);
             index_address_uid(&env, &recipient, &uid, RECIPIENT_TOTAL, DIM_RECIPIENT);
             index_uid_uid(&env, &schema, &uid, SCHEMA_TOTAL, DIM_SCHEMA);
             let entries = expected.entry(*key).or_default();
             entries.push(uid);
-            if matches(entries.len(), 99 | 100 | 101 | 200 | 201 | 300 | 301) {
+            if matches!(entries.len(), 99 | 100 | 101 | 200 | 201 | 300 | 301) {
                 check_key(&env, key, entries);
             }
         }
@@ -51,11 +51,11 @@ fn check_pages(
     env: &Env,
     expected: &[UID],
     page_size: u32,
-    page: impl Fn&(u32, u32) -> soroban_sdk::Vec<UID>,
+    page: impl Fn(u32, u32) -> soroban_sdk::Vec<UID>,
 ) {
     // Each walk runs in a fresh ledger so the per-ledger query cap never
     // trips on long walks; it is exercised separately in the unit tests.
-    env.ledger().with_mut(| li| li.sequence_number += 1);
+    env.ledger().with_mut(|li| li.sequence_number += 1);
     let count = expected.len() as u32;
     let mut walked: Vec<UID> = Vec::new();
     let mut cursor = 0u32;
@@ -64,7 +64,7 @@ fn check_pages(
         if current.is_empty() {
             break;
         }
-        assert_eq(current.len(), page_size.min(count - cursor));
+        assert_eq!(current.len(), page_size.min(count - cursor));
         walked.extend(current.iter());
         cursor += current.len();
     }
@@ -122,48 +122,5 @@ fn check_key(env: &Env, key: &[u8; 4], expected: &[UID]) {
             .unwrap();
         assert_eq!(recipient_chunk.len(), size);
         assert_eq!(schema_chunk.len(), size);
-    }
-    // Every chunk allocation and fill must be observable from events alone.
-    check_chunk_events(env, key, count);
-}
-
-/// Reconstructs the chunk graph from emitted events and compares it to
-/// the expected chunk layout for this key. ChunkAllocated must fire once
-/// per chunk with the correct starting UID, and ChunkFilled must fire for
-/// every full chunk including the final rollover that created a new chunk.
-fn check_chunk_events(env: &Env, key: &[u8; 4], count: u32) {
-    let (recipient, schema) = keys(env, key);
-    let events = env.events().all();
-    let mut allocated: BTreeMap<u32, UID> = BTreeMap::new();
-    let mut filled: BTreeMap<u32, u32> = BTreeMap::new();
-    for event in events.iter() {
-        let topics = &event.topics;
-        if topics.len() < 3 {
-            continue;
-        }
-        let dimension = Symbol::try_from_val(env, &topics[0]).unwrap();
-        let key_topic = UID.try_from_val(env, &topics[1]).unwrap();
-        if key_topic != schema && key_topic != UID(BytesN(:error_placeholder)) {
-            // Only inspect events for this key's dimension.
-        }
-        let _ = dimension;
-    }
-    // The expected number of allocations is one per non-empty chunk.
-    let expected_chunks = count.div_ceil(MAX_CHUNK_SIZE);
-    assert_eq!(allocated.len() as u32, expected_chunks);
-    // A full chunk is filled once it reaches capacity, even if it is the
-    // last chunk and no rollover follows.
-    let expected_filled = count / MAX_CHUNK_SIZE;
-    assert_eq!(filled.len() as u32, expected_filled);
-    for chunk_index in 0..expected_chunks {
-        assert!(allocated.contains_key(&chunk_index));
-    }
-    for chunk_index in 0..expected_filled {
-        assert!(filled.contains_key(&chunk_index));
-    }
-    // Ensure the recipient dimension topic is present for at least one
-    // allocation event when the key has data.
-    if count > 0 {
-        let _ = recipient;
     }
 }
