@@ -54,12 +54,31 @@ pub struct ArchivedInfo {
 /// simulation reports is added on top.
 const BASE_FEE: u32 = 100;
 
+/// Detailed resource consumption and limits breakdown for a simulated transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceBreakdown {
+    /// CPU instructions consumed during simulation.
+    pub cpu_instructions: u32,
+    /// Memory/ledger read bytes.
+    pub read_bytes: u32,
+    /// Memory/ledger write bytes.
+    pub write_bytes: u32,
+    /// Count of ledger keys in read-only footprint.
+    pub read_only_entries: u32,
+    /// Count of ledger keys in read-write footprint.
+    pub read_write_entries: u32,
+    /// Whether any metric exceeds 80% of network limits.
+    pub approaches_limits: bool,
+    /// Warning messages for metrics exceeding 80% of limits.
+    pub limit_warnings: Vec<String>,
+}
+
 /// Outcome of simulating a write call without signing or submitting it
-/// (issue #329's `--dry-run`): the resource footprint/fee a real submission
+/// (issue #329, #473's `--dry-run`): the resource footprint/fee a real submission
 /// would need to carry, obtained from the same `simulateTransaction` draft
 /// step `SASClient::submit_write` runs before it ever builds a signed
 /// envelope. No sequence number is consumed and no signature is produced.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DryRunResult {
     /// The contract function that was simulated.
     pub function_name: String,
@@ -71,6 +90,8 @@ pub struct DryRunResult {
     pub total_fee: i64,
     /// The ledger the simulation ran against.
     pub latest_ledger: u32,
+    /// Detailed breakdown of CPU, RAM bytes, and storage footprint entries.
+    pub resources: Option<ResourceBreakdown>,
 }
 
 /// Configurable fee policy for simulated write transactions.
@@ -98,7 +119,11 @@ pub enum FeePolicy {
 
 /// Applies the `FeePolicy` to a raw `BASE_FEE + resource_fee` sum and
 /// returns the fee that will be written into the transaction.
-fn apply_fee_policy(base_fee: u32, resource_fee: i64, policy: &FeePolicy) -> Result<u32, SdkError> {
+pub(crate) fn apply_fee_policy(
+    base_fee: u32,
+    resource_fee: i64,
+    policy: &FeePolicy,
+) -> Result<u32, SdkError> {
     let base = i64::from(base_fee);
     let raw = match policy {
         FeePolicy::Default => base + resource_fee,
@@ -1272,6 +1297,187 @@ impl SASClient {
         )
     }
 
+    /// Step 1 of two-step schema ownership transfer (#446).
+    /// Calls `SchemaRegistry::propose_schema_owner(schema_uid, new_owner)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_schema_owner(
+        &self,
+        rpc: &RpcClient,
+        network_passphrase: &str,
+        owner_secret_seed: &[u8; 32],
+        registry_contract_id: &str,
+        schema_uid: &UID,
+        new_owner: &str,
+    ) -> Result<GetTransactionResult, SdkError> {
+        let env = &Env::default();
+        let new_owner_addr = parse_address(env, new_owner, AddressKind::Either, "new_owner")?;
+        let args = vec![
+            simulate::encode_arg(env, schema_uid)?,
+            simulate::encode_arg(env, &new_owner_addr)?,
+        ];
+        self.submit_write(
+            rpc,
+            network_passphrase,
+            owner_secret_seed,
+            registry_contract_id,
+            "propose_schema_owner",
+            args,
+        )
+    }
+
+    /// Step 2 of two-step schema ownership transfer (#446).
+    /// Calls `SchemaRegistry::claim_schema_ownership(schema_uid)`.
+    /// Callable only by the proposed new owner.
+    pub fn claim_schema_ownership(
+        &self,
+        rpc: &RpcClient,
+        network_passphrase: &str,
+        new_owner_secret_seed: &[u8; 32],
+        registry_contract_id: &str,
+        schema_uid: &UID,
+    ) -> Result<GetTransactionResult, SdkError> {
+        let env = &Env::default();
+        let args = vec![simulate::encode_arg(env, schema_uid)?];
+        self.submit_write(
+            rpc,
+            network_passphrase,
+            new_owner_secret_seed,
+            registry_contract_id,
+            "claim_schema_ownership",
+            args,
+        )
+    }
+
+    /// Cancels an in-flight two-step schema ownership transfer (#446).
+    /// Calls `SchemaRegistry::cancel_schema_ownership_transfer(schema_uid)`.
+    pub fn cancel_schema_ownership_transfer(
+        &self,
+        rpc: &RpcClient,
+        network_passphrase: &str,
+        owner_secret_seed: &[u8; 32],
+        registry_contract_id: &str,
+        schema_uid: &UID,
+    ) -> Result<GetTransactionResult, SdkError> {
+        let env = &Env::default();
+        let args = vec![simulate::encode_arg(env, schema_uid)?];
+        self.submit_write(
+            rpc,
+            network_passphrase,
+            owner_secret_seed,
+            registry_contract_id,
+            "cancel_schema_ownership_transfer",
+            args,
+        )
+    }
+
+    /// Queries the currently pending owner for a schema, if any (#446).
+    pub fn get_pending_schema_owner(
+        &self,
+        rpc: &RpcClient,
+        registry_contract_id: &str,
+        schema_uid: &UID,
+    ) -> Result<Option<Address>, SdkError> {
+        let env = &Env::default();
+        let arg = simulate::encode_arg(env, schema_uid)?;
+        invoke_read_only(
+            env,
+            rpc,
+            registry_contract_id,
+            "get_pending_schema_owner",
+            vec![arg],
+        )
+    }
+
+    /// Queries the revocation policy for a schema (#448).
+    pub fn get_schema_policy(
+        &self,
+        rpc: &RpcClient,
+        registry_contract_id: &str,
+        schema_uid: &UID,
+    ) -> Result<soroban_sas_common::RevocationPolicy, SdkError> {
+        let env = &Env::default();
+        let arg = simulate::encode_arg(env, schema_uid)?;
+        invoke_read_only(
+            env,
+            rpc,
+            registry_contract_id,
+            "get_schema_policy",
+            vec![arg],
+        )
+    }
+
+    /// Advances the nonce watermark to cancel prior unsubmitted off-chain signatures (#437).
+    pub fn set_nonce_highwater_mark(
+        &self,
+        rpc: &RpcClient,
+        network_passphrase: &str,
+        attester_secret_seed: &[u8; 32],
+        new_nonce: u64,
+    ) -> Result<GetTransactionResult, SdkError> {
+        let env = &Env::default();
+        let attester_public_key = signature::derive_public_key(attester_secret_seed);
+        let attester_strkey = stellar_strkey::ed25519::PublicKey(attester_public_key).to_string();
+        let attester = Address::from_string(&SorobanString::from_str(env, &attester_strkey));
+        let args = vec![
+            simulate::encode_arg(env, &attester)?,
+            simulate::encode_arg(env, &new_nonce)?,
+        ];
+        self.submit_write(
+            rpc,
+            network_passphrase,
+            attester_secret_seed,
+            &self.contract_id,
+            "set_nonce_highwater_mark",
+            args,
+        )
+    }
+
+    /// Bulk invalidates a range of nonces for the calling attester (#437).
+    pub fn invalidate_nonces(
+        &self,
+        rpc: &RpcClient,
+        network_passphrase: &str,
+        attester_secret_seed: &[u8; 32],
+        min_nonce: u64,
+        max_nonce: u64,
+    ) -> Result<GetTransactionResult, SdkError> {
+        let env = &Env::default();
+        let attester_public_key = signature::derive_public_key(attester_secret_seed);
+        let attester_strkey = stellar_strkey::ed25519::PublicKey(attester_public_key).to_string();
+        let attester = Address::from_string(&SorobanString::from_str(env, &attester_strkey));
+        let args = vec![
+            simulate::encode_arg(env, &attester)?,
+            simulate::encode_arg(env, &min_nonce)?,
+            simulate::encode_arg(env, &max_nonce)?,
+        ];
+        self.submit_write(
+            rpc,
+            network_passphrase,
+            attester_secret_seed,
+            &self.contract_id,
+            "invalidate_nonces",
+            args,
+        )
+    }
+
+    /// Returns the current nonce highwater mark for an attester (#437).
+    pub fn get_nonce_highwater_mark(
+        &self,
+        rpc: &RpcClient,
+        attester: &str,
+    ) -> Result<u64, SdkError> {
+        let env = &Env::default();
+        let attester_addr = parse_address(env, attester, AddressKind::Either, "attester")?;
+        let arg = simulate::encode_arg(env, &attester_addr)?;
+        invoke_read_only(
+            env,
+            rpc,
+            &self.contract_id,
+            "get_nonce_highwater_mark",
+            vec![arg],
+        )
+    }
+
     /// Checks whether `delegate` is currently an authorized delegate for `schema_uid`.
     pub fn is_delegate(
         &self,
@@ -1358,6 +1564,20 @@ impl SASClient {
             vec![arg],
             fee_policy,
         )
+    }
+
+    /// Simulates `attest` without signing or submitting to estimate fees and resource usage.
+    pub fn attest_dry_run(
+        &self,
+        rpc: &RpcClient,
+        secret_seed: &[u8; 32],
+        attestation: Attestation,
+    ) -> Result<DryRunResult, SdkError> {
+        let env = attestation.attester.env();
+        ensure_attester_matches_secret(env, secret_seed, &attestation)?;
+        let arg = simulate::encode_arg(env, &attestation)?;
+        let public_key = signature::derive_public_key(secret_seed);
+        dry_run_write(rpc, &self.contract_id, "attest", vec![arg], &public_key)
     }
 
     /// Calls `SAS::attest_with_value(attestation, token, value)`: like
@@ -1479,6 +1699,20 @@ impl SASClient {
             vec![arg],
             fee_policy,
         )
+    }
+
+    /// Simulates `revoke` without signing or submitting to estimate fees and resource usage.
+    pub fn revoke_dry_run(
+        &self,
+        rpc: &RpcClient,
+        secret_seed: &[u8; 32],
+        uid: &[u8; 32],
+    ) -> Result<DryRunResult, SdkError> {
+        let env = &Env::default();
+        let uid = UID(BytesN::from_array(env, uid));
+        let arg = simulate::encode_arg(env, &uid)?;
+        let public_key = signature::derive_public_key(secret_seed);
+        dry_run_write(rpc, &self.contract_id, "revoke", vec![arg], &public_key)
     }
 
     /// Calls `SAS::multi_revoke(uids)`: encodes each UID into one Soroban
@@ -2628,6 +2862,7 @@ impl SASClient {
                     error_result_xdr,
                 }) if attempt == 0 && is_bad_sequence(error_result_xdr.as_deref()) => {
                     reservation.failed();
+                    let _ = manager.sync_on_chain(rpc, &public_key);
                     let _ = status;
                     continue;
                 }
@@ -2685,11 +2920,66 @@ fn dry_run_write(
         .unwrap_or("0")
         .parse()
         .map_err(|e| SdkError::RpcError(format!("invalid simulated minResourceFee: {e:?}")))?;
+
+    let mut resources = None;
+    if let Some(ref b64) = sim.transaction_data {
+        if let Ok(data) = SorobanTransactionData::from_xdr_base64(
+            b64,
+            crate::limits::default_rpc_response_limits(),
+        ) {
+            let cpu = data.resources.instructions;
+            let read_bytes = data.resources.read_bytes;
+            let write_bytes = data.resources.write_bytes;
+            let ro_entries = data.resources.footprint.read_only.len() as u32;
+            let rw_entries = data.resources.footprint.read_write.len() as u32;
+            let total_entries = ro_entries + rw_entries;
+
+            let mut warnings = Vec::new();
+            if cpu > 80_000_000 {
+                warnings.push(format!(
+                    "CPU instructions ({cpu}) exceed 80% of limit (100,000,000)"
+                ));
+            }
+            if read_bytes > 160_000 {
+                warnings.push(format!(
+                    "Read bytes ({read_bytes} B) exceed 80% of limit (200,000 B)"
+                ));
+            }
+            if write_bytes > 104_000 {
+                warnings.push(format!(
+                    "Write bytes ({write_bytes} B) exceed 80% of limit (130,000 B)"
+                ));
+            }
+            if total_entries > 32 {
+                warnings.push(format!(
+                    "Total storage keys ({total_entries}) exceed 80% of limit (40)"
+                ));
+            }
+            if rw_entries > 20 {
+                warnings.push(format!(
+                    "Write storage keys ({rw_entries}) exceed 80% of limit (25)"
+                ));
+            }
+
+            let approaches_limits = !warnings.is_empty();
+            resources = Some(ResourceBreakdown {
+                cpu_instructions: cpu,
+                read_bytes,
+                write_bytes,
+                read_only_entries: ro_entries,
+                read_write_entries: rw_entries,
+                approaches_limits,
+                limit_warnings: warnings,
+            });
+        }
+    }
+
     Ok(DryRunResult {
         function_name: function_name.to_string(),
         min_resource_fee,
         total_fee: i64::from(BASE_FEE) + min_resource_fee,
         latest_ledger: sim.latest_ledger,
+        resources,
     })
 }
 
@@ -2757,6 +3047,7 @@ mod tests {
             attester,
             revocable: true,
             data: Bytes::new(env),
+            valid_from: 0,
         }
     }
 
