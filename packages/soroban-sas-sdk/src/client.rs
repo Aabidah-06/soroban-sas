@@ -19,7 +19,22 @@ use soroban_sdk::xdr::{
     WriteXdr,
 };
 use soroban_sdk::{Address, BytesN, Env, String as SorobanString};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct CachedSchema {
+    value: Option<SchemaRecord>,
+    inserted_at: Instant,
+}
+
+#[derive(Default)]
+struct SchemaCache {
+    entries: HashMap<(String, [u8; 32]), CachedSchema>,
+    lru: VecDeque<(String, [u8; 32])>,
+}
 
 /// Distinguishes live, missing, and archived attestations — the
 /// SDK-supported view that keeps live entries from expiring. Fetching
@@ -152,12 +167,16 @@ pub struct SASClient {
     secret_seed: Option<[u8; 32]>,
     /// Optional configured Schema Registry contract ID.
     registry_contract_id: Option<String>,
+    schema_cache: Arc<Mutex<SchemaCache>>,
+    schema_cache_capacity: usize,
+    schema_cache_ttl: Duration,
     external_signer: Option<Arc<dyn TransactionSigner>>,
 }
 
 impl SASClient {
     /// Instantiates a new SASClient with the given contract ID and default
     /// submission policy.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(contract_id: String) -> Self {
         Self {
             contract_id,
@@ -167,6 +186,9 @@ impl SASClient {
             network_passphrase: None,
             secret_seed: None,
             registry_contract_id: None,
+            schema_cache: Arc::new(Mutex::new(SchemaCache::default())),
+            schema_cache_capacity: 256,
+            schema_cache_ttl: Duration::from_secs(300),
             external_signer: None,
         }
     }
@@ -242,6 +264,31 @@ impl SASClient {
     pub fn with_registry(mut self, registry_contract_id: impl Into<String>) -> Self {
         self.registry_contract_id = Some(registry_contract_id.into());
         self
+    }
+
+    /// Configures the maximum number of schema results and their time to live.
+    /// A capacity of zero disables caching.
+    pub fn with_schema_cache(mut self, capacity: usize, ttl: Duration) -> Self {
+        self.schema_cache_capacity = capacity;
+        self.schema_cache_ttl = ttl;
+        if let Ok(mut cache) = self.schema_cache.lock() {
+            while cache.entries.len() > capacity {
+                if let Some(key) = cache.lru.pop_front() {
+                    cache.entries.remove(&key);
+                } else {
+                    break;
+                }
+            }
+        }
+        self
+    }
+
+    /// Removes the cached schema result for a UID from every registry.
+    pub fn invalidate_schema_cache(&self, schema_uid: &[u8; 32]) {
+        if let Ok(mut cache) = self.schema_cache.lock() {
+            cache.entries.retain(|(_, uid), _| uid != schema_uid);
+            cache.lru.retain(|(_, uid)| uid != schema_uid);
+        }
     }
 
     /// Returns the configured registry contract ID, if set.
@@ -418,10 +465,66 @@ impl SASClient {
         registry_contract_id: &str,
         uid: &[u8; 32],
     ) -> Result<Option<SchemaRecord>, SdkError> {
+        self.get_schema_with_cache(rpc, registry_contract_id, uid, true)
+    }
+
+    /// Looks up a schema without consulting or updating the local cache.
+    pub fn get_schema_uncached(
+        &self,
+        rpc: &RpcClient,
+        registry_contract_id: &str,
+        uid: &[u8; 32],
+    ) -> Result<Option<SchemaRecord>, SdkError> {
+        self.get_schema_with_cache(rpc, registry_contract_id, uid, false)
+    }
+
+    fn get_schema_with_cache(
+        &self,
+        rpc: &RpcClient,
+        registry_contract_id: &str,
+        uid: &[u8; 32],
+        use_cache: bool,
+    ) -> Result<Option<SchemaRecord>, SdkError> {
+        let key = (registry_contract_id.to_owned(), *uid);
+        if use_cache && self.schema_cache_capacity > 0 && !self.schema_cache_ttl.is_zero() {
+            if let Ok(mut cache) = self.schema_cache.lock() {
+                if let Some(entry) = cache.entries.get(&key).cloned() {
+                    if entry.inserted_at.elapsed() < self.schema_cache_ttl {
+                        cache.lru.retain(|item| item != &key);
+                        cache.lru.push_back(key.clone());
+                        return Ok(entry.value);
+                    }
+                    cache.entries.remove(&key);
+                    cache.lru.retain(|item| item != &key);
+                }
+            }
+        }
         let env = &Env::default();
         let uid = UID(BytesN::from_array(env, uid));
         let arg = simulate::encode_arg(env, &uid)?;
-        invoke_read_only(env, rpc, registry_contract_id, "get_schema", vec![arg])
+        let result: Option<SchemaRecord> =
+            invoke_read_only(env, rpc, registry_contract_id, "get_schema", vec![arg])?;
+        if use_cache && self.schema_cache_capacity > 0 && !self.schema_cache_ttl.is_zero() {
+            if let Ok(mut cache) = self.schema_cache.lock() {
+                cache.entries.insert(
+                    key.clone(),
+                    CachedSchema {
+                        value: result.clone(),
+                        inserted_at: Instant::now(),
+                    },
+                );
+                cache.lru.retain(|item| item != &key);
+                cache.lru.push_back(key);
+                while cache.entries.len() > self.schema_cache_capacity {
+                    if let Some(oldest) = cache.lru.pop_front() {
+                        cache.entries.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Calls `SchemaRegistry::get_schema_by_content(schema, resolver,
