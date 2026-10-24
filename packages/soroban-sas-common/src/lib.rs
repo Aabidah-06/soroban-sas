@@ -25,7 +25,7 @@ pub use eip712::{
     SchemaError, StructDef, DOMAIN_STRUCT_NAME, EIP712_PREFIX,
 };
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Symbol};
 
 /// Approximate number of ledgers in one year at five seconds per ledger.
 pub const LEDGERS_IN_ONE_YEAR: u32 = 6_307_200;
@@ -70,6 +70,9 @@ pub fn extend_instance_ttl(env: &Env) {
 /// well within Soroban limits while accommodating typical attestation
 /// payloads. (#157)
 pub const MAX_ATTESTATION_DATA_BYTES: u32 = 10_000;
+
+/// Maximum number of attestations accepted by the SAS batch issuance entrypoints.
+pub const MAX_MULTI_ATTEST: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -384,6 +387,17 @@ pub struct CompactAttestationKey {
     pub uid: UID,
 }
 
+/// Expiration status bucket for indexing attestations by their expiration
+/// time. Perpetual attestations (expiration_time == 0) are indexed separately
+/// from time-bound attestations to enable efficient queries for time-sensitive
+/// use cases.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpirationStatus {
+    Perpetual,
+    Expiring,
+}
+
 /// Typed storage key for tracking per-attester delegation nonces (#237).
 ///
 /// Serializes as ScVec rather than ScMap (which a raw `(DELEGATION_NONCE, attester)`
@@ -392,6 +406,16 @@ pub struct CompactAttestationKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationNonceKey {
     pub attester: Address,
+}
+
+/// Separate recipient consent nonce space, so a recipient who is also an
+/// attester can sign both roles without their nonce watermarks colliding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientConsentNonceKey {
+    /// Distinguishes this key's ScVec encoding from `DelegationNonceKey`.
+    pub scope: Symbol,
+    pub recipient: Address,
 }
 
 /// Typed storage key wrapper for attester key records (#237).

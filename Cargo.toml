@@ -5,11 +5,17 @@ members = [
     "contracts/sas",
     "contracts/indexer",
     "packages/soroban-sas-sdk",
+    "packages/soroban-sas-schema-macro",
     "packages/soroban-sas-cli",
     "contracts/permissive-resolver",
-"tools/prometheus-exporter",
-"contracts/cross-chain-verifier",
-"contracts/zk-verifier",
+    "contracts/token-gated-resolver",
+    "contracts/multisig-resolver",
+    "contracts/endorsement-resolver",
+    "contracts/blacklist-resolver",
+    "contracts/time-window-resolver",
+    "tools/prometheus-exporter",
+    "contracts/cross-chain-verifier",
+    "contracts/zk-verifier",
 ]
 exclude = ["fuzz", "tools/gas-profiler"]
 resolver = "2"
