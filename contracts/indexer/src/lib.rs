@@ -2,7 +2,8 @@
 #![no_std]
 use soroban_sas_common::{
     events::{CONTRACT_UPGRADED, INDEXING_PROGRESS},
-    ContractUpgradedEvent, IndexingProgressEvent, SASError, LEDGERS_IN_ONE_YEAR, UID,
+    ContractUpgradedEvent, ExpirationStatus, IndexingProgressEvent, SASError, LEDGERS_IN_ONE_YEAR,
+    UID,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address, BytesN, Env,
@@ -37,6 +38,8 @@ pub struct Indexer;
 //   (UID, chunk_idx)                     - Chunks of UIDs per schema
 //   (ATTESTER_TOTAL, Address)            - Count of attestations per attester
 //   (Address, chunk_idx)                 - Chunks of UIDs per attester
+//   (EXPIRATION_TOTAL, ExpirationStatus) - Count of attestations per expiration status
+//   (ExpirationStatus, chunk_idx)       - Chunks of UIDs per expiration status
 //   (STATUS_KEY, UID)                    - Lifecycle status per attestation
 //   (INDEXED_KEY, UID)                   - Idempotency record (recipient, schema, attester)
 //   (RECIPIENT_ATTESTATION, Address, UID) - Direct recipient-to-attestation mapping
@@ -56,13 +59,21 @@ pub const CURRENT_WASM_HASH: Symbol = symbol_short!("WASMHASH");
 /// to activate. Increase only as part of a reviewed release.
 pub const MAX_KNOWN_VERSION: u32 = 2;
 const MAX_CHUNK_SIZE: u32 = 100;
+const CHUNK_ALLOCATED: Symbol = symbol_short!("CHKALLOC");
+const CHUNK_FULL: Symbol = symbol_short!("CHKFULL");
+const DIM_RECIPIENT: Symbol = symbol_short!("recipient");
+const DIM_SCHEMA: Symbol = symbol_short!("schema");
+const DIM_ATTESTER: Symbol = symbol_short!("attester");
 const MAX_QUERIES_PER_BLOCK: u32 = 1000;
 const RECIPIENT_TOTAL: Symbol = symbol_short!("RCOUNT");
 const SCHEMA_TOTAL: Symbol = symbol_short!("SCOUNT");
 const ATTESTER_TOTAL: Symbol = symbol_short!("ACOUNT");
+const EXPIRATION_TOTAL: Symbol = symbol_short!("ECOUNT");
 const SAS_INTERFACE_VERSION: Symbol = symbol_short!("SASV1");
 /// Persistent key prefix for a UID's [`IndexStatus`]: `(STATUS_KEY, uid)`.
 const STATUS_KEY: Symbol = symbol_short!("IDXSTAT");
+/// Persistent key prefix for an attestation's valid_from activation timestamp (#439).
+const VALID_FROM_KEY: Symbol = symbol_short!("VFROM");
 /// Persistent key prefix for a UID's idempotency record: `(INDEXED_KEY, uid)`
 /// stores the `(recipient, schema_uid, attester)` triple the UID was first
 /// indexed with. Its presence marks the UID as already indexed and pins the
@@ -81,12 +92,12 @@ const RECIPIENT_ATTESTATION: Symbol = symbol_short!("RATT");
 /// directly mapped to `recipient`.
 const RECIPIENT_ATTESTATION_COUNT: Symbol = symbol_short!("RATTC");
 
-/// The `(recipient, schema_uid, attester)` triple a UID was first indexed
+/// The `(recipient, schema_uid, attester, expiration_time)` quadruple a UID was first indexed
 /// with. A later `index_attestation` for the same UID must supply an
-/// identical triple (idempotent retry) or it is rejected. Stored as a plain
+/// identical quadruple (idempotent retry) or it is rejected. Stored as a plain
 /// tuple rather than a `#[contracttype]` struct so no `arbitrary`/testutils
 /// bound is imposed on `UID` in downstream test builds.
-type IndexRecord = (Address, UID, Address);
+type IndexRecord = (Address, UID, Address, u64);
 
 /// Lifecycle state the indexer tracks per attestation UID so filtered
 /// queries can hide revoked / replaced entries without deleting history.
@@ -254,7 +265,21 @@ where
     chunk
 }
 
-fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
+fn emit_chunk_allocated(env: &Env, dimension: Symbol, key: Val, chunk_index: u32) {
+    env.events().publish(
+        (CHUNK_ALLOCATED, dimension, chunk_index),
+        (key, env.ledger().sequence()),
+    );
+}
+
+fn emit_chunk_full(env: &Env, dimension: Symbol, key: Val, chunk_index: u32, total_items: u32) {
+    env.events().publish(
+        (CHUNK_FULL, dimension, chunk_index, total_items),
+        (key, total_items),
+    );
+}
+
+fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol, dimension: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
     let mut chunk_index = total / MAX_CHUNK_SIZE;
@@ -263,15 +288,30 @@ fn index_address_uid(env: &Env, key: &Address, uid: &UID, total_key: Symbol) {
         .persistent()
         .get(&(key.clone(), chunk_index))
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    let mut allocated = chunk.is_empty();
     if chunk.len() >= MAX_CHUNK_SIZE {
+        emit_chunk_full(
+            env,
+            dimension.clone(),
+            key.into_val(env),
+            chunk_index,
+            chunk.len(),
+        );
         chunk_index += 1;
         chunk = env
             .storage()
             .persistent()
             .get(&(key.clone(), chunk_index))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        allocated = true;
     }
     chunk.push_back(uid.clone());
+    if allocated {
+        emit_chunk_allocated(env, dimension.clone(), key.into_val(env), chunk_index);
+    }
+    if chunk.len() == MAX_CHUNK_SIZE {
+        emit_chunk_full(env, dimension, key.into_val(env), chunk_index, chunk.len());
+    }
     let storage_key = (key.clone(), chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
     env.storage()
@@ -317,7 +357,7 @@ fn index_recipient_attestation(env: &Env, recipient: &Address, uid: &UID) {
     extend_instance_ttl(env);
 }
 
-fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
+fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol, dimension: Symbol) {
     let count_key = (total_key, key.clone());
     let mut total = index_total(env, &count_key);
     let mut chunk_index = total / MAX_CHUNK_SIZE;
@@ -326,16 +366,63 @@ fn index_uid_uid(env: &Env, key: &UID, uid: &UID, total_key: Symbol) {
         .persistent()
         .get(&(key.clone(), chunk_index))
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    let mut allocated = chunk.is_empty();
     if chunk.len() >= MAX_CHUNK_SIZE {
+        emit_chunk_full(
+            env,
+            dimension.clone(),
+            key.into_val(env),
+            chunk_index,
+            chunk.len(),
+        );
         chunk_index += 1;
         chunk = env
             .storage()
             .persistent()
             .get(&(key.clone(), chunk_index))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        allocated = true;
     }
     chunk.push_back(uid.clone());
+    if allocated {
+        emit_chunk_allocated(env, dimension.clone(), key.into_val(env), chunk_index);
+    }
+    if chunk.len() == MAX_CHUNK_SIZE {
+        emit_chunk_full(env, dimension, key.into_val(env), chunk_index, chunk.len());
+    }
     let storage_key = (key.clone(), chunk_index);
+    env.storage().persistent().set(&storage_key, &chunk);
+    env.storage()
+        .persistent()
+        .extend_ttl(&storage_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+
+    total += 1;
+    env.storage().persistent().set(&count_key, &total);
+    env.storage()
+        .persistent()
+        .extend_ttl(&count_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+    extend_instance_ttl(env);
+}
+
+fn index_expiration_status(env: &Env, expiration_status: ExpirationStatus, uid: &UID) {
+    let count_key = (EXPIRATION_TOTAL, expiration_status);
+    let mut total = index_total(env, &count_key);
+    let mut chunk_index = total / MAX_CHUNK_SIZE;
+    let mut chunk: soroban_sdk::Vec<UID> = env
+        .storage()
+        .persistent()
+        .get(&(expiration_status, chunk_index))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    if chunk.len() >= MAX_CHUNK_SIZE {
+        chunk_index += 1;
+        chunk = env
+            .storage()
+            .persistent()
+            .get(&(expiration_status, chunk_index))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    }
+    chunk.push_back(uid.clone());
+    let storage_key = (expiration_status, chunk_index);
     env.storage().persistent().set(&storage_key, &chunk);
     env.storage()
         .persistent()
@@ -451,6 +538,63 @@ fn collect_page(
     uids
 }
 
+/// A reverse page and the inclusive position to pass to the next call.
+/// `None` as an input cursor starts at the current tail; `None` as an output
+/// cursor means the history has been exhausted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReversePage {
+    pub uids: soroban_sdk::Vec<UID>,
+    pub next_cursor: Option<u32>,
+}
+
+fn collect_reverse_page(
+    env: &Env,
+    total: u32,
+    cursor: Option<u32>,
+    limit: u32,
+    mut get_chunk: impl FnMut(u32) -> Option<soroban_sdk::Vec<UID>>,
+) -> ReversePage {
+    let mut page = ReversePage {
+        uids: soroban_sdk::Vec::new(env),
+        next_cursor: None,
+    };
+    if total == 0 || limit == 0 {
+        return page;
+    }
+    let Some(mut index) = cursor.or_else(|| total.checked_sub(1)) else {
+        return page;
+    };
+    if index >= total {
+        return page;
+    }
+    let mut loaded_index = None;
+    let mut loaded_chunk = soroban_sdk::Vec::new(env);
+    while page.uids.len() < limit {
+        let chunk_index = index / MAX_CHUNK_SIZE;
+        if loaded_index != Some(chunk_index) {
+            let Some(chunk) = get_chunk(chunk_index) else {
+                break;
+            };
+            loaded_chunk = chunk;
+            loaded_index = Some(chunk_index);
+        }
+        let offset = index % MAX_CHUNK_SIZE;
+        let Some(uid) = loaded_chunk.get(offset) else {
+            break;
+        };
+        page.uids.push_back(uid);
+        let Some(previous) = index.checked_sub(1) else {
+            return page;
+        };
+        index = previous;
+    }
+    if page.uids.len() == limit {
+        page.next_cursor = Some(index);
+    }
+    page
+}
+
 #[contractimpl]
 impl Indexer {
     /// Compatibility probe used by Indexer::init to prove the supplied
@@ -542,7 +686,7 @@ impl Indexer {
         env.storage().instance().get(&SAS_CONTRACT)
     }
 
-    /// Records `uid` in the recipient, schema, and attester indexes.
+    /// Records `uid` in the recipient, schema, attester, and expiration status indexes.
     ///
     /// Trust boundary: only the SAS contract bound at `init` may call this.
     /// It requires `sas.require_auth()`, which Soroban satisfies without an
@@ -555,17 +699,20 @@ impl Indexer {
     /// address to authorize against.
     ///
     /// Idempotent: a repeated call with the **same**
-    /// `(recipient, schema_uid, attester)` triple is a no-op (it only
+    /// `(recipient, schema_uid, attester, expiration_time)` quadruple is a no-op (it only
     /// renews TTLs), so a retried cross-contract call or a migration replay
-    /// can't duplicate query results or inflate storage. A repeated call
-    /// for the same `uid` with a **different** triple is rejected with
-    /// `SASError::DuplicateAttestation`.
+    /// can't duplicate query results or inflate storage. This ensures that
+    /// `bulk_reindex` replays after partial failures are safe: if some UIDs
+    /// were successfully indexed before a failure, replaying the entire batch
+    /// won't create duplicates. A repeated call for the same `uid` with a
+    /// **different** quadruple is rejected with `SASError::DuplicateAttestation`.
     pub fn index_attestation(
         env: Env,
         uid: UID,
         recipient: Address,
         schema_uid: UID,
         attester: Address,
+        expiration_time: u64,
     ) {
         let Some(sas): Option<Address> = env.storage().instance().get(&SAS_CONTRACT) else {
             panic_with_error!(&env, SASError::Unauthorized);
@@ -573,7 +720,12 @@ impl Indexer {
         sas.require_auth();
         extend_instance_ttl(&env);
 
-        let record: IndexRecord = (recipient.clone(), schema_uid.clone(), attester.clone());
+        let record: IndexRecord = (
+            recipient.clone(),
+            schema_uid.clone(),
+            attester.clone(),
+            expiration_time,
+        );
         let record_key = (INDEXED_KEY, uid.clone());
         if let Some(existing) = env
             .storage()
@@ -601,10 +753,17 @@ impl Indexer {
             LEDGERS_IN_ONE_YEAR,
         );
 
-        index_address_uid(&env, &recipient, &uid, RECIPIENT_TOTAL);
+        index_address_uid(&env, &recipient, &uid, RECIPIENT_TOTAL, DIM_RECIPIENT);
         index_recipient_attestation(&env, &recipient, &uid);
-        index_uid_uid(&env, &schema_uid, &uid, SCHEMA_TOTAL);
-        index_address_uid(&env, &attester, &uid, ATTESTER_TOTAL);
+        index_uid_uid(&env, &schema_uid, &uid, SCHEMA_TOTAL, DIM_SCHEMA);
+        index_address_uid(&env, &attester, &uid, ATTESTER_TOTAL, DIM_ATTESTER);
+
+        let expiration_status = if expiration_time == 0 {
+            ExpirationStatus::Perpetual
+        } else {
+            ExpirationStatus::Expiring
+        };
+        index_expiration_status(&env, expiration_status, &uid);
 
         // Progress for off-chain consumers (issue #315). Emitted only on the
         // first successful index of this UID, after the counters have moved.
@@ -628,6 +787,30 @@ impl Indexer {
     pub fn get_attestation_status(env: Env, uid: UID) -> Option<IndexStatus> {
         extend_instance_ttl(&env);
         env.storage().persistent().get(&(STATUS_KEY, uid))
+    }
+
+    /// Records the activation timestamp `valid_from` for an indexed attestation (#439).
+    /// Can only be called by the bound SAS contract.
+    pub fn set_valid_from(env: Env, uid: UID, valid_from: u64) {
+        let Some(sas): Option<Address> = env.storage().instance().get(&SAS_CONTRACT) else {
+            panic_with_error!(&env, SASError::Unauthorized);
+        };
+        sas.require_auth();
+        extend_instance_ttl(&env);
+        let key = (VALID_FROM_KEY, uid);
+        env.storage().persistent().set(&key, &valid_from);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
+        extend_instance_ttl(&env);
+    }
+
+    /// Exposes the recorded `valid_from` activation timestamp for `uid` (#439).
+    /// Returns 0 if unset or unknown.
+    pub fn get_valid_from(env: Env, uid: UID) -> u64 {
+        extend_instance_ttl(&env);
+        let key = (VALID_FROM_KEY, uid);
+        env.storage().persistent().get(&key).unwrap_or(0)
     }
 
     /// Total number of UIDs indexed under `address` as a recipient, across
@@ -690,6 +873,13 @@ impl Indexer {
         index_total(&env, &(ATTESTER_TOTAL, address))
     }
 
+    /// Total number of UIDs indexed under `expiration_status`. See
+    /// [`Indexer::get_count_by_recipient`] for semantics.
+    pub fn get_count_by_expiration(env: Env, expiration_status: ExpirationStatus) -> u32 {
+        extend_instance_ttl(&env);
+        index_total(&env, &(EXPIRATION_TOTAL, expiration_status))
+    }
+
     /// Complete recipient history, oldest first.
     ///
     /// Walks every chunk backing the key: the index rolls over to a new chunk
@@ -735,6 +925,25 @@ impl Indexer {
             &env,
             total,
             |chunk_index| read_chunk(&env, &(attester.clone(), chunk_index)),
+            true,
+        )
+    }
+
+    /// Complete expiration status history, oldest first. See
+    /// [`Indexer::get_attestations_by_recipient`] for the chunking contract
+    /// and `read_chunk` for the read-path retention policy: every expiration
+    /// status chunk this walks has its TTL renewed, and an empty lookup stays
+    /// read-only and returns an empty vector.
+    pub fn get_attestations_by_expiration(
+        env: Env,
+        expiration_status: ExpirationStatus,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        let total = index_total(&env, &(EXPIRATION_TOTAL, expiration_status));
+        collect_filtered(
+            &env,
+            total,
+            |chunk_index| read_chunk(&env, &(expiration_status, chunk_index)),
             true,
         )
     }
@@ -816,6 +1025,77 @@ impl Indexer {
         })
     }
 
+    /// One page of the complete expiration status history. Same pagination contract
+    /// as [`Indexer::get_atts_by_recipient_paginated`]; pair with
+    /// `get_count_by_expiration` (#306).
+    pub fn get_atts_by_expiration_paginated(
+        env: Env,
+        expiration_status: ExpirationStatus,
+        cursor: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(EXPIRATION_TOTAL, expiration_status));
+        collect_page(&env, total, cursor, limit, |chunk_index| {
+            read_chunk(&env, &(expiration_status, chunk_index))
+        })
+    }
+
+    /// Newest-first recipient history. Pass `None` for the first cursor and
+    /// then the returned `next_cursor` until it is `None`.
+    pub fn get_atts_by_recipient_reverse(
+        env: Env,
+        recipient: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ReversePage {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(RECIPIENT_TOTAL, recipient.clone()));
+        collect_reverse_page(&env, total, cursor, limit, |i| {
+            read_chunk(&env, &(recipient.clone(), i))
+        })
+    }
+
+    /// Newest-first schema history; uses the same cursor contract.
+    pub fn get_atts_by_schema_reverse(
+        env: Env,
+        schema_uid: UID,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ReversePage {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(SCHEMA_TOTAL, schema_uid.clone()));
+        collect_reverse_page(&env, total, cursor, limit, |i| {
+            read_chunk(&env, &(schema_uid.clone(), i))
+        })
+    }
+
+    /// Newest-first attester history; uses the same cursor contract.
+    pub fn get_atts_by_attester_reverse(
+        env: Env,
+        attester: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ReversePage {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(ATTESTER_TOTAL, attester.clone()));
+        collect_reverse_page(&env, total, cursor, limit, |i| {
+            read_chunk(&env, &(attester.clone(), i))
+        })
+    }
+
     /// Filtered variants: `include_revoked == true` returns the full
     /// auditable history (active + revoked + replaced); `false` returns
     /// only `Active` UIDs. Replacement UIDs remain `Active`; their
@@ -871,6 +1151,73 @@ impl Indexer {
             |chunk_index| read_chunk(&env, &(attester.clone(), chunk_index)),
             include_revoked,
         )
+    }
+
+    pub fn get_expiration_filtered(
+        env: Env,
+        expiration_status: ExpirationStatus,
+        include_revoked: bool,
+    ) -> soroban_sdk::Vec<UID> {
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(EXPIRATION_TOTAL, expiration_status));
+        collect_filtered(
+            &env,
+            total,
+            |chunk_index| read_chunk(&env, &(expiration_status, chunk_index)),
+            include_revoked,
+        )
+    }
+
+    /// Paginated active-only expiration status history. See
+    /// [`Indexer::get_recipient_page_filtered`] for the pagination contract.
+    pub fn get_expiration_page_filtered(
+        env: Env,
+        expiration_status: ExpirationStatus,
+        cursor: u32,
+        limit: u32,
+        include_revoked: bool,
+    ) -> soroban_sdk::Vec<UID> {
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        if limit == 0 {
+            return soroban_sdk::Vec::new(&env);
+        }
+        let total = index_total(&env, &(EXPIRATION_TOTAL, expiration_status));
+        if cursor >= total {
+            return soroban_sdk::Vec::new(&env);
+        }
+        let mut out = soroban_sdk::Vec::new(&env);
+        let mut index = cursor;
+        let mut loaded: Option<u32> = None;
+        let mut chunk = soroban_sdk::Vec::new(&env);
+        while index < total && out.len() < limit {
+            let chunk_index = index / MAX_CHUNK_SIZE;
+            let chunk_offset = index % MAX_CHUNK_SIZE;
+            if loaded != Some(chunk_index) {
+                let Some(next) = read_chunk(&env, &(expiration_status, chunk_index)) else {
+                    break;
+                };
+                chunk = next;
+                loaded = Some(chunk_index);
+            }
+            if chunk_offset >= chunk.len() {
+                index = (chunk_index + 1) * MAX_CHUNK_SIZE;
+                continue;
+            }
+            if let Some(uid) = chunk.get(chunk_offset) {
+                if include_revoked || is_active(&env, &uid) {
+                    out.push_back(uid);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            index += 1;
+        }
+        out
     }
 
     /// Total number of UIDs indexed under `issuer` as an attestation issuer.

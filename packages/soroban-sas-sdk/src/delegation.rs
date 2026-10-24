@@ -424,6 +424,7 @@ mod tests {
             attester: attester.clone(),
             revocable: true,
             data,
+            valid_from: 0,
         }
     }
 
