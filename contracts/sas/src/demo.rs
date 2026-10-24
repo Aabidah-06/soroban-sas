@@ -1,19 +1,19 @@
 //! A narrated, end-to-end walkthrough of the attestation service, run
-/// entirely in-process (no network, no funded accounts) against the *real*
-/// `schema-registry` and `sas` contracts — not mocks. Run it with:
-///
-///   cargo test -p sas --lib demo:: -- --nocapture
-///
-/// and record the terminal output: it prints each step of the protocol as
-/// it happens, so the output itself tells the story of what the service
-/// does — register a schema, issue an attestation against it, verify it,
-/// then revoke it and verify again.
+//! entirely in-process (no network, no funded accounts) against the *real*
+//! `schema-registry` and `sas` contracts — not mocks. Run it with:
+//!
+//!   cargo test -p sas --lib demo:: -- --nocapture
+//!
+//! and record the terminal output: it prints each step of the protocol as
+//! it happens, so the output itself tells the story of what the service
+//! does — register a schema, issue an attestation against it, verify it,
+//! then revoke it and verify again.
 
 use crate::{SASClient, SAS};
 use schema_registry::{SchemaRegistry, SchemaRegistryClient};
 use soroban_sas_common::{Attestation, UID};
 use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk:{contract, contractimpl, Address, Bytes, BytesN, Env, String as SorobanString};
+use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String as SorobanString};
 
 /// A resolver that accepts every attestation unconditionally. Schemas name a
 /// resolver contract that gets the final say on each attestation issued
@@ -44,12 +44,12 @@ pub fn demo_schema_string() -> &'static str {
     DEMO_SCHEMA
 }
 
-# [test]
+#[test]
 fn demo_register_schema_then_attest_verify_and_revoke() {
     let env = Env::default();
     env.mock_all_auths();
 
-    println("\n=== soroban-sas: schema -> attestation -> verification demo ===\n");
+    println!("\n=== soroban-sas: schema -> attestation -> verification demo ===\n");
 
     // --- Deploy the three parties: a schema registry, the core SAS
     // contract, and a resolver the demo schema will delegate to. ---
@@ -64,7 +64,7 @@ fn demo_register_schema_then_attest_verify_and_revoke() {
 
     let resolver_id = env.register_contract(None, noop_resolver::NoopResolver);
 
-    println(
+    println!(
         "1. Deployed schema-registry ({registry_id:?}) and sas ({sas_id:?}), bound together.\n"
     );
 
