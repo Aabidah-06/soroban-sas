@@ -656,11 +656,25 @@ pub struct ReversePage {
     pub next_cursor: Option<u32>,
 }
 
+/// Reads a newest-first window of one lookup key's history, starting at
+/// `cursor` (inclusive absolute position) or at the tail (`total - 1`) when
+/// `cursor` is `None`, and walking backward across 100-UID chunk boundaries.
+///
+/// With `include_revoked == true` the page is the contiguous window
+/// `[index - (limit - 1), index]` in insertion order, so both the caller's
+/// `cursor` and `limit` are counted in raw index positions. When
+/// `include_revoked` is `false`, `Revoked` / `Replaced` UIDs are skipped
+/// while walking backward, so the page holds up to `limit` *active* entries
+/// in strictly descending index (and therefore timestamp) order; the
+/// returned `next_cursor` remains an absolute position, so the walk can
+/// resume cleanly across chunks. A missing chunk ends the page early rather
+/// than trapping, matching `collect_page` / `collect_filtered`.
 fn collect_reverse_page(
     env: &Env,
     total: u32,
     cursor: Option<u32>,
     limit: u32,
+    include_revoked: bool,
     mut get_chunk: impl FnMut(u32) -> Option<soroban_sdk::Vec<UID>>,
 ) -> ReversePage {
     let mut page = ReversePage {
@@ -691,7 +705,9 @@ fn collect_reverse_page(
         let Some(uid) = loaded_chunk.get(offset) else {
             break;
         };
-        page.uids.push_back(uid);
+        if include_revoked || is_active(env, &uid) {
+            page.uids.push_back(uid);
+        }
         let Some(previous) = index.checked_sub(1) else {
             return page;
         };
@@ -1265,7 +1281,7 @@ impl Indexer {
             panic_with_error!(&env, err);
         }
         let total = index_total(&env, &(RECIPIENT_TOTAL, recipient.clone()));
-        collect_reverse_page(&env, total, cursor, limit, |i| {
+        collect_reverse_page(&env, total, cursor, limit, true, |i| {
             read_chunk(&env, &(recipient.clone(), i))
         })
     }
@@ -1282,7 +1298,7 @@ impl Indexer {
             panic_with_error!(&env, err);
         }
         let total = index_total(&env, &(SCHEMA_TOTAL, schema_uid.clone()));
-        collect_reverse_page(&env, total, cursor, limit, |i| {
+        collect_reverse_page(&env, total, cursor, limit, true, |i| {
             read_chunk(&env, &(schema_uid.clone(), i))
         })
     }
@@ -1299,9 +1315,137 @@ impl Indexer {
             panic_with_error!(&env, err);
         }
         let total = index_total(&env, &(ATTESTER_TOTAL, attester.clone()));
-        collect_reverse_page(&env, total, cursor, limit, |i| {
+        collect_reverse_page(&env, total, cursor, limit, true, |i| {
             read_chunk(&env, &(attester.clone(), i))
         })
+    }
+
+    /// The `limit` newest recipient attestations, newest first (#450).
+    ///
+    /// Convenience read over the reverse walker: it derives the starting
+    /// position from the recipient counter (`total - 1`) instead of taking a
+    /// cursor, then reads backward across chunk boundaries so the page is
+    /// filled from the tail chunk into any preceding chunks. Equivalent to
+    /// the first `get_atts_by_recipient_reverse(recipient, None, limit)` page
+    /// but returned as a plain vector. Revoked and replaced UIDs are
+    /// included (historical view); use `get_recipient_recent_filtered` for
+    /// the active-only view.
+    ///
+    /// `limit == 0` and an empty history return an empty vector. Counts
+    /// toward the per-ledger query limit (`SASError::LimitExceeded`).
+    pub fn get_atts_by_recipient_recent(
+        env: Env,
+        recipient: Address,
+        limit: u32,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(RECIPIENT_TOTAL, recipient.clone()));
+        let page = collect_reverse_page(&env, total, None, limit, true, |i| {
+            read_chunk(&env, &(recipient.clone(), i))
+        });
+        page.uids
+    }
+
+    /// The `limit` newest schema attestations, newest first. See
+    /// [`Indexer::get_atts_by_recipient_recent`] for semantics.
+    pub fn get_atts_by_schema_recent(
+        env: Env,
+        schema_uid: UID,
+        limit: u32,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(SCHEMA_TOTAL, schema_uid.clone()));
+        let page = collect_reverse_page(&env, total, None, limit, true, |i| {
+            read_chunk(&env, &(schema_uid.clone(), i))
+        });
+        page.uids
+    }
+
+    /// The `limit` newest attester attestations, newest first. See
+    /// [`Indexer::get_atts_by_recipient_recent`] for semantics.
+    pub fn get_atts_by_attester_recent(
+        env: Env,
+        attester: Address,
+        limit: u32,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(ATTESTER_TOTAL, attester.clone()));
+        let page = collect_reverse_page(&env, total, None, limit, true, |i| {
+            read_chunk(&env, &(attester.clone(), i))
+        });
+        page.uids
+    }
+
+    /// The `limit` newest recipient attestations, newest first, with the
+    /// same `include_revoked` filter as [`Indexer::get_recipient_filtered`].
+    ///
+    /// With `include_revoked == false` the walker skips revoked/replaced UIDs
+    /// while reading backward, so the result is the newest `limit` *active*
+    /// attestations in strictly descending order — including when the skip
+    /// crosses a 100-UID chunk boundary into a preceding chunk. Pass `true`
+    /// to match [`Indexer::get_atts_by_recipient_recent`].
+    pub fn get_recipient_recent_filtered(
+        env: Env,
+        recipient: Address,
+        limit: u32,
+        include_revoked: bool,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(RECIPIENT_TOTAL, recipient.clone()));
+        let page = collect_reverse_page(&env, total, None, limit, include_revoked, |i| {
+            read_chunk(&env, &(recipient.clone(), i))
+        });
+        page.uids
+    }
+
+    /// Newest-first active-only schema history. See
+    /// [`Indexer::get_recipient_recent_filtered`] for semantics.
+    pub fn get_schema_recent_filtered(
+        env: Env,
+        schema_uid: UID,
+        limit: u32,
+        include_revoked: bool,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(SCHEMA_TOTAL, schema_uid.clone()));
+        let page = collect_reverse_page(&env, total, None, limit, include_revoked, |i| {
+            read_chunk(&env, &(schema_uid.clone(), i))
+        });
+        page.uids
+    }
+
+    /// Newest-first active-only attester history. See
+    /// [`Indexer::get_recipient_recent_filtered`] for semantics.
+    pub fn get_attester_recent_filtered(
+        env: Env,
+        attester: Address,
+        limit: u32,
+        include_revoked: bool,
+    ) -> soroban_sdk::Vec<UID> {
+        extend_instance_ttl(&env);
+        if let Err(err) = check_query_limit(&env) {
+            panic_with_error!(&env, err);
+        }
+        let total = index_total(&env, &(ATTESTER_TOTAL, attester.clone()));
+        let page = collect_reverse_page(&env, total, None, limit, include_revoked, |i| {
+            read_chunk(&env, &(attester.clone(), i))
+        });
+        page.uids
     }
 
     /// Filtered variants: `include_revoked == true` returns the full

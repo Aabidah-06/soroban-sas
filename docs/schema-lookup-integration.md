@@ -166,6 +166,16 @@ when new attestations are appended. Each call reads only the chunks touched
 by its page, including when it crosses a 100-UID chunk boundary. A zero limit,
 empty history, or out-of-range cursor returns an empty page.
 
+When you only need the single newest page, the `get_atts_by_recipient_recent`,
+`get_atts_by_schema_recent`, and `get_atts_by_attester_recent` reads take
+`(key, limit)` and return the newest `limit` UIDs, newest first, without a
+cursor. They are equivalent to the first reverse page. For an active-only
+view, `get_recipient_recent_filtered`, `get_schema_recent_filtered`, and
+`get_attester_recent_filtered` add an `include_revoked` flag: with `false`
+they skip revoked/replaced UIDs while walking backward, so the surviving
+entries stay in descending order even when the skip crosses a chunk boundary.
+All of these count toward the per-ledger query limit.
+
 ```rust
 let page_size = 50;
 let mut cursor = 0;

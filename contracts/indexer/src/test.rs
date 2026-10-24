@@ -414,6 +414,166 @@ fn reverse_pages_match_forward_history_across_chunk_boundaries() {
     );
 }
 
+/// Issue #450: `get_atts_by_*_recent` returns the newest `limit` entries,
+/// newest first, deriving its start from the tail counter and walking
+/// backward across chunk boundaries; it must agree with the reverse pages
+/// and with reversing the forward history.
+#[test]
+fn recent_reads_return_newest_first_and_agree_with_reverse_pages() {
+    let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.budget().reset_unlimited();
+    let (indexer_id, client, sas) = setup_indexed(&env);
+    let sas_client = mock::MockSasClient::new(&env, &sas);
+    let recipient = Address::generate(&env);
+    let attester = Address::generate(&env);
+    let schema = UID(BytesN::from_array(&env, &[21; 32]));
+
+    let total = MAX_CHUNK_SIZE + 25; // 125: chunk 1 holds only 25 UIDs.
+    let uid_at = |i: u32| {
+        let mut raw = [0u8; 32];
+        raw[..4].copy_from_slice(&i.to_be_bytes());
+        UID(BytesN::from_array(&env, &raw))
+    };
+
+    // A zero limit and an empty history are empty pages, never errors.
+    assert!(client
+        .get_atts_by_recipient_recent(&recipient, &0)
+        .is_empty());
+    assert_eq!(client.get_count_by_recipient(&recipient), 0);
+
+    for i in 0..total {
+        sas_client.relay_index(&indexer_id, &uid_at(i), &recipient, &schema, &attester, &0);
+    }
+
+    // Unfiltered recent is newest-first and matches the reverse reader.
+    let recent = client.get_atts_by_recipient_recent(&recipient, &10);
+    assert_eq!(recent.len(), 10);
+    assert_eq!(recent.first(), Some(uid_at(total - 1)));
+    assert_eq!(recent.last(), Some(uid_at(total - 10)));
+    assert_eq!(
+        recent,
+        client
+            .get_atts_by_recipient_reverse(&recipient, &None, &10)
+            .uids
+    );
+
+    // A 30-entry page spans the boundary: 25 from chunk 1 then 5 from chunk 0.
+    let spanning = client.get_atts_by_recipient_recent(&recipient, &30);
+    assert_eq!(spanning.len(), 30);
+    for i in 0..spanning.len() {
+        assert_eq!(spanning.get(i), Some(uid_at(total - 1 - i)));
+    }
+
+    // Asking for more than exists returns everything, still descending.
+    let all = client.get_atts_by_recipient_recent(&recipient, &(total + 50));
+    assert_eq!(all.len(), total);
+    assert_eq!(all.first(), Some(uid_at(total - 1)));
+    assert_eq!(all.last(), Some(uid_at(0)));
+
+    // Schema and attester variants share the same ordering.
+    assert_eq!(client.get_atts_by_schema_recent(&schema, &30), spanning);
+    assert_eq!(client.get_atts_by_attester_recent(&attester, &30), spanning);
+}
+
+/// Issue #450: active-only recent reads skip revoked/replaced UIDs while
+/// walking backward, so the surviving entries stay in strictly descending
+/// order even when the skip crosses a chunk boundary. The result must equal
+/// the reversed forward filtered history and, with `include_revoked == true`,
+/// the unfiltered recent read.
+#[test]
+fn recent_filtered_skips_revoked_in_descending_order() {
+    let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.budget().reset_unlimited();
+    let (indexer_id, client, sas) = setup_indexed(&env);
+    let sas_client = mock::MockSasClient::new(&env, &sas);
+    let recipient = Address::generate(&env);
+    let attester = Address::generate(&env);
+    let schema = UID(BytesN::from_array(&env, &[22; 32]));
+
+    let total = MAX_CHUNK_SIZE + 5; // 105: chunk 1 holds 5 UIDs.
+    let revoked = 8; // Revoke the 8 newest UIDs (indices 97..104).
+    let uid_at = |i: u32| {
+        let mut raw = [0u8; 32];
+        raw[..4].copy_from_slice(&i.to_be_bytes());
+        UID(BytesN::from_array(&env, &raw))
+    };
+    for i in 0..total {
+        sas_client.relay_index(&indexer_id, &uid_at(i), &recipient, &schema, &attester, &0);
+    }
+    env.as_contract(&indexer_id, || {
+        for i in (total - revoked)..total {
+            set_index_status(&env, &uid_at(i), IndexStatus::Revoked);
+        }
+    });
+
+    // The newest active UID is the first non-revoked one below the tail.
+    let active = client.get_recipient_recent_filtered(&recipient, &10, &false);
+    assert_eq!(active.len(), 10);
+    assert_eq!(active.first(), Some(uid_at(total - revoked - 1)));
+    for i in 0..active.len() {
+        assert_eq!(active.get(i), Some(uid_at(total - revoked - 1 - i)));
+    }
+
+    // Consistency with the forward filtered history, reversed.
+    let forward_active = client.get_recipient_filtered(&recipient, &false);
+    assert_eq!(forward_active.len(), total - revoked);
+    for i in 0..active.len() {
+        assert_eq!(
+            active.get(i),
+            forward_active.get(forward_active.len() - 1 - i)
+        );
+    }
+
+    // Historical mode ignores status and matches the unfiltered recent read.
+    assert_eq!(
+        client.get_recipient_recent_filtered(&recipient, &10, &true),
+        client.get_atts_by_recipient_recent(&recipient, &10)
+    );
+
+    // Schema and attester filtered variants agree with the recipient read.
+    assert_eq!(
+        client.get_schema_recent_filtered(&schema, &10, &false),
+        active
+    );
+    assert_eq!(
+        client.get_attester_recent_filtered(&attester, &10, &false),
+        active
+    );
+
+    // A limit past the active count returns every surviving UID.
+    let all_active = client.get_recipient_recent_filtered(&recipient, &(total + 10), &false);
+    assert_eq!(all_active.len(), total - revoked);
+    assert_eq!(all_active.last(), Some(uid_at(0)));
+}
+
+/// Issue #450: the recent reads count toward the per-ledger query limit,
+/// even when the key has never been indexed.
+#[test]
+fn recent_reads_enforce_the_per_ledger_query_limit() {
+    let env = Env::default();
+    let (_indexer_id, client, _sas) = setup_indexed(&env);
+    env.budget().reset_unlimited();
+    let unknown = Address::generate(&env);
+    let unknown_schema = UID(BytesN::from_array(&env, &[0x66; 32]));
+
+    assert!(client.get_atts_by_recipient_recent(&unknown, &5).is_empty());
+    assert!(client
+        .get_atts_by_schema_recent(&unknown_schema, &5)
+        .is_empty());
+
+    for _ in 2..MAX_QUERIES_PER_BLOCK {
+        client.get_atts_by_attester_recent(&unknown, &1);
+    }
+    assert_eq!(
+        client.try_get_recipient_recent_filtered(&unknown, &1, &false),
+        Err(Ok(SASError::LimitExceeded.into()))
+    );
+}
+
 /// A direct call from a bare test invocation (no authorizing contract in
 /// the call stack) must be rejected: the indexer's trust boundary is the
 /// bound SAS contract, not "whoever calls the entry point."
