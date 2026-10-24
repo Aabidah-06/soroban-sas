@@ -320,6 +320,12 @@ network call or funded key, and prints usage with `--help`.
   cargo run --example delegated_attest -- --dry-run
   ```
 
+The SDK also runs on serverless edge runtimes. With the `wasm` feature it
+compiles to `wasm32-unknown-unknown` and talks to Soroban RPC through the
+runtime's global `fetch`, which is what the
+[Cloudflare Worker template](examples/cloudflare-worker) uses. See
+[Edge Runtimes](docs/edge-runtime.md) for the full walkthrough.
+
 ## Getting Started
 
 - **Building an app on soroban-sas?** Follow [Getting Started for DApp Developers](docs/getting-started.md):
@@ -364,6 +370,10 @@ TMPDIR=/tmp cargo test --workspace
 - [Getting Started for DApp Developers](docs/getting-started.md): schema
   design, resolvers, issuance rules, off-chain and on-chain verification,
   indexer queries, and a security checklist.
+- [Stellar SEP-8 Regulated Assets Guide](docs/guides/sep8-regulated-assets.md): complete
+  technical walkthrough for issuing Stellar SEP-8 compliant regulated tokens with Soroban
+  smart contracts, perpetual and expiring SAS attestations, issuer revocation flows, and
+  a sample token wrapper contract.
 - [Local Development Environment](docs/local-development.md): toolchain,
   build and test, git hooks, local network, local deployment, and
   troubleshooting.
@@ -380,6 +390,9 @@ TMPDIR=/tmp cargo test --workspace
 - [Deployment Guide](docs/DEPLOYMENT.md): build optimized WASM, deploy
   `schema-registry`, `sas` and `indexer` to Testnet (via `scripts/deploy.sh` or
   `scripts/deploy_testnet.sh`), verify the deployment, and a Mainnet operational checklist.
+- [Edge Runtimes](docs/edge-runtime.md): build the Rust SDK for
+  `wasm32-unknown-unknown` and run it on Cloudflare Workers, Deno and other
+  serverless edge platforms, including a deployable Worker template.
 - [Soroban Mainnet Launch Preparation](docs/mainnet-launch-preparation.md): launch phases, key custody, reproducible builds, and operational runbooks.
 - [Fee Collection and Treasury Mechanics](docs/fee-collection-and-treasury.md): protocol fee configuration, treasury routing, and token withdrawals.
 - [Internationalization (i18n) and Translation Guidelines](docs/i18n-translation-guidelines.md): localization conventions, terminology glossary, and contribution guidelines.

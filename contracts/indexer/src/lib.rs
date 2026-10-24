@@ -62,62 +62,62 @@ pub const MAX_KNOWN_VERSION: u32 = 2;
 /// been recorded in instance storage. Kept at the historical value so
 /// existing deployments read their chunks with the same layout they were
 /// written with.
-const DEFAULT_CHUNK_SIZE: u32 = 100;
+pub const DEFAULT_CHUNK_SIZE: u32 = 100;
 /// Smallest chunk capacity the adaptive tiering will ever select. Bounds
 /// the number of storage writes per chunk so a single `set` stays well
 /// under the Soroban ledger entry size cap.
-const MIN_CHUNK_SIZE: u32 = 25;
+pub const MIN_CHUNK_SIZE: u32 = 25;
 /// Largest chunk capacity the adaptive tiering will ever select. Bounds
 /// the serialized size of one chunk vector so it cannot exceed the
 /// Soroban ledger entry read/write byte boundary.
-const MAX_CHUNK_SIZE: u32 = 100;
+pub const MAX_CHUNK_SIZE: u32 = 100;
 /// Approximate serialized size of one `UID` (32-byte hash) plus its XDR
 /// length prefix, used to derive the byte-bounded chunk capacity.
-const UID_BYTES: u32 = 36;
+pub const UID_BYTES: u32 = 36;
 /// Conservative per-entry byte budget for a single chunk write. Soroban
 /// caps a ledger entry at 64 KiB; leaving headroom for the vector header
 /// and key keeps writes strictly under the cap.
-const MAX_CHUNK_BYTES: u32 = 32_768;
-const CHUNK_ALLOCATED: Symbol = symbol_short!("CHKALLOC");
-const CHUNK_FULL: Symbol = symbol_short!("CHKFULL");
-const DIM_RECIPIENT: Symbol = symbol_short!("recipient");
-const DIM_SCHEMA: Symbol = symbol_short!("schema");
-const DIM_ATTESTER: Symbol = symbol_short!("attester");
-const MAX_QUERIES_PER_BLOCK: u32 = 1000;
-const RECIPIENT_TOTAL: Symbol = symbol_short!("RCOUNT");
-const SCHEMA_TOTAL: Symbol = symbol_short!("SCOUNT");
-const ATTESTER_TOTAL: Symbol = symbol_short!("ACOUNT");
-const EXPIRATION_TOTAL: Symbol = symbol_short!("ECOUNT");
-const SAS_INTERFACE_VERSION: Symbol = symbol_short!("SASV1");
+pub const MAX_CHUNK_BYTES: u32 = 32_768;
+pub const CHUNK_ALLOCATED: Symbol = symbol_short!("CHKALLOC");
+pub const CHUNK_FULL: Symbol = symbol_short!("CHKFULL");
+pub const DIM_RECIPIENT: Symbol = symbol_short!("recipient");
+pub const DIM_SCHEMA: Symbol = symbol_short!("schema");
+pub const DIM_ATTESTER: Symbol = symbol_short!("attester");
+pub const MAX_QUERIES_PER_BLOCK: u32 = 1000;
+pub const RECIPIENT_TOTAL: Symbol = symbol_short!("RCOUNT");
+pub const SCHEMA_TOTAL: Symbol = symbol_short!("SCOUNT");
+pub const ATTESTER_TOTAL: Symbol = symbol_short!("ACOUNT");
+pub const EXPIRATION_TOTAL: Symbol = symbol_short!("ECOUNT");
+pub const SAS_INTERFACE_VERSION: Symbol = symbol_short!("SASV1");
 /// Persistent key prefix for a UID's [`IndexStatus`]: `(STATUS_KEY, uid)`.
-const STATUS_KEY: Symbol = symbol_short!("IDXSTAT");
+pub const STATUS_KEY: Symbol = symbol_short!("IDXSTAT");
 /// Persistent key prefix for an attestation's valid_from activation timestamp (#439).
-const VALID_FROM_KEY: Symbol = symbol_short!("VFROM");
+pub const VALID_FROM_KEY: Symbol = symbol_short!("VFROM");
 /// Persistent key prefix for a UID's idempotency record: `(INDEXED_KEY, uid)`
 /// stores the `(recipient, schema_uid, attester)` triple the UID was first
 /// indexed with. Its presence marks the UID as already indexed and pins the
 /// metadata a retry must match.
-const INDEXED_KEY: Symbol = symbol_short!("INDEXED");
+pub const INDEXED_KEY: Symbol = symbol_short!("INDEXED");
 /// Instance key for tracking query count per ledger sequence.
-const QUERY_COUNTER_SEQ: Symbol = symbol_short!("QCSEQ");
+pub const QUERY_COUNTER_SEQ: Symbol = symbol_short!("QCSEQ");
 /// Instance key for tracking query count in the current sequence.
-const QUERY_COUNTER_COUNT: Symbol = symbol_short!("QCOUNT");
+pub const QUERY_COUNTER_COUNT: Symbol = symbol_short!("QCOUNT");
 /// Persistent key prefix for a direct recipient-to-attestation mapping:
 /// `(RECIPIENT_ATTESTATION, recipient, uid)` stores `true` when `uid` is
 /// indexed under `recipient`. Enables O(1) membership checks.
-const RECIPIENT_ATTESTATION: Symbol = symbol_short!("RATT");
+pub const RECIPIENT_ATTESTATION: Symbol = symbol_short!("RATT");
 /// Persistent key prefix for the count of direct recipient mappings:
 /// `(RECIPIENT_ATTESTATION_COUNT, recipient)` stores the number of UIDs
 /// directly mapped to `recipient`.
-const RECIPIENT_ATTESTATION_COUNT: Symbol = symbol_short!("RATTC");
+pub const RECIPIENT_ATTESTATION_COUNT: Symbol = symbol_short!("RATTC");
 /// Persistent key prefix for a direct schema-to-attestation mapping:
 /// `(SCHEMA_ATTESTATION, schema_uid, uid)` stores `true` when `uid` is
 /// indexed under `schema_uid`. Enables O(1) membership checks.
-const SCHEMA_ATTESTATION: Symbol = symbol_short!("SATT");
+pub const SCHEMA_ATTESTATION: Symbol = symbol_short!("SATT");
 /// Persistent key prefix for the count of direct schema mappings:
 /// `(SCHEMA_ATTESTATION_COUNT, schema_uid)` stores the number of UIDs
 /// directly mapped to `schema_uid`.
-const SCHEMA_ATTESTATION_COUNT: Symbol = symbol_short!("SATTC");
+pub const SCHEMA_ATTESTATION_COUNT: Symbol = symbol_short!("SATTC");
 
 /// Instance key recording the active adaptive chunk capacity (in UIDs).
 /// Absent on legacy deployments, which fall back to `DEFAULT_CHUNK_SIZE`.
@@ -299,7 +299,7 @@ fn commit_upgrade(env: &Env, admin: &Address, new_wasm_hash: &BytesN<32>, new_ve
 /// duplicate UIDs on the next write (#219). Renewing on every read, not just
 /// every write, keeps a heavily-read/rarely-written key's counter alive as
 /// long as its chunks.
-fn index_total<K>(env: &Env, count_key: &K) -> u32
+pub fn index_total<K>(env: &Env, count_key: &K) -> u32
 where
     K: IntoVal<Env, Val>,
 {
@@ -325,7 +325,7 @@ where
 /// different retention behavior. A missing chunk yields `None` without
 /// writing anything, so a gap in the chunk sequence — or an empty lookup —
 /// neither creates storage nor traps.
-fn read_chunk<K>(env: &Env, chunk_key: &K) -> Option<soroban_sdk::Vec<UID>>
+pub fn read_chunk<K>(env: &Env, chunk_key: &K) -> Option<soroban_sdk::Vec<UID>>
 where
     K: IntoVal<Env, Val>,
 {
@@ -544,11 +544,10 @@ fn index_expiration_status(env: &Env, expiration_status: ExpirationStatus, uid: 
 
 /// Records a non-default lifecycle state for `uid`. Only `Revoked` /
 /// `Replaced` are ever persisted — an unindexed or freshly indexed UID has
-/// no status entry, which [`is_active`] and [`Indexer::get_attestation_status`]
+/// no status entry, which `is_active` and [`Indexer::get_attestation_status`]
 /// both read as active. Invoked by the SAS `handle_revoke` / `handle_replace`
 /// callbacks (added separately).
-#[allow(dead_code)]
-fn set_index_status(env: &Env, uid: &UID, status: IndexStatus) {
+pub fn set_index_status(env: &Env, uid: &UID, status: IndexStatus) {
     let key = (STATUS_KEY, uid.clone());
     env.storage().persistent().set(&key, &status);
     env.storage()

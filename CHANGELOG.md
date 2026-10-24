@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | Indexer | `soroban_sas_indexer.wasm` | `TBD` |
 
 ### Added
+- FROST threshold endorsement for delegated attestations (#534). A schema may
+  declare a required Ed25519 FROST group with
+  `SchemaRegistry::set_schema_frost_group` (`get_schema_frost_group` /
+  `clear_schema_frost_group` round out the API), authenticated to the schema
+  owner or registry admin and emitted as `SchemaFrostGroupUpdated`. When a
+  group is declared, `attest_by_delegation`, `multi_attest_by_delegation`,
+  `revoke_by_delegation`, `multi_revoke_by_delegation`, and
+  `verify_offchain_attestation` accept only the group public key and verify the
+  single 64-byte aggregate with one ordinary Ed25519 verification. The calldata
+  footprint and verification cost are therefore identical to single-signature
+  delegated attestations, while aggregates made with fewer than `threshold`
+  shares fail validation. Golden vectors for 2-of-3 and 3-of-5 groups live in
+  `packages/soroban-sas-common/test_vectors/frost_threshold.tsv` and are
+  exercised end-to-end against the real contracts.
 - `contracts/time-window-resolver`, a schema resolver that enforces a
   configurable `cooldown_period_seconds` between attestations issued to the
   same recipient. It records `last_attested_time` per recipient in persistent
@@ -101,6 +115,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validator and `validate_schema_syntax` both replay the shared golden
   vectors in `packages/soroban-sas-common/test_vectors/schema_syntax.tsv`.
   Built and tested in the *Developer Tooling* workflow. (#346)
+- Nullifier set management in the ZK verifier contract. Checking and
+  recording a nullifier is now a single atomic step: a nullifier is spent
+  only when the whole proof verification succeeds, so a rejected proof never
+  burns its nullifier, and a nullifier that was already spent is rejected
+  with `ZKError::NullifierSpent` (the contract error type `ZkVerifierError`
+  is aliased as `ZKError`). Nullifier records are renewed with the contract
+  instance's own TTL policy, so a spent nullifier never expires before the
+  instance that guards it. The new `are_nullifiers_used` query lets
+  off-chain clients check a whole batch of nullifiers with a single contract
+  call instead of one call per nullifier. (#547)
+- WebAssembly build of the Rust SDK for serverless edge runtimes
+  (`wasm32-unknown-unknown`). The new `wasm` feature replaces the native
+  `ureq` transport with a `web-sys` `fetch` implementation, so RPC calls are
+  awaited through the runtime's global `fetch` instead of blocking the event
+  loop; the synchronous RPC methods are wasm-only errors that point at their
+  `*_async` counterparts. Host-only APIs (`SASClient`, the `Val` bridge
+  helpers) are compiled out for wasm, and the new
+  `soroban_sas_sdk::attestation` module decodes attestations straight from
+  the XDR wire format into a JSON-serializable `AttestationRecord`, so edge
+  runtimes can read attestations without a Soroban host environment.
+  `examples/cloudflare-worker` is a deployable Worker template that answers
+  `GET /attestation/{uid}` from a Soroban RPC node, `docs/edge-runtime.md`
+  documents the feature and the deployment steps, and CI keeps the edge build
+  working through the new `wasm-sdk` job. (#553)
 - `soroban-sas schema wizard`: interactive schema registration that prompts
   for a name, field-by-field definitions, revocability, an optional resolver
   address, and a metadata URI, validating every answer as it is typed
