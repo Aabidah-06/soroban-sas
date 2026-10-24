@@ -27,8 +27,7 @@ pub use eip712::{
     SchemaError, StructDef, DOMAIN_STRUCT_NAME, EIP712_PREFIX,
 };
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Vec};
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Symbol};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
 /// Approximate number of ledgers in one year at five seconds per ledger.
 pub const LEDGERS_IN_ONE_YEAR: u32 = 6_307_200;

@@ -9,12 +9,8 @@ use soroban_sas_common::{
         SCHEMA_FEE_UPDATED, SCHEMA_FROST_GROUP_UPDATED, SCHEMA_OWNERSHIP_PROPOSED,
         SCHEMA_OWNERSHIP_TRANSFERRED, SCHEMA_QUARANTINED, TREASURY_UPDATED,
     },
-    validate_schema_syntax, ContractUpgradedEvent, PreviousAddress, RevocationPolicy, SASError,
-    SchemaDelegateAddedEvent, SchemaDelegateRemovedEvent, SchemaDeprecatedEvent,
-    SchemaFeeUpdatedEvent, SchemaOwnershipProposedEvent, SchemaOwnershipTransferredEvent,
-    SchemaRecord, TreasuryUpdatedEvent, DelegatesStatus, LEDGERS_IN_ONE_YEAR, UID,
-    validate_frost_group, validate_schema_syntax, ContractUpgradedEvent, FrostGroup,
-    PreviousAddress, RevocationPolicy, SASError, SchemaDelegateAddedEvent,
+    validate_frost_group, validate_schema_syntax, ContractUpgradedEvent, DelegatesStatus,
+    FrostGroup, PreviousAddress, RevocationPolicy, SASError, SchemaDelegateAddedEvent,
     SchemaDelegateRemovedEvent, SchemaDeprecatedEvent, SchemaFeeUpdatedEvent,
     SchemaFrostGroupUpdatedEvent, SchemaOwnershipProposedEvent, SchemaOwnershipTransferredEvent,
     SchemaRecord, SchemaStatus, TreasuryUpdatedEvent, LEDGERS_IN_ONE_YEAR, UID,
@@ -253,21 +249,15 @@ fn add_to_delegate_list(env: &Env, uid: &UID, delegate: &Address) {
     if !members_contain(&list, delegate) {
         list.push_back(delegate.clone());
         env.storage().persistent().set(&list_key, &list);
-        env.storage().persistent().extend_ttl(
-            &list_key,
-            LEDGERS_IN_ONE_YEAR,
-            LEDGERS_IN_ONE_YEAR,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&list_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
     }
 }
 
 fn remove_from_delegate_list(env: &Env, uid: &UID, delegate: &Address) {
     let list_key = (SCHEMA_DELEGATES, uid.clone());
-    let Some(list) = env
-        .storage()
-        .persistent()
-        .get::<_, Vec<Address>>(&list_key)
-    else {
+    let Some(list) = env.storage().persistent().get::<_, Vec<Address>>(&list_key) else {
         return;
     };
     let mut new_list: Vec<Address> = Vec::new(env);
@@ -281,15 +271,13 @@ fn remove_from_delegate_list(env: &Env, uid: &UID, delegate: &Address) {
         }
         i = i.saturating_add(1);
     }
-    if new_list.len() == 0 {
+    if new_list.is_empty() {
         env.storage().persistent().remove(&list_key);
     } else {
         env.storage().persistent().set(&list_key, &new_list);
-        env.storage().persistent().extend_ttl(
-            &list_key,
-            LEDGERS_IN_ONE_YEAR,
-            LEDGERS_IN_ONE_YEAR,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&list_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
     }
 }
 
@@ -722,7 +710,9 @@ impl SchemaRegistry {
         );
 
         let expiry_key = (DELEGATE_EXPIRY, schema_uid.clone(), delegate.clone());
-        env.storage().persistent().set(&expiry_key, &expiry_timestamp);
+        env.storage()
+            .persistent()
+            .set(&expiry_key, &expiry_timestamp);
         env.storage().persistent().extend_ttl(
             &expiry_key,
             LEDGERS_IN_ONE_YEAR,
@@ -1941,11 +1931,9 @@ impl SchemaRegistry {
             return DelegatesStatus { active, expired };
         };
 
-        env.storage().persistent().extend_ttl(
-            &list_key,
-            LEDGERS_IN_ONE_YEAR,
-            LEDGERS_IN_ONE_YEAR,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&list_key, LEDGERS_IN_ONE_YEAR, LEDGERS_IN_ONE_YEAR);
 
         let now = env.ledger().timestamp();
         let len = delegates.len();
