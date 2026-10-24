@@ -101,6 +101,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validator and `validate_schema_syntax` both replay the shared golden
   vectors in `packages/soroban-sas-common/test_vectors/schema_syntax.tsv`.
   Built and tested in the *Developer Tooling* workflow. (#346)
+- Nullifier set management in the ZK verifier contract. Checking and
+  recording a nullifier is now a single atomic step: a nullifier is spent
+  only when the whole proof verification succeeds, so a rejected proof never
+  burns its nullifier, and a nullifier that was already spent is rejected
+  with `ZKError::NullifierSpent` (the contract error type `ZkVerifierError`
+  is aliased as `ZKError`). Nullifier records are renewed with the contract
+  instance's own TTL policy, so a spent nullifier never expires before the
+  instance that guards it. The new `are_nullifiers_used` query lets
+  off-chain clients check a whole batch of nullifiers with a single contract
+  call instead of one call per nullifier. (#547)
 - WebAssembly build of the Rust SDK for serverless edge runtimes
   (`wasm32-unknown-unknown`). The new `wasm` feature replaces the native
   `ureq` transport with a `web-sys` `fetch` implementation, so RPC calls are
